@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qwen-tts-cli"
+version = "0.1.0"
+description = "Scriptable local Qwen3-TTS command line tool: say, voice assets, forced alignment, subtitles."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "qwen-tts-cli contributors" }]
+dependencies = [
+    "numpy>=1.24",
+    "soundfile>=0.12",
+]
+
+[project.optional-dependencies]
+# Model runtime. Install both for the single-environment M0 setup (PRD §3.3).
+tts = ["qwen-tts>=0.1.1", "torch>=2.4"]
+align = ["qwen-asr>=0.0.6", "torch>=2.4"]
+hf = ["huggingface_hub>=0.24"]
+modelscope = ["modelscope>=1.15"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+qtts = "qtts_cli.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["qtts_cli*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "integration: requires local models and a torch runtime (set RUN_INTEGRATION=1)",
+]
