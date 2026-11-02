@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# Test / lint / type caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/settings.local.json
+
+# Generated audio and subtitle outputs
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.ogg
+*.opus
+*.recipe.json
+*.srt
+*.vtt
+*.ass
+!tests/fixtures/**/*.wav
+!tests/fixtures/**/*.srt
+!examples/**/*.wav
+
+# Voice archives
+*.qttsvoice
+
+# Local data / models / outputs
+data/
+models/
+outputs/
+out/
