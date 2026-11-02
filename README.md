@@ -471,6 +471,7 @@ tests/
 
 - [PRD.md](PRD.md) — 产品需求、功能清单、命令规范、数据模型、验收标准
 - [WORKLOG.md](WORKLOG.md) — 从需求讨论到 P0 交付的工作进程记录
+- [CHANGELOG.md](CHANGELOG.md) — 版本变更记录与已知限制
 
 ---
 
