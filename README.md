@@ -125,15 +125,17 @@ models/
 示例：
 
 ```bash
-export QTTS_MODELS=/path/to/Qwen3-TTS/models
-qtts models list --model-dir "$QTTS_MODELS"
+export QTTS_MODEL_DIR=/path/to/Qwen3-TTS/models
+qtts models list --model-dir "$QTTS_MODEL_DIR"
 ```
+
+`QTTS_MODEL_DIR`（或 `QWEN_TTS_MODEL_DIR`）会被 CLI 自动读取，也可以改用 `--model-dir` 显式覆盖。
 
 从远端下载：
 
 ```bash
 qtts models pull Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
-  --source hf --revision main --model-dir "$QTTS_MODELS"
+  --source hf --revision main --model-dir "$QTTS_MODEL_DIR"
 ```
 
 `--offline` 会禁止下载，并尽量让加载器只读本地文件。
@@ -150,7 +152,7 @@ qtts models pull Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
 qtts say "你好，世界。这是一次测试。" \
   --voice builtin:Vivian \
   --language Chinese \
-  --model-dir "$QTTS_MODELS" \
+  --model-dir "$QTTS_MODEL_DIR" \
   --out hello.wav \
   --subtitle srt
 
@@ -162,7 +164,7 @@ qtts say "你好，世界。这是一次测试。" \
 ```bash
 qtts say "第一段。第二段。" \
   --voice builtin:Vivian \
-  --model-dir "$QTTS_MODELS" \
+  --model-dir "$QTTS_MODEL_DIR" \
   --out out.wav --subtitle srt --dry-run
 ```
 
@@ -175,11 +177,11 @@ qtts voice add alice \
   --ref-text "参考音频对应的文字" \
   --mode icl \
   --i-have-rights \
-  --model-dir "$QTTS_MODELS"
+  --model-dir "$QTTS_MODEL_DIR"
 
-qtts voice preview alice --model-dir "$QTTS_MODELS" --out alice-preview.wav
+qtts voice preview alice --model-dir "$QTTS_MODEL_DIR" --out alice-preview.wav
 qtts say "你好，我是 Alice。" --voice voice:alice \
-  --model-dir "$QTTS_MODELS" --out alice.wav
+  --model-dir "$QTTS_MODEL_DIR" --out alice.wav
 ```
 
 ### 4. 设计音色并固化
@@ -191,7 +193,7 @@ qtts voice add narrator \
   --sample-text "这是试音句。" \
   --language Chinese \
   --materialize-clone \
-  --model-dir "$QTTS_MODELS"
+  --model-dir "$QTTS_MODEL_DIR"
 ```
 
 ### 5. 对已有音频做对齐
@@ -201,13 +203,13 @@ qtts align hello.wav \
   --text-file script.txt \
   --language Chinese \
   --format srt,vtt,ass,json \
-  --model-dir "$QTTS_MODELS"
+  --model-dir "$QTTS_MODEL_DIR"
 ```
 
 ### 6. 诊断与性能基线
 
 ```bash
-qtts doctor --bench --model-dir "$QTTS_MODELS"
+qtts doctor --bench --model-dir "$QTTS_MODEL_DIR"
 ```
 
 ### 7. 多角色脚本
