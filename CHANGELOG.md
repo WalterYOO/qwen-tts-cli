@@ -12,6 +12,12 @@
 - **多角色脚本**：`script lint FILE`、`script compile FILE -o PLAN.json`、`say --script FILE`，接受 YAML/JSON；逐段 `voice/language/instruct/seed/max_new_tokens/pause_after_ms`，缺省 id 自动生成，重复 id/未知字段/能力冲突在加载模型前失败；编译计划稳定可复现。
 - **词典与导演标记**：`say/align --lexicon` 让 TTS 读 `spoken`、字幕保留原文 `term`，显式 spoken→display 字符映射；`[[pause:MS]]` 支持句首/句间/句尾/连续出现，负数和 `speed/rate/pitch` 等不支持标记退出 2。
 - **批量清单**：`batch plan/run`，`--jobs`、`--resume`、`--retry`、`--fail-fast`、`--watch`；确定性 `plan.json`、原子 `status.jsonl`、job_key/输出 sha256/recipe 校验、部分失败退出 6。
+- **ASR 质检**：`check AUDIO --text/--text-file/--srt`，Qwen3-ASR 转写后按语言自动选 CER/WER，输出编辑距离、错误片段与 `schema_version:1` 报告；`ratio > threshold` 退出 5，参考输入互斥、音频上限 300s、`errors[].start/end` 在 Wave 3a 固定为 `null`。
+- **音频 QC**：`qc AUDIO` 测量 peak/clipping/DC/silence/LUFS/true peak/speech rate/speaker similarity；所有阈值可选且默认 `None`，只测量时退出 0，越界退出 5；`--json` 与 `--report` 逐字节一致。`say --qc` 复用同一实现并把指标写入 payload 与 recipe。
+- **自动参考文本**：`voice add --kind clone --auto-ref-text`（可配 `--language`/`--asr-model`）在 staging 内用 ASR 转写参考音频，成功后释放 ASR 再加载 TTS；`voice.json` 记录 `ref_text_source=asr` 与 `asr_model`。
+- ASR 模型发现：`catalog.scan()` 区分 `Qwen3-ASR-*` 与 `Qwen3-ForcedAligner-*`（两者可能同为 `model_type=qwen3_asr`），新增独立 `select_asr()`，缺失退出 3、歧义退出 2；`models list`/`doctor` 显示 ASR 能力。
+- `scipy>=1.10` 基础依赖，用于 BS.1770-4 LUFS 与 true peak 重采样；scipy 不可用时对应指标为 `null` 并给出 `unavailable` 原因。
+- `TtsEngine.extract_speaker_embedding()`：对非 24kHz 音频重采样后调用底层说话人编码器，返回扁平 CPU float32。
 - `PyYAML>=6.0` 基础依赖；YAML 严格拒绝重复 key、多文档、alias/anchor 与超大输入。
 
 ### Changed
@@ -21,6 +27,12 @@
 
 ### Fixed
 
+- 报告类命令的 canonical JSON 不再把进程 `exit_code` 写入文档，`--json` 与 `--report` 保持逐字节一致。
+- Wave 3a 返修：`check` 在任何音频/模型检查前校验并 canonicalize ASR 语言（非法语言恒退出 2）；小写语言名与规范名产生相同的数字/日期/货币归一化；`asr.language` 不再用参考语言回填，新增 `comparison_language`。
+- `voice add` 补齐 `--asr-model`，与 `check` 共用 `select_asr` 消歧；`say --qc --reference-voice` 在生成前校验 profile，失败不产生音频/recipe。
+- 说话人 embedding 能力改为类级探测、加载权重前失败；qc 的 Base 模型选择错误统一退出 3；空文本不再触发语速门禁（退出 2）。
+- ASR 缓存键包含 aligner；ASR `model_type` 只接受精确 `qwen3_asr`；Wave 3a 集成测试改从 `QTTS_SMOKE_MODEL_DIR` 读取模型目录。
+- `say --qc --reference-voice` 在生成前解析 Base 并做无权重能力探测；参数/输出组合错误优先于 profile/模型预检。`voice add` 在没有 `--auto-ref-text` 时拒绝 `--asr-model`。
 - 多角色脚本：一个 segment 含多句、marker 分块或预算切分时，所有 piece 使用唯一稳定 id（`s001.p1`），不再重复 `s001`。
 - `say --script` 不再静默忽略 TEXT/`--stdin`/`--file`（退出 2）；显式 `--language/--instruct/--max-new-tokens/--pause-ms` 覆盖脚本 defaults 并进入 plan/recipe。
 - 脚本 schema 错误统一退出 2（重复 id、未知字段、类型/整数错误、未闭合 marker、顶层 `project`），并先校验脚本再扫描模型；YAML 纯 anchor 也会被拒绝。
@@ -31,7 +43,6 @@
 
 ### Planned
 
-- ASR 质检 `check`（CER/WER）与自动 `ref_text`
 - 多 take 资产库与自动选优
 - 长音频对齐分窗（> 5 分钟）
 

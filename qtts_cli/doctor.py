@@ -129,7 +129,15 @@ def gather(cfg) -> dict[str, Any]:
         },
         "packages": {
             name: _package_version(name)
-            for name in ("qwen-tts", "qwen-asr", "transformers", "torch", "numpy", "soundfile")
+            for name in (
+                "qwen-tts",
+                "qwen-asr",
+                "transformers",
+                "torch",
+                "numpy",
+                "soundfile",
+                "scipy",
+            )
         },
         "torch": _torch_report(),
         "tools": {
@@ -162,7 +170,7 @@ def gather(cfg) -> dict[str, Any]:
     if not _module_present("qwen_tts"):
         report["advice"].append("qwen-tts is missing; `say`/`voice` cannot run")
     if not _module_present("qwen_asr"):
-        report["advice"].append("qwen-asr is missing; `align`/`--subtitle` cannot run")
+        report["advice"].append("qwen-asr is missing; `align`/`--subtitle`/`check` cannot run")
     if not cfg.model_dir or not Path(cfg.model_dir).is_dir():
         report["advice"].append("no model directory; pass --model-dir or set QTTS_MODEL_DIR")
     if report["tools"].get("ffmpeg") is None:

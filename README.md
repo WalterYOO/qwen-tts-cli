@@ -44,6 +44,9 @@
 | **多角色脚本** | `script lint/compile` 与 `say --script` 接受 YAML/JSON；逐段音色、模型、语言、instruct、seed 与预算，生成稳定、无时间戳的计划 |
 | **词典与导演标记** | `--lexicon` 让 TTS 读 `spoken`、字幕显示原文 `term`；`[[pause:MS]]` 只影响音频与时间轴，不进入字幕 |
 | **批量清单** | `batch plan/run` 全量预校验 JSONL、确定性计划、单线程原子状态、并发调度、`--resume/--retry/--fail-fast` |
+| **ASR 质检** | `check AUDIO` 用 Qwen3-ASR 转写，按语言自动选 CER/WER，输出编辑距离、错误片段与可选阈值门禁 |
+| **音频 QC** | `qc AUDIO` 测量响度（BS.1770 LUFS）、true peak、削波、DC、静音与语速；阈值全部可选，`say --qc` 复用同一实现 |
+| **自动参考文本** | `voice add --kind clone --auto-ref-text` 用 ASR 转写参考音频，作为 ICL 的 `ref_text` 并记录来源与模型 |
 | **音色归档** | `voice export/import` 单文件 `.qttsvoice`，白名单成员、流式校验、原子替换 |
 | **项目锁文件** | `project init/lock` 固定模型全量 sha256、音色、采样参数、字幕策略与运行时版本 |
 | **计划与诊断** | `--dry-run` 不加载模型即可输出分段与预算；`doctor --bench` 产出本机性能基线 |
@@ -55,7 +58,8 @@
 
 - Python 3.10–3.12
 - macOS 或 Linux（Windows 未验证）
-- 本地推理需要 `qwen-tts` 与 `qwen-asr`（ForcedAligner）
+- 本地推理需要 `qwen-tts` 与 `qwen-asr`（ForcedAligner / ASR）
+- 基础依赖包含 `scipy`，用于 LUFS K-weighting 与 true peak 重采样；scipy 不可用时这两项为 `null` 并在 `unavailable` 给出原因
 - 可选：`ffmpeg` / `SoX`（格式转换与音频检查）
 
 **实测通过的版本组合（macOS / Apple Silicon / MPS）：**
@@ -80,7 +84,7 @@ cd qwen-tts-cli
 python -m venv .venv
 source .venv/bin/activate
 
-# 1) 安装 CLI 本体（numpy + soundfile + PyYAML）
+# 1) 安装 CLI 本体（numpy + scipy + soundfile + PyYAML）
 pip install -e .
 
 # 2) 依次安装运行时；第二条会把 transformers 升到 4.57.6
@@ -265,6 +269,24 @@ qtts batch run manifest.jsonl --out-dir build --jobs 2 --resume --retry 2 --watc
 
 `batch plan` 启动时完整解析、校验并编译全部条目，写 `build/plan.json` 与初始 `build/status.jsonl`，不加载模型。`batch run` 复用单条 `say` 执行器；`job_key` 覆盖文本、音色/模型身份、语言、instruct、采样、格式、字幕、词典内容哈希与输出路径。`--resume` 只在 `status=done`、`job_key`、输出 sha256 和 recipe 的 `job_key` 全部匹配时跳过；只有被标记为 transient 的失败才可在 `--resume --retry` 下重新调度。`status.jsonl` 由单线程调度器原子重写，记录 `last_error`/`transient`，崩溃遗留的 `running` 会恢复为 `pending`。部分失败退出 6。
 
+### 10. ASR 质检与音频 QC
+
+```bash
+# 转写音频并与参考文本比较；中文默认 CER，英文默认 WER
+qtts check out.wav --text "你好，世界。" --threshold 0.05 --report check.json
+
+# 只测量音频，不设阈值时永远退出 0
+qtts qc out.wav --json --report qc.json
+
+# 生成后立即质检；阈值与 qc 子命令同名
+qtts say "你好。" --voice "builtin:Vivian" --qc \
+  --max-clipping-ratio 0.001 --target-lufs -16 --lufs-tolerance 1.0 --out hello.wav
+```
+
+`check` 的参考文本与 ASR 文本走同一归一化管道（标点/符号移除、空白折叠、大小写折叠）；`ratio = distance / max(1, 参考单元数)`，`ratio <= threshold` 通过（默认 0.03），否则退出 5。归一化、编辑距离与错误片段均可复现；Wave 3a 冻结时间戳，`errors[].start/end` 固定为 `null`。`check` 单次音频上限 300 秒，超过在加载模型前退出 4。
+
+`qc` 的阈值全部可选，未显式给出的指标只测量不判定。`lufs_integrated` 用 BS.1770-4（K-weighting、400ms 块、绝对 -70 LUFS 与相对 -10 LU 门限），`true_peak_dbtp` 至少 4x 过采样；数字静音、音频过短或 scipy 不可用时返回 `null`，并在 `unavailable` 中以稳定枚举说明原因，绝不编造数值。`--reference-voice` 额外计算说话人余弦相似度，需要 Base 模型。`--json` 与 `--report` 生成逐字节相同的排序 JSON，不含绝对路径、时间戳或耗时。
+
 ---
 
 ## 命令参考
@@ -300,6 +322,10 @@ qtts say [TEXT | - | --file FILE | --script FILE | --stdin --jsonl]
   [--max-new-tokens N]
   [--pause-ms N]
   [--model MODEL]
+  [--qc] [--reference-voice NAME]
+  [--max-clipping-ratio N] [--target-lufs N --lufs-tolerance N]
+  [--max-true-peak-dbtp N] [--max-dc-offset N] [--max-silence-ratio N]
+  [--min-speech-rate N] [--max-speech-rate N]
   [--dry-run] [--yes]
 ```
 
@@ -313,6 +339,8 @@ qtts say [TEXT | - | --file FILE | --script FILE | --stdin --jsonl]
 - 字幕策略默认：单 cue 最大 42 显示宽度、单行最大 42、CPS 20、最短 0.8s、最长 7s、合并最大静音间隔 300ms。CPS = 非空白可见显示宽度 / 渲染秒数（毫秒先量化；CJK/全角/emoji 宽 2，组合字符宽 0）；恰等于上限不算违规。短 cue 合并与 CPS 平衡都不会跨过超过 `--max-merge-gap-ms` 的静音。
 - 短句（如 `好。`）只告警；若其显示宽度不超过 `max_cps * min_cue_seconds`，即使当前时长导致 CPS 偏高，也只作为 warning。只有“可修复但仍超限”的格式/质量失败才退出 5。退出 5 时不写字幕文件，仍可写音频与配方，并在 `--json` 的 `details.subtitle_qc` 给出完整报告。
 - `--no-subtitle-qc` 只关闭阈值判定；重叠、越界、非正时长、非单调仍会修复，无法修复则退出 4，配方记录 `enabled:false` 与修复计数。
+- `--qc` 对最终音频（含首尾停顿）运行同一套 `audio_qc.analyze()`，指标写入 `--json` 的 `qc` 字段与 recipe；不指定阈值时只测量，越界时音频与报告仍完整写出并退出 5。`--reference-voice` 必须与 `--qc` 同时使用，且会额外加载 Base 模型计算说话人相似度；不带它时 `--qc` 不加载任何额外模型。
+- `--qc --reference-voice` 在纯参数/输出组合校验之后、任何生成或写音频之前，依次做 profile 文件级校验、Base 模型解析与类级 embedding 能力探测（不加载权重）；profile 不存在、Base 缺失或运行时无该能力时不会产生音频或 recipe。`--dry-run` 只做 profile 文件级校验，不导入 torch/qwen_tts。
 - `--stdin --jsonl` 每行一个请求：`{"id","text","voice"?,"out"?}`；每行结果 `{"id","status":"ok","output","recipe","metrics"}` 或 `{"id","status":"error","error":{"code","message","details"}}`。单条失败继续，全部成功退出 0、任一失败退出 6、空 stdin 或启动参数错误退出 2。`--jsonl` 不能与 `--json`、`--out`、`--recipe-out`、`--subtitle-out-prefix`、`--dry-run`、位置文本或 `--out-dir -` 组合；`out` 必须是文件路径，不能是 `-`。
 - stdout 一次只能承载一个产物：`--out -`、`--json`、`--subtitle-out-prefix -`、`--recipe-out -` 互斥。
 - `--out -` 时 stdout 是纯音频，摘要写 stderr。未指定 `--recipe-out` 时，recipe 写到 data-dir 的 `recipes/<request hash>.recipe.json`；hash 覆盖 voice identity、seed、sampling、language、instruct 与逐段 cache key，避免相同文本的不同请求互相覆盖。
@@ -344,6 +372,40 @@ qtts batch run MANIFEST.jsonl --out-dir DIR
 - `--resume` 要求 `status=done`、`job_key` 相同、输出存在且 sha256 匹配、recipe 存在且其 `job_key` 匹配；`running` 恢复为 `pending`，`skipped` 下次重新调度。`--retry N` 只重试执行期 transient 失败（ModelError/OSError/RuntimeError），普通异常立即失败；status 记录 `attempts`、`last_error` 与 `transient`，`--resume --retry` 只重新调度 `transient=true` 的失败；`--fail-fast` 只停止调度新任务，未启动项标 `skipped`。
 - 进度与 `--watch` 只写 stderr；stdout 只有最终 summary（`--json` 为单个对象）。任一任务失败退出 6。
 
+### `qtts check`
+
+```text
+qtts check AUDIO (--text TEXT | --text-file FILE | --srt FILE)
+  [--language auto|Chinese|English|...]
+  [--asr-model PATH|ID]
+  [--metric auto|cer|wer] [--threshold 0.03]
+  [--report FILE] [--json]
+```
+
+- 参考输入三者互斥且必须给一个，否则退出 2；AUDIO 不存在/不可读退出 4；音频超过 300 秒在模型加载前退出 4。
+- `auto` 时中文/日文选择 CER，空格分词语言选择 WER；也可显式 `--metric`。CJK 的 CER 去掉所有空白后按字符比较。
+- `--language` 大小写不敏感并 canonicalize 到 Qwen3-ASR 冻结语言表；非法语言在读取音频或选择模型之前退出 2。语言在全局表但所选 ASR 模型不支持时也在加载权重前退出 2；小写 `chinese`/`english` 与规范名产生相同的数字/日期/货币读法。
+- ASR 模型按 `--asr-model`、本地路径或 `Qwen/Qwen3-ASR-0.6B` 这类 id 解析；缺失退出 3，多个同版本候选退出 2。
+- 报告包含 `schema_version/ok/audio/metric/threshold/ratio/distance/reference_units/units/reference/hypothesis/errors/asr/comparison_language/normalization`。`asr.language` 保留 ASR 原始返回值（未检测到就是 `null`），`comparison_language` 是实际用于归一化与选 metric 的语言。`--json` 与 `--report` 逐字节一致，`audio.path` 仅 basename。
+- `ratio > threshold` 时 `ok=false` 并退出 5；`ratio == threshold` 通过。Wave 3a 不启用时间戳，`errors[].start/end` 固定 `null`。
+
+### `qtts qc`
+
+```text
+qtts qc AUDIO [--text TEXT|--text-file FILE] [--language auto]
+  [--reference-voice NAME] [--model MODEL]
+  [--max-clipping-ratio N] [--target-lufs N --lufs-tolerance N]
+  [--max-true-peak-dbtp N] [--max-dc-offset N] [--max-silence-ratio N]
+  [--min-speech-rate N] [--max-speech-rate N]
+  [--report FILE] [--json]
+```
+
+- 只测量时退出 0；任何显式阈值越界时全部指标照常输出、`ok=false`、退出 5。
+- 指标：`peak_dbfs`、`clipping_ratio/count`、`dc_offset`（逐声道最大 |mean|）、`silence_ratio`、`longest_silence_s`、`lufs_integrated`、`true_peak_dbtp`、`speech_rate`、`speaker_similarity`。
+- 音频按原始声道读取；mono/stereo 支持，超过 2 声道退出 4。数字静音或能力缺失的指标为 `null`，原因写在 `unavailable`。
+- 语速阈值需要非空 `--text`/`--text-file`（全空白等同于未提供，退出 2）；`--target-lufs` 与 `--lufs-tolerance` 必须成对出现。
+- `--reference-voice` 必须是 clone profile，需要 Base 模型提供 `extract_speaker_embedding()`；该能力在加载权重前做类级探测。`--model` 路径不存在、非 clone 或无可用 Base 统一退出 3。
+
 ### `qtts voice`
 
 ```text
@@ -361,9 +423,12 @@ qtts voice import FILE.qttsvoice [--name NAME] [--force]
 `add` 的 clone 选项：
 
 ```text
---ref-audio FILE --ref-text TEXT [--mode icl|xvec]
+--ref-audio FILE (--ref-text TEXT | --auto-ref-text) [--mode icl|xvec]
+[--language LANG] [--asr-model PATH|ID]
 --i-have-rights --license TEXT --consent-note TEXT --tags a,b
 ```
+
+`--auto-ref-text` 先用 Qwen3-ASR 转写参考音频，再把文本作为 ICL `ref_text`；与 `--ref-text` 同时给出或与 `--mode xvec` 组合退出 2。`--asr-model` 只能与 `--auto-ref-text` 一起使用，否则退出 2；它与 `check` 使用同一套解析/消歧规则（路径、id、目录名；同版本多个候选必须显式指定）。转写发生在 staging 目录内，ASR 模型在加载 TTS Base 前释放；ASR/模型缺失退出 3，转写为空退出 4，失败不会留下半成品 profile。`voice.json` 记录 `source.ref_text_source=asr` 与 `source.asr_model`。
 
 `add` 的 design 选项：
 
@@ -504,7 +569,7 @@ preview.wav         # 试音
 | 2 | 参数/用法错误 |
 | 3 | 模型或后端错误（加载、显存、依赖） |
 | 4 | 输入校验失败（音频不合格、能力不支持、对齐覆盖率过低） |
-| 5 | 质量门禁未通过 |
+| 5 | 质量门禁未通过（`check` 错误率超阈值、`qc`/`say --qc` 显式阈值越界、字幕 QC） |
 | 6 | 批处理部分失败（`say --stdin --jsonl`、`batch run`） |
 | 130 | 用户中断 |
 
@@ -516,8 +581,9 @@ preview.wav         # 试音
 # 单元测试：不需要 GPU / 模型 / torch
 PYTHONPATH=. pytest tests -q
 
-# 集成测试：需要本地模型与 MPS/CUDA
-RUN_INTEGRATION=1 PYTHONPATH=. pytest tests/test_integration_smoke.py -q
+# 集成测试：需要本地模型与 MPS/CUDA（含 Qwen3-ASR-0.6B）
+QTTS_SMOKE_MODEL_DIR=/path/to/models RUN_INTEGRATION=1 PYTHONPATH=. \
+  pytest tests/test_integration_smoke.py tests/test_integration_wave3a.py -q
 
 # lint
 ruff check qtts_cli tests

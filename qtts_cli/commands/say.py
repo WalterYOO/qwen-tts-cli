@@ -24,6 +24,7 @@ from ..audio_io import (
     write_audio,
     write_audio_stdout,
 )
+from ..audio_qc import analyze as analyze_audio
 from ..cache import AudioCache
 from ..catalog import language_supported, scan, select_aligner
 from ..errors import CapabilityError, InputError, ModelError, QttsError, UsageError
@@ -36,6 +37,9 @@ from ..plan import (
     rekey_plan,
     resolve_dtype_name,
 )
+from ..quality import evaluate as evaluate_quality
+from ..quality import thresholds_from_args as qc_thresholds_from_args
+from ..quality import validate_thresholds as validate_qc_thresholds
 from ..budget import DEFAULT_MAX_NEW_TOKENS
 from ..script import compile_script
 from ..sidecar import build_recipe, recipe_path
@@ -53,6 +57,10 @@ from ..subtitles import (
 from ..tts_engine import TtsEngine, clear_model_cache
 from ..utils import atomic_write_json, atomic_write_text, emit_json, sha256_text
 from ..voice_store import VoiceStore, utc_now
+from .qc import precheck_speaker_similarity as qc_precheck_speaker_similarity
+from .qc import report_payload as qc_report_payload
+from .qc import speaker_similarity as qc_speaker_similarity
+from .qc import validate_reference_voice as validate_qc_reference_voice
 
 
 # --------------------------------------------------------------------------- #
@@ -159,6 +167,14 @@ def run(
     sub_prefix = _subtitle_prefix(args, out_target)
     recipe_arg = getattr(args, "recipe_out", None)
 
+    qc_enabled = bool(getattr(args, "qc", False))
+    qc_reference_voice = getattr(args, "reference_voice", None)
+    qc_thresholds = qc_thresholds_from_args(args) if qc_enabled else {}
+    if qc_enabled:
+        validate_qc_thresholds(qc_thresholds, has_text=True)
+    elif qc_reference_voice:
+        raise UsageError("--reference-voice requires --qc")
+
     # stdout has exactly one consumer (codex P0-2). Validate before any load.
     consumers: list[str] = []
     if out_target == "-":
@@ -177,6 +193,15 @@ def run(
         raise UsageError("--subtitle-out-prefix - supports exactly one subtitle format")
     if out_target == "-" and subtitle_formats and sub_prefix is None:
         raise UsageError("--out - cannot host subtitle files; pass --subtitle-out-prefix")
+
+    if qc_reference_voice:
+        # Profile and Base/runtime prechecks run after pure parameter/output
+        # validation but before any generation or audio write (t10 P1-4/P2).
+        validate_qc_reference_voice(VoiceStore(cfg.data_dir), qc_reference_voice)
+        if not getattr(args, "dry_run", False):
+            qc_precheck_speaker_similarity(
+                cfg, models, getattr(args, "model", None)
+            )
 
     if structured:
         plan = compile_script(
@@ -249,6 +274,11 @@ def run(
             "device": cfg.device,
             "dtype": "auto" if cfg.dtype == "auto" else cfg.dtype,
             "memory_estimate": _estimate_memory(plan, aligner_model is not None),
+            "qc": {
+                "enabled": qc_enabled,
+                "thresholds": qc_thresholds,
+                "reference_voice": qc_reference_voice,
+            },
         }
 
     started = time.perf_counter()
@@ -474,6 +504,49 @@ def run(
     else:
         write_audio(out_target, full, sample_rate, fmt)
 
+    qc_result: Optional[dict[str, Any]] = None
+    qc_violations: list[dict[str, Any]] = []
+    if qc_enabled:
+        # QC sees the final audio, including leading/trailing pauses.
+        qc_metrics = analyze_audio(
+            full,
+            sample_rate,
+            text=plan.normalized_text or plan.display_text,
+            language=plan.language,
+        )
+        if qc_reference_voice:
+            qc_store = VoiceStore(cfg.data_dir)
+            validate_qc_reference_voice(qc_store, qc_reference_voice)
+            reusable = (
+                last_engine
+                if last_engine is not None
+                and last_engine.model is not None
+                and last_engine.model_info.kind == "clone"
+                else None
+            )
+            if reusable is None and last_engine is not None:
+                last_engine.model = None
+                clear_model_cache()
+            qc_metrics["speaker_similarity"] = qc_speaker_similarity(
+                cfg,
+                models,
+                qc_store,
+                qc_reference_voice,
+                full,
+                sample_rate,
+                getattr(args, "model", None),
+                reusable_engine=reusable,
+            )
+            qc_metrics["unavailable"].pop("speaker_similarity", None)
+        qc_violations = evaluate_quality(qc_metrics, qc_thresholds)
+        qc_result = qc_report_payload(
+            None if out_target == "-" else out_target,
+            qc_metrics,
+            qc_thresholds,
+            qc_violations,
+            qc_reference_voice,
+        )
+
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     runtime_dtype = (last_engine.dtype_name if last_engine else None) or plan.dtype_name
     runtime_device = last_engine.device if last_engine else cfg.device
@@ -545,6 +618,8 @@ def run(
         recipe["lexicon_sha256"] = plan.lexicon_sha256
     if subtitle_formats and qc_report is not None:
         recipe["subtitle_qc"] = qc_report.to_dict()
+    if qc_result is not None:
+        recipe["qc"] = qc_result
     if recipe_target == "-":
         emit_json(recipe)
     elif recipe_target is not None:
@@ -579,6 +654,11 @@ def run(
         payload["align_coverage"] = round(min(coverages), 4) if coverages else None
         payload["subtitle_qc"] = qc_report.to_dict() if qc_report is not None else None
         payload["subtitle_boundaries"] = dict(boundary_stats)
+    if qc_result is not None:
+        payload["qc"] = qc_result
+        if qc_violations:
+            payload["ok"] = False
+            payload["exit_code"] = 5
     return payload
 
 

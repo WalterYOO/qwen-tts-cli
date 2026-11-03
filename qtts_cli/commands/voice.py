@@ -8,9 +8,10 @@ from typing import Any, Optional
 
 from .. import __version__
 from ..admit import check_ref_audio
+from ..asr_engine import AsrEngine, clear_asr_cache
 from ..audio_io import duration_s, resolve_output_format, write_audio
 from ..capabilities import validate_capabilities
-from ..catalog import ModelInfo, find_model, scan, select
+from ..catalog import ModelInfo, find_model, scan, select, select_asr
 from ..errors import InputError, ModelError, UsageError
 from ..plan import SAMPLING_DEFAULTS, resolve_dtype_name
 from ..sidecar import build_recipe, recipe_path, write_recipe
@@ -28,6 +29,10 @@ DEFAULT_DESIGN_SAMPLE = "你好，很高兴认识你。"
 # add
 # --------------------------------------------------------------------------- #
 def add(cfg, args) -> dict[str, Any]:
+    if getattr(args, "auto_ref_text", False) and args.kind != "clone":
+        raise UsageError("--auto-ref-text is only valid with --kind clone")
+    if getattr(args, "asr_model", None) and not getattr(args, "auto_ref_text", False):
+        raise UsageError("--asr-model requires --auto-ref-text")
     if args.kind == "clone":
         return _add_clone(cfg, args)
     if args.kind == "design":
@@ -63,10 +68,27 @@ def _add_clone(cfg, args) -> dict[str, Any]:
     mode = (args.mode or "icl").lower()
     if mode not in ("icl", "xvec"):
         raise UsageError("--mode must be icl or xvec")
-    if mode == "icl" and not (args.ref_text or "").strip():
-        raise InputError("--mode icl requires --ref-text; use --mode xvec to skip it")
 
-    report = check_ref_audio(args.ref_audio, ref_text=args.ref_text, language=args.language)
+    auto_ref_text = bool(getattr(args, "auto_ref_text", False))
+    explicit_language = getattr(args, "language", None)
+    language = explicit_language or "Chinese"
+    ref_text = getattr(args, "ref_text", None)
+    if auto_ref_text:
+        if ref_text is not None:
+            raise UsageError("--auto-ref-text cannot be combined with --ref-text")
+        if mode != "icl":
+            raise UsageError("--auto-ref-text requires --mode icl")
+    elif mode == "icl" and not (ref_text or "").strip():
+        raise InputError(
+            "--mode icl requires --ref-text or --auto-ref-text; "
+            "use --mode xvec to skip it"
+        )
+
+    report = check_ref_audio(
+        args.ref_audio,
+        ref_text=None if auto_ref_text else ref_text,
+        language=language,
+    )
     if not report.ok:
         raise InputError(
             "reference audio rejected by admission checks",
@@ -76,51 +98,86 @@ def _add_clone(cfg, args) -> dict[str, Any]:
 
     models = scan(cfg.model_dir)
     model = find_model(models, args.model) if args.model else select(models, "clone")
-    # Capability gate before the model is loaded (codex P0-8).
+    # Capability gate before the model is loaded (codex P0-8). With auto
+    # ref_text the ICL text is not known yet; it is validated after ASR.
     validate_capabilities(
         model,
         mode="clone",
-        language=args.language,
-        icl=(mode == "icl"),
-        ref_text=args.ref_text if mode == "icl" else None,
+        language=language,
+        icl=(mode == "icl" and not auto_ref_text),
+        ref_text=None if auto_ref_text else ref_text,
     )
-    engine = TtsEngine(cfg, model)
-    engine.load()
-    items = engine.create_clone_prompt_items(
-        args.ref_audio,
-        ref_text=args.ref_text if mode == "icl" else None,
-        x_vector_only_mode=(mode == "xvec"),
-    )
-    if not items:
-        raise ModelError("model returned an empty clone prompt")
-    item = items[0]
 
-    # Build the whole profile in a staging dir and publish it atomically so a
-    # failure never leaves a half-written voice (codex P1-2).
+    asr_model: Optional[ModelInfo] = None
     staging = store.staging_dir(name)
     try:
+        # Stage the reference first: ASR and the clone prompt must read the
+        # same bytes, and no half-written profile may survive a failure.
+        store.copy_ref_audio(name, args.ref_audio, directory=staging)
+        staged_ref = Path(staging) / "ref.wav"
+        ref_sha = sha256_file(staged_ref)
+
+        if auto_ref_text:
+            asr_model = select_asr(models, getattr(args, "asr_model", None))
+            asr = AsrEngine(cfg, asr_model)
+            transcription = asr.transcribe(
+                staged_ref,
+                language=explicit_language,
+                timestamps=False,
+            )
+            ref_text = str(transcription.get("text") or "").strip()
+            if not ref_text:
+                raise InputError(
+                    "ASR produced an empty ref_text for the reference audio",
+                    details={"model": asr_model.model_id},
+                )
+            # Free the 1.8G ASR model before loading Base (MPS co-residency).
+            asr = None
+            clear_asr_cache()
+
+        engine = TtsEngine(cfg, model)
+        engine.load()
+        items = engine.create_clone_prompt_items(
+            staged_ref,
+            ref_text=ref_text if mode == "icl" else None,
+            x_vector_only_mode=(mode == "xvec"),
+        )
+        if not items:
+            raise ModelError("model returned an empty clone prompt")
+        item = items[0]
+
+        source: dict[str, Any] = {
+            "type": "clone",
+            "ref_audio_sha256": ref_sha,
+            "ref_text": ref_text if mode == "icl" else None,
+            "ref_text_source": (
+                "asr" if auto_ref_text else ("user" if ref_text else None)
+            ),
+            "mode": mode,
+            "ref_audio": "ref.wav",
+        }
+        if asr_model is not None:
+            source["asr_model"] = {
+                "id": asr_model.model_id,
+                "revision": asr_model.revision,
+                "fingerprint": asr_model.fingerprint,
+            }
+
         meta = store.create(
             name=name,
             kind="clone",
-            source={
-                "type": "clone",
-                "ref_audio_sha256": sha256_file(args.ref_audio),
-                "ref_text": args.ref_text if mode == "icl" else None,
-                "mode": mode,
-                "ref_audio": "ref.wav",
-            },
+            source=source,
             model={"id": model.model_id, "revision": model.revision,
                    "fingerprint": model.fingerprint, "path": str(model.path)},
             tokenizer={"type": "12hz", "codec_rate_hz": 12.5},
             dtype=engine.dtype_name or resolve_dtype_name(cfg),
-            language=args.language,
+            language=language,
             default_instruct=None,
             tags=_split_tags(args.tags),
             consent=consent,
             qtts_version=__version__,
             staging=staging,
         )
-        store.copy_ref_audio(name, args.ref_audio, directory=staging)
         store.save_prompt_tensors(
             name,
             ref_spk_embedding=item.ref_spk_embedding,
@@ -139,6 +196,8 @@ def _add_clone(cfg, args) -> dict[str, Any]:
         "voice": meta,
         "admission": report.to_dict(),
         "model": model.model_id,
+        "ref_text_source": source.get("ref_text_source"),
+        "asr_model": source.get("asr_model"),
     }
 
 
@@ -151,7 +210,7 @@ def _add_design(cfg, args) -> dict[str, Any]:
     if not description:
         raise UsageError("voice add --kind design requires --description TEXT")
     sample_text = (args.sample_text or DEFAULT_DESIGN_SAMPLE).strip()
-    language = args.language or "Chinese"
+    language = getattr(args, "language", None) or "Chinese"
 
     models = scan(cfg.model_dir)
     design_model = find_model(models, args.model) if args.model else select(models, "design")
@@ -572,6 +631,14 @@ def format_result(payload: dict[str, Any]) -> str:
             f"created={meta.get('created_at')}",
             f"  consent={meta.get('consent')}",
         ]
+        source = meta.get("source") or {}
+        if source.get("ref_text_source"):
+            lines.append(f"  ref_text_source={source['ref_text_source']}")
+        if source.get("asr_model"):
+            asr = source["asr_model"]
+            lines.append(
+                f"  asr_model={asr.get('id')} revision={asr.get('revision')}"
+            )
         if payload.get("admission"):
             warnings = payload["admission"].get("warnings") or []
             lines.append(f"  admission: ok ({len(warnings)} warning(s))")

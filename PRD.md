@@ -716,3 +716,39 @@ qtts align
 - `--resume` 校验 `status=done`、job_key、输出存在且 sha256 匹配、recipe 存在且其中稳定 job_key 匹配；recipe 的 `created_at`/耗时/绝对路径不进入 job_key。`running` 恢复为 `pending`，`skipped` 下次重新调度；失败的 job 只有 `transient=true` 时才会在 `--resume --retry N` 下重新调度。
 - `--retry N` 只重试执行期 transient 失败（ModelError/OSError/RuntimeError），普通异常立即失败；不重试 Usage/Input/Capability/QC。记录 attempts、last_error 与 transient。`--fail-fast` 只停止调度新任务，在跑任务完成，未启动项标 `skipped`。
 - 进度与 `--watch` 只走 stderr；stdout 只有最终 summary。任一任务失败退出 6。
+
+### 13.6 P1 Wave 3a 实现注记
+
+本节记录实现选择，不改变上面的需求定义。
+
+**ASR 模型发现与选择（FR-P1-03）**
+
+- `Qwen3-ASR-*` 与 `Qwen3-ForcedAligner-*` 的 `config.json` 都可能是 `model_type=qwen3_asr`，因此 `catalog.scan()` 先按目录名判定含 `aligner` 的为 `align`，再判定目录名 `Qwen3-ASR-*` 或 `model_type == "qwen3_asr"` 的为 `asr`；不接受任意含 `asr` 子串的第三方 `model_type`。ASR 的 `size` 从目录名解析（如 `0b6`、`1b7`），不依赖 `Qwen3-TTS` 的 `tts_model_size`。
+- ASR 模型的完整性检查单独处理：只要求存在 `*.safetensors`，不要求 TTS 的 `speech_tokenizer` 目录。
+- `select_asr(models, spec=None)` 独立于 TTS 的 `find_model`：`spec` 支持本地目录、`org/id`、basename 与精确名称；无 `spec` 时选最高版本，同版本多个候选退出 2；缺失或命中的不是 ASR 模型退出 3（不是 `find_model` 的 4）。
+
+**ASR 运行时与报告（FR-P1-03）**
+
+- `AsrEngine` 惰性导入 `qwen_asr`；`transcribe()` 把模型返回规范化成 `{"text", "language", "items"}`，接受对象、单元素列表或字符串。Wave 3a 固定 `timestamps=False`，不加载 forced aligner，`errors[].start/end` 恒为 `null`。
+- ASR 模型按 `(model path, device, dtype, fingerprint, aligner path/fingerprint)` 进程内缓存，并加 `RLock`；aligner 参与缓存键，避免未来启用时间戳时复用错误实例。`clear_asr_cache()` 清引用并尽力释放 MPS/CUDA 缓存。
+- `--language auto` 在调用 qwen-asr 前转为 `None`；显式语言先按冻结的 Qwen3-ASR 语言表大小写不敏感 canonicalize，再按 `ModelInfo.languages` 校验，非法值退出 2。`check` 在读取音频或选择模型之前完成全局表校验，因此缺音频、缺模型时非法语言仍先退出 2；语言在全局表但所选模型不支持时也在加载权重前退出 2。
+- `check` 在加载任何模型前完成参考输入、音频（存在、非空、有限、≤300s）校验；ASR 缺失在加载前退出 3。参考文本与 ASR 文本使用同一 `qc_language` 与归一化管道：`normalize_text()` → 去掉 Unicode `P*`/`S*` → 折叠空白 → `casefold()`；`qc_language()` 与 `normalize_for_qc()` 入口先 canonicalize，小写 `chinese`/`english` 与规范名产生相同数字/日期/货币读法。CER 去空白按字符，WER 按空白切词。`ratio = distance / max(1, 参考单元数)`，`ratio == threshold` 通过。
+- 错误片段用 `SequenceMatcher(autojunk=False)`，块区间半开；错误块不合并跨多个操作，便于定位。
+- `--json` 与 `--report` 都写同一 `schema_version: 1` 文档；排序 key、`ensure_ascii=False`、`allow_nan=False`、末尾换行，`audio.path` 只记 basename，模型只记 id/revision。`asr.language` 保留模型返回值（未检测到就是 `null`），另有 `comparison_language` 记录 QC 实际使用的语言。
+
+**音频 QC（FR-P1-07）**
+
+- `audio_qc.analyze()` 是纯函数，任何指标无法可靠计算时返回 `null`，并在 `unavailable` 写稳定原因（如 `scipy_unavailable`、`digital_silence`、`too_short_for_lufs`、`below_absolute_gate`、`cjk_no_word_boundaries`、`no_text`），不编造数值。
+- 音频按原始声道读取；mono/stereo 支持，超过 2 声道退出 4。数字静音时 `peak_dbfs`/`lufs_integrated`/`true_peak_dbtp` 为 `null`。
+- 响度按 ITU-R BS.1770-4：每声道重采样到 48kHz 后做两级 K-weighting，400ms 块、100ms hop，施加 -70 LUFS 绝对门限与 -10 LU 相对门限。true peak 至少 4x 过采样。scipy 为基础依赖；不可用时这两项降级为 `null` + `scipy_unavailable`。
+- 静音检测复用 20ms 帧 RMS，默认 -50 dBFS、最短 0.2s；帧按完整时长补零，避免尾部短静音被漏算。DC offset 取各声道 |mean| 的最大值。
+- 所有 QC 阈值 argparse 默认 `None`；不显式给出就只测量并退出 0。语速门禁要求非空文本：空字符串或全空白 `--text`/`--text-file` 视为未提供并退出 2。越界项以 `{metric, op, value|None, threshold, reason?}` 写入 `violations`，`ok=false` 并退出 5；阈值不可用视为越界，`op=unavailable` 并带枚举原因。
+- `--reference-voice` 要求 clone profile 且有 prompt 或 `ref.wav`；`TtsEngine.require_speaker_embedding()` 在 `load()` 之前做 runtime/类级能力探测，`extract_speaker_embedding()` 也先探测再加载权重。Base 模型选择失败（路径不存在、非 clone、无可用 Base）统一映射为退出 3。非 24kHz 音频重采样后返回扁平 CPU float32。
+
+**`say --qc` 与自动 `ref_text`**
+
+- `say --qc` 对最终拼装音频（含首尾停顿）跑同一 `analyze()`；指标写入 `--json` 的 `qc` 与 recipe 的 `qc`。阈值越界时音频、recipe 与报告仍完整写出，payload `ok=false`、退出 5。
+- 不带 `--reference-voice` 时 `--qc` 不加载额外模型；`--reference-voice` 未与 `--qc` 同用退出 2。
+- `voice add --kind clone --auto-ref-text` 先把参考音频复制到 staging，再从 staging 转写，确保 ASR 与 clone prompt 读取同一份字节；`--asr-model` 只能与 `--auto-ref-text` 同用（否则退出 2），并与 `check` 共用 `select_asr` 解析/消歧。ASR 语言非法时在 staging 内、加载权重前退出 2，失败路径删除 staging。转写成功后清空 ASR 缓存再加载 TTS Base。任何失败删除 staging，不提交半成品 profile。`voice.json.source` 记录 `ref_text`、`ref_text_source=asr` 与 `asr_model{id,revision,fingerprint}`。
+- `say --qc --reference-voice` 先完成纯参数/输出组合校验（例如 `--out -` 与 `--json` 冲突），再在任何生成或写音频前完成 profile 文件级校验、Base 模型解析与类级 embedding 能力探测（不加载权重）。`--dry-run` 只做 profile 文件级校验，不导入运行时。
+- 集成测试复用一条 TTS 生成音频，覆盖真实 ASR 的 CER、故意改字后的退出 5、QC 指标量级与自动 `ref_text`，控制总时长并避免重复加载模型。模型目录只从 `QTTS_SMOKE_MODEL_DIR` 读取；未设置时整组跳过，不把个人绝对路径写入仓库。

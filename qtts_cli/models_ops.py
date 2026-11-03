@@ -59,7 +59,7 @@ def list_models(cfg) -> list[dict[str, Any]]:
 def _complete(model_dir: Path, kind: str) -> bool:
     if not (model_dir / "config.json").is_file():
         return False
-    if kind == "align":
+    if kind in ("align", "asr"):
         return bool(list(model_dir.glob("*.safetensors")))
     return bool(list(model_dir.glob("*.safetensors"))) and (
         model_dir / "speech_tokenizer" / "model.safetensors"

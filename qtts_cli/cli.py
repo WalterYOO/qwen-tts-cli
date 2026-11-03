@@ -11,6 +11,7 @@ from . import __version__
 from .budget import DEFAULT_MAX_NEW_TOKENS
 from .config import build_config
 from .errors import EXIT_INTERRUPT, QttsError, UsageError
+from .quality import canonical_report_text
 from .utils import emit_json, eprint
 
 
@@ -60,6 +61,26 @@ def _add_subtitle_policy(parser: argparse.ArgumentParser) -> None:
                         help="disable subtitle threshold gate (structural repairs still run)")
 
 
+def _add_qc_thresholds(parser: argparse.ArgumentParser) -> None:
+    """QC gates are opt-in: every default is None (t10 H-E01)."""
+    parser.add_argument("--max-clipping-ratio", type=float, default=None,
+                        help="fail when clipping ratio exceeds this (recommended: 0.001)")
+    parser.add_argument("--target-lufs", type=float, default=None,
+                        help="target integrated loudness; pair with --lufs-tolerance")
+    parser.add_argument("--lufs-tolerance", type=float, default=None,
+                        help="allowed LU deviation from --target-lufs")
+    parser.add_argument("--max-true-peak-dbtp", type=float, default=None,
+                        help="fail when true peak exceeds this dBTP (recommended: -1.0)")
+    parser.add_argument("--max-dc-offset", type=float, default=None,
+                        help="fail when |dc offset| exceeds this (recommended: 0.01)")
+    parser.add_argument("--max-silence-ratio", type=float, default=None,
+                        help="fail when silence ratio exceeds this (recommended: 0.5)")
+    parser.add_argument("--min-speech-rate", type=float, default=None,
+                        help="fail below this many characters/second (requires text)")
+    parser.add_argument("--max-speech-rate", type=float, default=None,
+                        help="fail above this many characters/second (requires text)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = QttsArgumentParser(
         prog="qtts",
@@ -72,9 +93,11 @@ def build_parser() -> argparse.ArgumentParser:
     # -- say ---------------------------------------------------------------- #
     from .commands import align as align_cmd
     from .commands import batch as batch_cmd
+    from .commands import check as check_cmd
     from .commands import doctor as doctor_cmd
     from .commands import models as models_cmd
     from .commands import project as project_cmd
+    from .commands import qc as qc_cmd
     from .commands import say as say_cmd
     from .commands import script as script_cmd
     from .commands import voice as voice_cmd
@@ -114,6 +137,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="silence between segments")
     say.add_argument("--model", help="override the automatically selected model")
     say.add_argument("--lexicon", help="JSON pronunciation lexicon (schema_version 1)")
+    say.add_argument("--qc", action="store_true",
+                     help="measure the final assembled audio (no extra model without --reference-voice)")
+    say.add_argument("--reference-voice",
+                     help="clone profile used for speaker similarity (loads Base)")
+    _add_qc_thresholds(say)
     say.add_argument("--dry-run", action="store_true", help="print the plan without loading models")
     say.add_argument("--yes", action="store_true", help="non-interactive confirmation")
     say.set_defaults(func=say_cmd.run, formatter=say_cmd.format_result)
@@ -173,10 +201,15 @@ def build_parser() -> argparse.ArgumentParser:
     voice_add.add_argument("--kind", required=True, choices=["clone", "design"])
     voice_add.add_argument("--ref-audio", help="reference audio (clone)")
     voice_add.add_argument("--ref-text", help="reference transcript (clone, ICL mode)")
+    voice_add.add_argument("--auto-ref-text", action="store_true",
+                           help="transcribe --ref-audio with Qwen3-ASR for ICL")
+    voice_add.add_argument("--asr-model",
+                           help="ASR model path or id for --auto-ref-text")
     voice_add.add_argument("--mode", choices=["icl", "xvec"], default="icl")
     voice_add.add_argument("--description", help="natural-language voice description (design)")
     voice_add.add_argument("--sample-text", help="sample text used for design/materialization")
-    voice_add.add_argument("--language", default="Chinese")
+    voice_add.add_argument("--language", default=argparse.SUPPRESS,
+                           help="reference language (default: Chinese profile; omitted leaves ASR auto)")
     voice_add.add_argument("--materialize-clone", action="store_true",
                            help="design -> generate reference -> freeze as clone prompt")
     voice_add.add_argument("--i-have-rights", action="store_true", help="confirm cloning consent")
@@ -298,6 +331,34 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--bench", action="store_true", help="run the local performance baseline")
     doctor.set_defaults(func=doctor_cmd.run, formatter=doctor_cmd.format_result)
 
+    # -- check -------------------------------------------------------------- #
+    check = sub.add_parser("check", help="ASR-based CER/WER quality check")
+    _add_common(check, suppress=True)
+    check.add_argument("audio")
+    check.add_argument("--text")
+    check.add_argument("--text-file")
+    check.add_argument("--srt")
+    check.add_argument("--language", default="auto")
+    check.add_argument("--asr-model", help="ASR model path or id")
+    check.add_argument("--metric", choices=["auto", "cer", "wer"], default="auto")
+    check.add_argument("--threshold", type=float, default=0.03,
+                       help="maximum error ratio (default: 0.03)")
+    check.add_argument("--report", help="write a deterministic JSON report")
+    check.set_defaults(func=check_cmd.run, formatter=check_cmd.format_result)
+
+    # -- qc ----------------------------------------------------------------- #
+    qc = sub.add_parser("qc", help="measure audio quality and apply explicit gates")
+    _add_common(qc, suppress=True)
+    qc.add_argument("audio")
+    qc.add_argument("--text")
+    qc.add_argument("--text-file")
+    qc.add_argument("--language", default="auto")
+    qc.add_argument("--reference-voice", help="clone profile for speaker similarity")
+    qc.add_argument("--model", help="Base model override for speaker embeddings")
+    _add_qc_thresholds(qc)
+    qc.add_argument("--report", help="write a deterministic JSON report")
+    qc.set_defaults(func=qc_cmd.run, formatter=qc_cmd.format_result)
+
     return parser
 
 
@@ -317,10 +378,20 @@ def main(argv: Optional[list[str]] = None) -> int:
             payload = say_cmd.run_jsonl(cfg, args)
         else:
             payload = args.func(cfg, args)
+        canonical = bool(payload.pop("_canonical", False))
+        # Canonical QC reports are byte-identical to --report files, so the
+        # process exit code must not leak into the JSON document.
+        exit_code = payload.get("exit_code")
+        if canonical:
+            payload.pop("exit_code", None)
         if payload.get("raw_stdout"):
-            return int(payload.get("exit_code", 0))
+            return int(exit_code or 0)
         if cfg.json:
-            emit_json(payload)
+            if canonical:
+                sys.stdout.write(canonical_report_text(payload))
+                sys.stdout.flush()
+            else:
+                emit_json(payload)
         else:
             text = args.formatter(payload)
             if text:
@@ -330,8 +401,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     print(text, file=sys.stderr)
                 else:
                     print(text)
-        if "exit_code" in payload:
-            return int(payload["exit_code"])
+        if exit_code is not None:
+            return int(exit_code)
         return 0 if payload.get("ok", True) else 1
     except QttsError as exc:
         if want_json:

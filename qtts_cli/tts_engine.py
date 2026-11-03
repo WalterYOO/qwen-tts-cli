@@ -8,7 +8,9 @@ imported only inside :meth:`TtsEngine.load`, which is never reached by
 from __future__ import annotations
 
 import gc
+import math
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -35,6 +37,21 @@ def _runtime():
             details={"error": f"{type(exc).__name__}: {exc}"},
         ) from exc
     return torch, Qwen3TTSModel, VoiceClonePromptItem
+
+
+def _class_supports_speaker_embedding(model_class: Any) -> bool:
+    """Check the runtime API without loading weights (t10 Wave 3a P1-5)."""
+    if hasattr(model_class, "extract_speaker_embedding"):
+        return True
+    module = sys.modules.get(getattr(model_class, "__module__", ""))
+    if module is None:
+        return False
+    return any(
+        isinstance(candidate, type)
+        and candidate.__name__.endswith(("ForConditionalGeneration", "Model"))
+        and hasattr(candidate, "extract_speaker_embedding")
+        for candidate in vars(module).values()
+    )
 
 
 def clear_model_cache() -> None:
@@ -154,6 +171,68 @@ class TtsEngine:
                 )
         except Exception as exc:
             raise ModelError(f"failed to build clone prompt: {exc}") from exc
+
+    # -- speaker embedding -------------------------------------------------- #
+    def require_speaker_embedding(self) -> None:
+        """Raise before loading weights when the runtime lacks the capability."""
+        _, Qwen3TTSModel, _ = _runtime()
+        if not _class_supports_speaker_embedding(Qwen3TTSModel):
+            raise ModelError(
+                "this qwen-tts build does not expose extract_speaker_embedding(); "
+                "speaker similarity QC is unavailable"
+            )
+
+    def extract_speaker_embedding(
+        self, samples: np.ndarray, sr: int
+    ) -> np.ndarray:
+        """Qwen speaker-encoder embedding for similarity QC (FR-P1-07).
+
+        The underlying API only accepts 24 kHz audio, so other rates are
+        resampled first. The result is a flat CPU float32 vector.
+        """
+        self.require_speaker_embedding()
+        self.load()
+        data = np.asarray(samples, dtype=np.float32)
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        data = np.ascontiguousarray(data.reshape(-1), dtype=np.float32)
+        if data.size == 0:
+            raise ModelError("cannot extract a speaker embedding from empty audio")
+        target_sr = 24000
+        if int(sr) != target_sr:
+            try:
+                from scipy import signal
+
+                divisor = math.gcd(int(sr), target_sr)
+                data = signal.resample_poly(
+                    data, target_sr // divisor, int(sr) // divisor
+                ).astype(np.float32)
+            except Exception as exc:  # pragma: no cover - scipy is a base dep
+                raise ModelError(
+                    f"cannot resample audio to 24 kHz for speaker embedding: {exc}"
+                ) from exc
+        inner = getattr(self.model, "model", self.model)
+        extractor = getattr(inner, "extract_speaker_embedding", None)
+        if extractor is None:
+            raise ModelError(
+                "this qwen-tts build does not expose extract_speaker_embedding(); "
+                "speaker similarity QC is unavailable"
+            )
+        try:
+            with stdout_to_stderr():
+                embedding = extractor(data, target_sr)
+        except Exception as exc:
+            raise ModelError(f"speaker embedding extraction failed: {exc}") from exc
+        for attribute in ("detach", "cpu", "float", "numpy"):
+            if hasattr(embedding, attribute):
+                try:
+                    embedding = getattr(embedding, attribute)()
+                except Exception:  # pragma: no cover - backend dependent
+                    break
+        vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        if vector.size == 0:
+            raise ModelError("model returned an empty speaker embedding")
+        return vector
 
     # -- generation --------------------------------------------------------- #
     def _seed(self, seed: int) -> None:

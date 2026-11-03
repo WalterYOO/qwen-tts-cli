@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
-from .errors import InputError, ModelError
+from .errors import InputError, ModelError, UsageError
 
 MODEL_KIND_BY_TTS_TYPE = {
     "custom_voice": "builtin",
@@ -98,7 +98,7 @@ class ModelInfo:
     tokenizer_type: Optional[str] = None
     revision: Optional[str] = None
     fingerprint: str = ""
-    kind: str = "unknown"  # builtin / clone / design / align
+    kind: str = "unknown"  # builtin / clone / design / align / asr
 
     @property
     def model_id(self) -> str:
@@ -131,6 +131,18 @@ class ModelInfo:
         }
 
 
+def _size_from_name(name: str) -> Optional[str]:
+    """Parse ``Qwen3-ASR-0.6B`` -> ``0b6`` for stable tier ordering."""
+    match = re.search(r"(\d+(?:\.\d+)?)\s*B", name, re.IGNORECASE)
+    if not match:
+        return None
+    value = match.group(1)
+    if "." in value:
+        major, minor = value.split(".", 1)
+        return f"{major}b{minor}"
+    return f"{int(value)}b0"
+
+
 def _load_one(model_dir: Path) -> Optional[ModelInfo]:
     config = _read_json(model_dir / "config.json")
     if config is None:
@@ -145,8 +157,20 @@ def _load_one(model_dir: Path) -> Optional[ModelInfo]:
         fingerprint=model_fingerprint(model_dir),
     )
 
-    if model_type == "qwen3_asr" or "aligner" in model_dir.name.lower():
+    name_lower = model_dir.name.lower()
+    # Qwen3-ASR and Qwen3-ForcedAligner share model_type "qwen3_asr"; the
+    # directory name is the only reliable discriminator. Check the aligner
+    # first so an aligner is never misclassified as ASR (t10 H-A01).
+    if "aligner" in name_lower:
         info.kind = "align"
+        langs = config.get("support_languages") or []
+        info.languages = [display_language(x) for x in langs] if langs else []
+        return info
+    # Only the known ASR model_type or the frozen directory pattern; matching
+    # any "asr" substring would misclassify third-party models (t10 P2-4).
+    if model_type.lower() == "qwen3_asr" or re.match(r"qwen3[-_]asr", name_lower):
+        info.kind = "asr"
+        info.size = _size_from_name(model_dir.name)
         langs = config.get("support_languages") or []
         info.languages = [display_language(x) for x in langs] if langs else []
         return info
@@ -278,6 +302,78 @@ def select_aligner(models: Iterable[ModelInfo]) -> ModelInfo:
         "no forced aligner model found; expected a *ForcedAligner* directory",
         details={"available": [m.name for m in models]},
     )
+
+
+def _asr_version(model: ModelInfo) -> float:
+    """Best-effort version number for "highest version" ASR selection."""
+    match = re.fullmatch(r"(\d+)b(\d+)", str(model.size or "").lower())
+    if match:
+        return float(f"{match.group(1)}.{match.group(2)}")
+    match = re.search(r"(\d+(?:\.\d+)?)\s*B", model.name, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    return 0.0
+
+
+def select_asr(models: Iterable[ModelInfo], spec: Optional[str] = None) -> ModelInfo:
+    """Pick an ASR model by local path, repo id/directory name, or best local.
+
+    ``spec`` may be a directory, ``Qwen/Qwen3-ASR-0.6B``, or a unique name
+    suffix. With no spec the highest local version wins; equal versions are
+    ambiguous and require an explicit choice.
+    """
+    models = list(models)
+    if spec is not None and str(spec).strip():
+        needle = str(spec).strip()
+        path = Path(needle).expanduser()
+        if path.is_dir():
+            info = _load_one(path)
+            if info is None:
+                raise ModelError(
+                    f"not a supported model directory: {path}",
+                    details={"path": str(path)},
+                )
+            if info.kind != "asr":
+                raise ModelError(
+                    f"model {path.name} is not an ASR model (kind={info.kind})",
+                    details={"path": str(path), "kind": info.kind},
+                )
+            return info
+        candidates = [m for m in models if m.kind == "asr"]
+        basename = needle.rstrip("/").split("/")[-1]
+        for predicate in (
+            lambda m: m.name == needle or m.model_id == needle,
+            lambda m: m.name == basename,
+            lambda m: m.name.endswith(needle),
+            lambda m: m.name.endswith(basename),
+        ):
+            hits = [m for m in candidates if predicate(m)]
+            if len(hits) == 1:
+                return hits[0]
+            if len(hits) > 1:
+                raise UsageError(
+                    f"ASR model spec {needle!r} is ambiguous",
+                    details={"available": [m.name for m in hits]},
+                )
+        raise ModelError(
+            f"ASR model not found: {needle}",
+            details={"available": [m.name for m in candidates]},
+        )
+
+    candidates = [m for m in models if m.kind == "asr"]
+    if not candidates:
+        raise ModelError(
+            "no local ASR model found; pull Qwen/Qwen3-ASR-0.6B or pass --asr-model PATH",
+            details={"available": [m.name for m in models]},
+        )
+    ranked = sorted(candidates, key=lambda m: (-_asr_version(m), m.name))
+    best = ranked[0]
+    if len(ranked) > 1 and _asr_version(ranked[1]) == _asr_version(best):
+        raise UsageError(
+            "multiple ASR models with the same version; pass --asr-model",
+            details={"available": [m.name for m in ranked]},
+        )
+    return best
 
 
 def find_model(models: Iterable[ModelInfo], spec: str) -> ModelInfo:
