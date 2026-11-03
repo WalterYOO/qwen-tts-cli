@@ -108,7 +108,7 @@ class GenerationPlan:
     codec_rate: float
     warnings: list[str] = field(default_factory=list)
     subtitle_formats: list[str] = field(default_factory=list)
-    granularity: str = "char"
+    granularity: str = "sentence"
     cache_hit_rate: float = 0.0
     cache_stats: dict[str, Any] = field(default_factory=dict)
     dtype_name: str = "auto"
@@ -233,7 +233,7 @@ def build_plan(
     output: Optional[str] = None,
     fmt: Optional[str] = None,
     subtitle_formats: Optional[list[str]] = None,
-    granularity: str = "char",
+    granularity: str = "sentence",
     models: Iterable[ModelInfo],
     store: VoiceStore,
     model_override: Optional[str] = None,

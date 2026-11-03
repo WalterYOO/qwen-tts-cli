@@ -4,9 +4,9 @@
 |---|---|
 | 文档性质 | 过程记录，不是需求文档 |
 | 记录范围 | 2026-11-02 需求讨论 → 2026-11-03 P0 交付 |
-| 对应需求 | [PRD.md](PRD.md) v0.4 |
-| 对应代码 | `qtts_cli/` P0 实现 |
-| 当前状态 | P0 已完成，经两轮独立审查并修复，119 个测试通过 |
+| 对应需求 | [PRD.md](PRD.md) v0.5 |
+| 对应代码 | `qtts_cli/` P0 实现 + 0.1.1 字幕粒度修正 |
+| 当前状态 | P0 已完成，经两轮独立审查并修复；0.1.1 默认逐句字幕，122 个测试（117 passed + 5 integration skipped） |
 
 本文记录「为什么做成现在这样」，包括走过的弯路、被推翻的判断和关键取舍。面向后续维护者，避免重复踩坑。
 
@@ -39,6 +39,7 @@ Herdr 的 `hc` CLI 用于跨 pane 发送任务、读取输出与等待状态；�
 | 7. 第一轮审查 | 11-03 凌晨 | 10 条 P0 阻断 + 10 条 P1 |
 | 8. 返修与复核 | 11-03 凌晨 | 3 条 PARTIAL 收尾，119 个测试 |
 | 9. 文档与仓库初始化 | 11-03 | `README.md`、`WORKLOG.md`、`.gitignore`、git 提交 |
+| 10. 0.1.1 字幕粒度修正 | 11-03 | `sentence` 默认、PRD v0.5、122 个测试 |
 
 ---
 
@@ -87,6 +88,7 @@ codex 实际读了 `../Qwen3-TTS` 源码，纠正了上一版的 8 处判断：
 | v0.2 | 首个目标设备定为 Mac；验收语言增加英文；M0 支持全部 9 个内置音色；新增依赖门禁 |
 | v0.3 | 依赖实测后改写 §3.3：从「硬冲突、必须桥接」改为「钉版不一致、混装可用」 |
 | v0.4 | P0 实现完成；sidecar 路径澄清为 `<stem>.recipe.json` |
+| v0.5 | 0.1.1：字幕默认逐句；FR-P1-05 拆为 cue 分段策略（05a）与质量门禁（05b） |
 
 ### 3.4 依赖兼容性：一次被推翻的判断
 
@@ -187,6 +189,19 @@ ruff check qtts_cli tests           # All checks passed
 - `--json` + 非法参数：rc=2、stdout 0 字节、stderr 单个 JSON
 - `build_cues("AB", ..., audio_duration=2.0)`：`[(1.8,1.9,'A'),(1.9,2.0,'B')]`，全部 `end > start`
 
+### 3.9 0.1.1 字幕粒度修正
+
+P0 的字幕默认是 `char`。这在英文里表现为按对齐 token 切分，在中文里因为对齐器按字给时间，最终变成**一字一 cue** 的 SRT，默认产出不可读。用户在使用 `qwen-tts-cli-f2` 会话时发现了这一点。
+
+根因不是渲染，而是 `build_cues()` 按 atom 边界切分，而 `--granularity` 默认 `char`。修正如下：
+
+- `GRANULARITIES` 增加 `sentence`，`say` / `align` 默认改为 `sentence`。
+- `say` 的每个 TTS 分段本身就是句子级，因此一句一 cue；`align` 用 `segment_text()` 得到句子范围，复用 `build_cues_for_ranges()`。
+- `char` / `word` 行为不变；`align --srt` 仍优先保留输入 cue 边界。
+- PRD v0.5 把「cue 怎么分段」写成显式需求（FR-P1-05a），与质量门禁（FR-P1-05b）分开。0.1.1 只做逐句，不做超长句切分/短句合并。
+
+新增 3 个回归测试，总数 122（117 passed + 5 integration skipped）。
+
 ---
 
 ## 4. 关键决策记录
@@ -216,7 +231,7 @@ ruff check qtts_cli tests           # All checks passed
 | `WORKLOG.md` | 本文 |
 | `pyproject.toml` | 打包、extras、入口点、pytest 配置 |
 | `qtts_cli/` | P0 实现 |
-| `tests/` | 119 个测试，含审查回归与集成 smoke |
+| `tests/` | 122 个测试，含审查回归与集成 smoke |
 | `.gitignore` | 忽略缓存、虚拟环境、生成产物 |
 
 不在仓库内：
@@ -275,7 +290,7 @@ $HOME/miniconda3/envs/qwen3-asr/bin/python -m venv --system-site-packages /tmp/q
 2. 多角色脚本与 `script compile`
 3. ASR `check` 与 CER/WER 门禁
 4. 多 take 资产库
-5. 字幕 CPS / 行宽门禁
+5. 字幕 cue 分段策略（超长句切分 / 短句合并）与 CPS / 行宽门禁
 6. `voice export/import`
 7. `project init/lock`
 8. 长音频对齐分窗（>5 分钟）

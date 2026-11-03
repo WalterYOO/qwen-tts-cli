@@ -74,7 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
     say.add_argument("--subtitle", help="comma list of srt,vtt,ass,json")
     say.add_argument("--subtitle-out-prefix", help="prefix for subtitle files (or '-' for stdout)")
     say.add_argument("--recipe-out", help="write the reproducibility recipe here ('-' for stdout)")
-    say.add_argument("--granularity", choices=["char", "word"], default="char")
+    say.add_argument(
+        "--granularity",
+        choices=["sentence", "char", "word"],
+        default="sentence",
+        help="cue granularity (default: sentence)",
+    )
     say.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     say.add_argument("--pause-ms", type=int, default=300, help="silence between segments")
     say.add_argument("--model", help="override the automatically selected model")
@@ -139,7 +144,12 @@ def build_parser() -> argparse.ArgumentParser:
     align.add_argument("--srt")
     align.add_argument("--script")
     align.add_argument("--language", default="auto")
-    align.add_argument("--granularity", choices=["char", "word"], default="char")
+    align.add_argument(
+        "--granularity",
+        choices=["sentence", "char", "word"],
+        default="sentence",
+        help="cue granularity (default: sentence)",
+    )
     align.add_argument("--format", default="srt", help="comma list of srt,vtt,ass,json")
     align.add_argument("--out-prefix", help="output prefix (default: audio stem)")
     align.add_argument("--recipe-out", help="write the alignment recipe here ('-' for stdout)")

@@ -2,8 +2,8 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档版本 | v0.4（P0 实现完成；sidecar 路径澄清为 `<stem>.recipe.json`） |
-| 日期 | 2026-11-02 |
+| 文档版本 | v0.5（字幕默认逐句；cue 分段策略与质量门禁拆为 P1 显式需求） |
+| 日期 | 2026-11-03 |
 | 状态 | Draft，待评审 |
 | 参考实现 | [`../Qwen3-TTS`](../Qwen3-TTS)（`qwen-tts==0.1.1`） |
 | 目标产物 | 可安装的本地 CLI + Python 包 |
@@ -183,7 +183,8 @@ Qwen3-TTS 官方仓库提供了 Python API 和示例脚本，但直接使用存�
 
 - `align AUDIO --text FILE|--srt|--script`，输出 SRT/VTT/ASS/JSON。
 - `say --subtitle srt,vtt,json`：生成音频后直接对齐，逐段累加时间偏移。
-- 粒度 `char|word`；CPS 与行宽约束在 P1 加门禁，P0 先输出原始时间轴。
+- 粒度 `sentence|char|word`，默认 `sentence`：每个句子一个 cue；`char` 用于逐字校对/卡拉 OK，`word` 用于英文逐词校对。`--srt` 输入始终保留原 cue 边界。
+- P0 输出原始时间轴；超长句二次切分、短句合并、CPS 与行宽门禁在 P1 实现（FR-P1-05a / FR-P1-05b）。
 - 依赖 `qwen-asr`，M0 默认与主环境同装（已实测可用，见 §3.3）；未安装时给出明确指引，不静默失败。子进程桥接保留为冲突时的 fallback。
 - 复杂度：M
 
@@ -214,7 +215,8 @@ Qwen3-TTS 官方仓库提供了 Python API 和示例脚本，但直接使用存�
 | FR-P1-02 | 多角色脚本 | YAML/JSON 声明角色、音色、语言、instruct、停顿；`script lint/compile` 产出 plan | M |
 | FR-P1-03 | ASR 质检 | 自动 `ref_text`（仅 ICL）；`check` 计算规范化 CER/WER，定位错误片段；与 `align` 共用 qwen-asr 集成形态 | L |
 | FR-P1-04 | 多 take 资产库 | `--takes N` 显式开启；`--select cer,speaker-sim,lufs`；`takes list/compare/promote` | L |
-| FR-P1-05 | 字幕质量门禁 | CPS、最短/最长展示时长、重叠、行宽、标点悬挂；不达标非零退出 | S |
+| FR-P1-05a | 字幕 cue 分段策略 | 默认逐句；超长句按次级标点切分并受最大字数/CPS 约束；过短句可合并且不跨段；始终保持 `join(cue.text) == normalized_text` | S |
+| FR-P1-05b | 字幕质量门禁 | CPS、最短/最长展示时长、重叠、行宽、标点悬挂；不达标非零退出 | S |
 | FR-P1-06 | 发音词典与导演标记 | `--lexicon dict.json`；停顿/重音/速度用可重复的标记，不依赖 instruct | M |
 | FR-P1-07 | 音频 QC | 削波、LUFS、真峰值、DC offset、静音、语速；speaker similarity 复用 Base `extract_speaker_embedding()` | L |
 | FR-P1-08 | Agent 友好 stdin 模式 | `say --stdin --jsonl`：一行请求一行结果，含 `id/status/output/metrics` | S |
@@ -333,7 +335,7 @@ qtts voice rm NAME [--yes]
 qtts align AUDIO
   --text TEXT | --text-file FILE | --srt FILE | --script FILE
   --language Chinese
-  --granularity char|word
+  --granularity sentence|char|word
   --format srt,vtt,ass,json
   --out-prefix OUT
 
@@ -461,7 +463,7 @@ qtts finetune prepare|train|eval --project project.yaml
     }
   ],
   "output": {"path": "out.wav", "format": "wav"},
-  "subtitle": {"enabled": true, "formats": ["srt", "json"], "granularity": "char"},
+  "subtitle": {"enabled": true, "formats": ["srt", "json"], "granularity": "sentence"},
   "qc": {"asr": false, "audio": true}
 }
 ```
@@ -553,7 +555,7 @@ qtts align
 - 多角色脚本与 `script compile`
 - `check`（ASR + CER/WER）
 - takes 资产库
-- 字幕质量门禁
+- 字幕 cue 分段策略（超长句切分 / 短句合并）与 CPS / 行宽门禁
 - `voice export/import`
 - `project init/lock`
 
@@ -582,6 +584,7 @@ qtts align
 11. 英文文本走通完整链路：`say --language English` 生成音频，`--subtitle srt` 的字幕文本与原文逐字一致。
 12. `voice list` 能枚举并试听全部 9 个内置音色；任一 `builtin:<speaker>` 可用于 `say`。
 13. 同进程 smoke test：先 TTS 生成 wav，再对同一 wav + 原文调用 ForcedAligner，全部成功；该测试纳入回归。
+14. 默认 `--granularity sentence`：中文、英文多句文本的 cue 数等于句数，`join(cue.text)` 与规范化原文逐字一致；显式 `char` / `word` 行为与 0.1.0 一致；`align --srt` 仍保留原 cue 边界。
 
 ---
 

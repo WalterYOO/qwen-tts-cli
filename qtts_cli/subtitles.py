@@ -12,9 +12,10 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Sequence
 
 from .errors import InputError, UsageError
+from .segmenter import segment_text
 
 SUBTITLE_FORMATS = ("srt", "vtt", "ass", "json")
-GRANULARITIES = ("char", "word")
+GRANULARITIES = ("sentence", "char", "word")
 MIN_CUE_SECONDS = 0.001
 
 
@@ -293,11 +294,22 @@ def _clean_cues(cues: Sequence[Cue], audio_duration: Optional[float]) -> list[Cu
     return out
 
 
+def _sentence_ranges(text: str) -> list[tuple[int, int]]:
+    """Character ranges of sentence-like segments; concatenation is ``text``."""
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for sentence in segment_text(text):
+        end = cursor + len(sentence)
+        ranges.append((cursor, end))
+        cursor = end
+    return ranges
+
+
 def build_cues(
     text: str,
     items: Sequence[AlignItem],
     *,
-    granularity: str = "char",
+    granularity: str = "sentence",
     fallback_duration: Optional[float] = None,
     audio_duration: Optional[float] = None,
 ) -> list[Cue]:
@@ -315,6 +327,13 @@ def build_cues(
         )
         end = min(duration, audio_duration) if audio_duration else duration
         return [Cue(0.0, max(MIN_CUE_SECONDS, end), text)]
+
+    if granularity == "sentence":
+        # One cue per sentence-like segment, timed from its first/last matched
+        # character. P1 adds secondary splitting and CPS/line-length gates.
+        return build_cues_for_ranges(
+            text, items, _sentence_ranges(text), audio_duration=audio_duration
+        )
 
     atoms = _atoms_from_spans(text, spans, granularity)
     boundaries = [0]
@@ -450,7 +469,7 @@ def to_ass(cues: Sequence[Cue]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def to_json(cues: Sequence[Cue], *, language: Optional[str] = None, granularity: str = "char") -> str:
+def to_json(cues: Sequence[Cue], *, language: Optional[str] = None, granularity: str = "sentence") -> str:
     import json
 
     payload = {
@@ -462,7 +481,7 @@ def to_json(cues: Sequence[Cue], *, language: Optional[str] = None, granularity:
     return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
 
 
-def render(cues: Sequence[Cue], fmt: str, *, language: Optional[str] = None, granularity: str = "char") -> str:
+def render(cues: Sequence[Cue], fmt: str, *, language: Optional[str] = None, granularity: str = "sentence") -> str:
     if fmt == "srt":
         return to_srt(cues)
     if fmt == "vtt":

@@ -232,7 +232,7 @@ qtts say [TEXT | - | --file FILE | --script FILE]
   [--subtitle srt,vtt,ass,json]
   [--subtitle-out-prefix PREFIX | -]
   [--recipe-out FILE | -]
-  [--granularity char|word]
+  [--granularity sentence|char|word]
   [--max-new-tokens N]
   [--pause-ms N]
   [--model MODEL]
@@ -243,6 +243,7 @@ qtts say [TEXT | - | --file FILE | --script FILE]
 
 - `--instruct` 只支持 1.7B CustomVoice / VoiceDesign；Base、0.6B CustomVoice 收到会直接退出 4。
 - `--language auto` 按段判定并逐段校验。
+- `--granularity` 默认 `sentence`：一句一 cue；`char` 逐字（卡拉 OK/精修），`word` 按英文词。P1 再加超长句切分、短句合并与 CPS/行宽门禁。
 - stdout 一次只能承载一个产物：`--out -`、`--json`、`--subtitle-out-prefix -`、`--recipe-out -` 互斥。
 - `--out -` 时 stdout 是纯音频，摘要写 stderr。
 
@@ -276,13 +277,14 @@ qtts voice rm NAME [--yes]
 qtts align AUDIO
   (--text TEXT | --text-file FILE | --srt FILE | --script FILE)
   [--language Chinese]
-  [--granularity char|word]
+  [--granularity sentence|char|word]
   [--format srt,vtt,ass,json]
   [--out-prefix PREFIX]
   [--recipe-out FILE | -]
 ```
 
 - 单样本对齐上限约 5 分钟；超过会退出 4（长音频分窗属 P1）。
+- 默认 `--granularity sentence`，按句子出 cue；`char` / `word` 可显式选择。
 - `--srt` 输入会保留原 cue 的编号和边界，只重算时间。
 - 字幕文本是该 cue 的规范化原文，覆盖率过低会告警或退出 4。
 
@@ -437,6 +439,7 @@ tests/
 - **模型能力差异**：VoiceDesign 仅 1.7B；Base 不支持 instruct；0.6B CustomVoice 的 instruct 会被静默丢弃，因此 CLI 在参数层直接报错。
 - **对齐器单样本约 5 分钟**：`say` 按段对齐，限制按段计算；超长音频的分窗策略属 P1。
 - **对齐器不能替代 ASR**：CER/WER 与自动 `ref_text` 需要 Qwen3-ASR，属 P1。
+- **逐句字幕 = 当前分段边界**：`sentence` 模式一句一 cue，不做过长切分或过短合并；这两项与 CPS/行宽门禁一起留给 P1。
 - **MPS 不保证 bit-perfect**：同 seed 可复现趋势，但跨设备/后端结果会漂移。
 - **依赖钉版冲突**：见[环境要求](#环境要求)；M0 采用单环境混装，桥接方案保留为 fallback。
 
@@ -454,7 +457,7 @@ tests/
 - 多角色脚本与 `script compile`
 - ASR `check`（CER/WER）
 - 多 take 资产库与自动选优
-- 字幕 CPS / 行宽门禁
+- 字幕 cue 分段策略（超长句切分 / 短句合并）与 CPS / 行宽门禁
 - `voice export/import`
 - `project init/lock`
 - 长音频对齐分窗

@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from qtts_cli.cli import main
+from qtts_cli.segmenter import sentence_count
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODELS = REPO_ROOT / "models"
@@ -81,6 +82,7 @@ def test_chinese_say_with_subtitles(tmp_path: Path):
         if line and not line.isdigit() and "-->" not in line
     ]
     assert "".join(cues) == CHINESE_TEXT
+    assert len(cues) == sentence_count(CHINESE_TEXT)
     assert recipe["language"] == "Chinese"
     assert recipe["timing"]["total_ms"] > 0
     print(
@@ -98,6 +100,7 @@ def test_english_say_with_subtitles(tmp_path: Path):
         if line and not line.isdigit() and "-->" not in line
     ]
     assert "".join(cues) == ENGLISH_TEXT
+    assert len(cues) == sentence_count(ENGLISH_TEXT)
     assert recipe["language"] == "English"
     print(
         f"\n[smoke] en: duration={_duration(out):.2f}s wall={elapsed:.2f}s "
