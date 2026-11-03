@@ -450,13 +450,19 @@ qtts align AUDIO
   [--max-cue-chars N] [--max-line-width N] [--max-cps N]
   [--min-cue-seconds N] [--max-cue-seconds N] [--max-merge-gap-ms N]
   [--no-subtitle-qc]
+  [--window-seconds 270] [--window-overlap 3]
+  [--approximate] [--asr-model MODEL]
   [--recipe-out FILE | -]
 ```
 
-- 单样本对齐上限约 5 分钟；超过会退出 4（长音频分窗属 P1）。
 - 默认 `--granularity sentence`，按句子出 cue；`char` / `word` 可显式选择。
-- `--srt` 输入不会重新分组：输入 cue 边界优先于 TTS 计划段和原句边界，只重算时间；cue 文本保持逐字原文。
-- `--lexicon` 时对齐器仍读 `spoken` 文本，时间轴再按字符映射回 display；`--text/--text-file/--srt` 都支持，SRT 模式下词典项不能跨越 cue 边界。
+- 音频 ≤300s 走原有单次对齐路径，不选择也不加载 ASR；报告里只有 `windowing: {"enabled": false}`。
+- 音频 >300s 默认按静音切窗：每个 core 窗 240–285s（`--window-seconds`，默认 270），相邻音频窗保留至少 2s 重叠（`--window-overlap`，默认 3），单窗音频不超过 300s。每窗先用 Qwen3-ASR 无时间戳转写，把 ASR 文本单调锚定到原文，再逐窗调用 forced aligner；因此长路径需要 `Qwen3-ASR-*` 与 `Qwen3-ForcedAligner-*` 两个模型。最后按全局字符位置合并时间，只构建一次 cue。
+- `--approximate` 跳过 ASR，按每个窗口**实际送入 aligner 的 audio 区间**（含左重叠）比例分配原文，相邻文本区间因此允许重叠；碰到词典保护项时吸附到 term 边界。静音切窗无解时退化为确定性固定间隔（`windowing.plan="fixed"`，并给出 warning），不再退出 4；逐字符归属仍优先 core，时间倒退会被确定性单调裁剪并报告调整次数。边界不保证，报告与 stderr 会给出 `long-audio boundaries are approximate; subtitle boundaries are not guaranteed`。无法避开词典项时退出 4。
+- `--approximate` 不能与 `--srt` 同用：SRT cue 边界已是硬锚点，冲突在加载任何模型前退出 2。
+- `--srt` 输入不会重新分组：输入 cue 边界优先于 TTS 计划段和原句边界，只重算时间；cue 文本保持逐字原文。长 SRT 的 cue 边界同时作为切窗硬锚点，不使用 ASR；cue 超过 285s 或边界不在合格静音内退出 4，窗口绝不切开 cue。
+- `--lexicon` 时对齐器仍读 `spoken` 文本，时间轴再按字符映射回 display；`--text/--text-file/--srt` 都支持，SRT 模式下词典项不能跨越 cue 边界。词典只做一次全局 `project_text`，逐窗只切片，不逐窗重新投影。
+- 长路径使用 aligner 原始逐字符 item 计算真实覆盖率，写入 `windowing.matched_ratio` 与 recipe `coverage`，并复用短路径的 30% 拒绝/80% warning 门禁；末窗允许最多 `max(--window-overlap, 1s)` 的有界尾部溢出并裁剪到音频时长。
 - 字幕策略与质量门禁和 `say` 相同；`--srt` 输入不做 CPS/行宽等格式强校验，只做结构检查。
 - 无法修复的结构问题（重叠、越界、非正时长、非单调）退出 4；`--no-subtitle-qc` 下可修复的仍然修复并记录。
 
@@ -642,8 +648,8 @@ tests/
 
 - **没有本地 token 级流式**：`non_streaming_mode` 只模拟流式文本输入，API 返回完整音频。需要低延迟请走 DashScope Realtime。
 - **模型能力差异**：VoiceDesign 仅 1.7B；Base 不支持 instruct；0.6B CustomVoice 的 instruct 会被静默丢弃，因此 CLI 在参数层直接报错。
-- **对齐器单样本约 5 分钟**：`say` 按段对齐，限制按段计算；超长音频的分窗策略属 P1。
-- **对齐器不能替代 ASR**：CER/WER 与自动 `ref_text` 需要 Qwen3-ASR，属 P1。
+- **对齐器单样本约 5 分钟**：`say` 按段对齐，限制按段计算；`align` 对 >300s 的音频使用静音切窗、ASR 文本锚点与全局字符归属合并，单窗仍不超过 300s。
+- **长音频默认需要 ASR**：`align` 的默认长路径先无时间戳转写再逐窗对齐；`--srt` 用 cue 边界硬锚定、`--approximate` 按比例降级，这两条路径不需要 ASR，但 approximate 的边界不保证。
 - **字幕三级边界**：`--srt` 输入 cue > TTS 计划段 > 原句。只有 `parent_ids` 完全一致时才合并；`--srt` 永不重新分组。切分/合并后仍逐字保留原文，`join(cue.text) == normalized_text`。
 - **硬切是最后手段**：只有找不到自然断点时才硬切，并记录策略/告警；引号内、数字和拉丁单词内不硬切。
 - **投影顺序固定**：原文 → 抽取导演标记 → 词典保护的 display 投影 → spoken 投影 → 分句/预算。词典匹配发生在数字/日期规范化之前，映射是显式字符区间，禁止事后 `find()` 二次定位；`join(cue.text) == display_text`。

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import gc
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -19,6 +21,22 @@ from .utils import StdoutMuted, stdout_to_stderr
 MAX_ALIGN_SECONDS = 300.0
 
 _ALIGNER_CACHE: dict[tuple[str, str, str], Any] = {}
+
+
+def clear_aligner_cache() -> None:
+    """Drop cached aligner weights so ASR can load without double residency."""
+    _ALIGNER_CACHE.clear()
+    gc.collect()
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return
+    for backend_name in ("mps", "cuda"):
+        try:
+            backend = getattr(torch, backend_name, None)
+            if backend is not None and backend.is_available():
+                backend.empty_cache()
+        except Exception:  # pragma: no cover - backend dependent
+            continue
 
 
 def _runtime():

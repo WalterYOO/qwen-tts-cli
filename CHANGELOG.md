@@ -9,6 +9,7 @@
 
 ### Added
 
+- **长音频对齐（FR-P1-11）**：`align` 对 >300s 音频按合格静音切窗（core 240–285s、目标 270s、至少 2s 重叠、单窗 ≤300s），默认逐窗用 Qwen3-ASR 无时间戳转写做单调文本锚定，再逐窗调用 forced aligner，最后按全局字符归属合并并只构建一次 cue；新增 `--window-seconds`、`--window-overlap`、`--approximate`、`--asr-model`。SRT 输入以 cue 边界为硬锚点且不跑 ASR，`--srt --approximate` 在加载模型前退出 2；`--approximate` 按实际 audio 区间（含重叠）分配文本，静音计划无解时退化为固定间隔并 warning，时间倒退做确定性单调裁剪；末窗允许有界尾部溢出并裁剪。长路径报告/recipe 增加真实覆盖率门禁与 `windowing`，短音频保持原字节且 `windowing.enabled=false`。字幕与 recipe 先 staging 后原子提交且在失败时回滚，ASR 完全释放后才加载 aligner。
 - **多角色脚本**：`script lint FILE`、`script compile FILE -o PLAN.json`、`say --script FILE`，接受 YAML/JSON；逐段 `voice/language/instruct/seed/max_new_tokens/pause_after_ms`，缺省 id 自动生成，重复 id/未知字段/能力冲突在加载模型前失败；编译计划稳定可复现。
 - **词典与导演标记**：`say/align --lexicon` 让 TTS 读 `spoken`、字幕保留原文 `term`，显式 spoken→display 字符映射；`[[pause:MS]]` 支持句首/句间/句尾/连续出现，负数和 `speed/rate/pitch` 等不支持标记退出 2。
 - **批量清单**：`batch plan/run`，`--jobs`、`--resume`、`--retry`、`--fail-fast`、`--watch`；确定性 `plan.json`、原子 `status.jsonl`、job_key/输出 sha256/recipe 校验、部分失败退出 6。
@@ -23,7 +24,7 @@
 ### Changed
 
 - `SegmentPlan` 保存完整 voice/model 快照与 `source_segment_id`；预算切分 id 形如 `s001.p2`。多处执行器只保留一个 TTS 模型槽，切换模型前释放旧 engine 与 clone prompt。
-- 文本投影顺序固定为 raw → marker → 词典 display → spoken → 分句/预算；缓存键包含词典内容哈希，recipe 记录逐段 voice/model 与 `lexicon_sha256`。
+- 文本投影顺序固定为 raw → marker → 词典 display → spoken → 分句/预算；缓存键包含词典内容哈希，recipe 记录逐段 voice/model 与 `lexicon_sha256`。`PreparedText` 额外携带 display 字符的原始 `source_spans`，SRT 长音频只投影一次即可把原始 cue 边界映射到 display 坐标。
 
 ### Fixed
 
@@ -44,7 +45,6 @@
 ### Planned
 
 - 多 take 资产库与自动选优
-- 长音频对齐分窗（> 5 分钟）
 
 ## [0.1.1] - 2026-11-03
 

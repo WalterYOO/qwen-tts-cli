@@ -276,13 +276,14 @@ Qwen3-TTS 官方仓库提供了 Python API 和示例脚本，但直接使用存�
 
 单样本 5 分钟是硬上限，batch 不能绕过。策略：
 
-1. 用 Qwen3-ASR 转写长音频，得到粗粒度文本锚点。
-2. 对已知原文与 ASR 文本做规范化后的**单调序列匹配**，确定每段音频对应的原文范围。
-3. 在长静音处切窗，每窗约 4–4.5 分钟，保留 1 条字幕或数秒重叠。
-4. 每窗只送入对应范围内的原文，调用 `Qwen3ForcedAligner.align`。
-5. 合并结果，加全局时间偏移，裁掉重叠区。
+1. 以 20ms 帧、-45 dBFS、至少 0.6s 检测合格静音；静音切点取区间中点，并优先满足 240–285s 的 core、约 270s 的目标时长与至少 2s 的重叠。全局 DP 选路，避免贪心在尾部留下无解短窗。
+2. 音频窗可重叠，但 core 覆盖 `[0, duration)` 且不重叠；每个音频窗（含单侧左上下文）不超过 300s。
+3. 默认路径逐窗用 Qwen3-ASR 做**无时间戳**转写，对已知原文与各窗转录做规范化后的顺序单调匹配，得到每窗 spoken 原文区间；匹配必须全量覆盖、唯一锚定，插入/删除/替换只在破坏唯一性时失败。
+4. 每窗用 `slice_prepared(global_prepared, display_start, display_end)` 切出 display/spoken 文本，禁止逐窗重新投影词典；切点落在词典 term 内必须吸附到 term 边界，否则退出 4。
+5. 每窗调用 `Qwen3ForcedAligner.align`；结果映射回全局 display 字符位置。合并采用字符归属制：每字符恰好选一个候选，优先 core 覆盖，再按窗口序号/时间确定性选择；缺失覆盖、越界或非容差时间倒退退出 4。最后只调用一次全局 `build_cues`/`build_cues_for_ranges`。
+6. SRT 输入以 cue 边界为硬锚点，不跑 ASR；cue 超 285s、边界不在合格静音内或跨窗都退出 4，窗口绝不拆分 cue。
 
-禁止按固定时长或字符比例硬切；跨窗漂移会导致整体错位。若既无 SRT/脚本也不引入 ASR，只提供近似切分并明确标注「边界不保证」。
+禁止按固定时长或字符比例硬切；跨窗漂移会导致整体错位。若既无 SRT 也不引入 ASR，`--approximate` 按每个窗口实际送入 aligner 的 audio 区间（含左重叠）分配文本，允许文本区间重叠；静音计划无解时退化为确定性固定间隔并明确标注「边界不保证」；时间倒退做单调裁剪并报告次数，无法避开 term 时退出 4。`--srt --approximate` 在模型加载前退出 2，因为 SRT cue 边界已是硬锚点。
 
 ### 6.4 批处理
 
@@ -752,3 +753,34 @@ qtts align
 - `voice add --kind clone --auto-ref-text` 先把参考音频复制到 staging，再从 staging 转写，确保 ASR 与 clone prompt 读取同一份字节；`--asr-model` 只能与 `--auto-ref-text` 同用（否则退出 2），并与 `check` 共用 `select_asr` 解析/消歧。ASR 语言非法时在 staging 内、加载权重前退出 2，失败路径删除 staging。转写成功后清空 ASR 缓存再加载 TTS Base。任何失败删除 staging，不提交半成品 profile。`voice.json.source` 记录 `ref_text`、`ref_text_source=asr` 与 `asr_model{id,revision,fingerprint}`。
 - `say --qc --reference-voice` 先完成纯参数/输出组合校验（例如 `--out -` 与 `--json` 冲突），再在任何生成或写音频前完成 profile 文件级校验、Base 模型解析与类级 embedding 能力探测（不加载权重）。`--dry-run` 只做 profile 文件级校验，不导入运行时。
 - 集成测试复用一条 TTS 生成音频，覆盖真实 ASR 的 CER、故意改字后的退出 5、QC 指标量级与自动 `ref_text`，控制总时长并避免重复加载模型。模型目录只从 `QTTS_SMOKE_MODEL_DIR` 读取；未设置时整组跳过，不把个人绝对路径写入仓库。
+
+### 13.7 P1 Wave 3b 实现注记
+
+本节记录长音频对齐的实现选择，不改变 §6.3 的需求定义。
+
+**窗口与切点**
+
+- `AudioWindow` 以样本号为准，暴露 `audio_*`（可重叠）与 `core_*`（不重叠、覆盖全时长）两套半开区间；秒数只由样本号派生。`plan_windows()` 只规划音频/核心区间和 SRT 字符锚点，不负责文本匹配。
+- 静音按 20ms 帧、`<= -45 dBFS`、至少 0.6s 检测；不足一帧的尾部仍作为部分帧计入。非末窗 core 限制在 240–285s；末窗非空且不超过 285s；音频窗只带左侧上下文，任一窗不超过 300s。候选切点用全局 DP 选择，代价为偏离目标窗长的绝对值，并按路径字典序确定性打破平局。静音计划无解且 `--approximate` 时，从样本 0 起按 `round(window_s * sr)` 固定间隔切分，报告 `plan="fixed"` 并同时向 stderr 与 JSON warnings 写入固定间隔 warning；非近似模式仍退出 4，且只有该模式错误文本包含 `use --approximate to override`。
+- SRT 模式只接受 cue 边界作为切点；cue 必须整体落在同一 core 内。cue >285s、时间重叠/越界、边界不在合格静音内或无法映射到 cue 边界时退出 4，不做 cue 拆分或时间修正。
+
+**文本锚点与字符归属**
+
+- `mapped_text.mapped_normalize()` 复用 QC 规范化规则，但为每个规范化字符保留原文源区间；`monotonic_window_ranges(reference, window_transcripts)` 在 spoken 坐标系做顺序后缀匹配，边界通过源区间回到原文，不把规范化偏移当原文偏移。
+- 每个匹配窗的区间必须非空、首窗从 0 开始、末窗到参考末尾、相邻区间有序且无空洞；重复文本用 occurrence 序列确认唯一单调锚点，歧义直接退出 4。
+- 每窗 aligner 输出先乘全局样本偏移并映射为 `WindowItem(global_display_start/end, start_s, end_s)`。`merge_window_items()` 为每个 display 字符建立候选，用字符级 DP 按 `(非 core 候选数, 窗口序号序列, 时间序列)` 字典序求全局最优，而不是逐字符贪心；标点/空白可继承邻字时间，内容字符缺失、原始 `end < start`、候选越界或时间倒退（超出数值容差）退出 4。近似模式对倒退做 `start=max(start,last_end)`、`end=max(end,start)` 的确定性裁剪并记录 `monotonic_adjustments`；最后一窗允许最多 `max(overlap,1s)` 的尾部溢出并裁剪到音频时长，非末窗同幅溢出仍退出 4。
+- 合并完成后只调用一次全局 `build_cues()` 或 `build_cues_for_ranges()`；SRT 模式最后恢复输入 cue 的 index。`ensure_full_text()` 在 QC 之前校验全局文本不变量。
+
+**词典与 SRT 边界**
+
+- `project_text()` 在入口只调用一次。`PreparedText` 现在同时携带 `source_spans`：每个 display 字符对应原始文本的 `[start, end)`；SRT cue 的原始边界通过该映射转成 display 边界，若落在展开后的数字/日期或词典 term 内部则退出 4。
+- 逐窗只调用 `slice_prepared()`，切片拒绝落在 lexicon term 内部；`spoken_items_to_display_positions()` 保留全局字符位置，避免重复文本被 `find()` 错位。
+
+**模型驻留与输出**
+
+- 执行顺序固定为：参数/文本/词典/SRT/时长/format/stdout 冲突校验 → 选模型 → 逐窗 ASR（默认路径）→ `engine.model=None`、删除引用、`gc.collect()`、`clear_asr_cache()`、清 MPS/CUDA → 确认 aligner 缓存为空 → 加载 aligner → 对齐 → 合并 → QC → 写出。
+- 新增 `align_engine.clear_aligner_cache()`；长路径在 ASR 前和 aligner 构造前都清理。`AsrEngine.transcribe_samples()` 直接接收 `(samples, sr)` 且固定 `return_time_stamps=False`，不构造常驻 forced aligner。
+- 字幕与 recipe 先全部序列化到同目录临时文件，QC、全文校验和 `window` 报告全部成功后再 `os.replace` 提交；任何失败删除临时文件，不留下半套字幕/recipe。
+- `align --json` 与 recipe 增加 `windowing`：`enabled`、`approximate`、`window_seconds`、`overlap_seconds`、`min/max_window_seconds`、ASR model/revision/fingerprint、warnings，以及每窗的样本号、时间、core/display/spoken 区间、转录 sha256、item 数。短音频保持 `{"enabled": false}` 且不选择 ASR；长音频 length、窗口计划和 cue 在固定 fake 输入下确定，recipe 的 `created_at`/timing 仍是诊断字段。
+- `--approximate` 不构造 ASR，按每窗实际 `audio_start_s/audio_end_s` 分配字符（允许相邻区间重叠），边界落在词典 term 内部时 start 吸附 term start、end 吸附 term end；静音计划无解时使用固定间隔并在 payload/recipe/stderr 报告固定间隔 warning。`--srt --approximate` 在模型加载前退出 2。缺 ASR 模型时默认长路径退出 3；`select_asr()` 与 `select_aligner()` 都在任何 ASR 权重加载前完成，aligner 缺失时 ASR 调用次数为 0。
+- 长路径覆盖率来自逐窗 aligner 的原始逐字符 item（不是合并后补齐全部字符的结果），写入 `windowing.matched_ratio` 与 recipe `coverage`，并复用短路径的 `MIN_COVERAGE=0.3` 退出 4、`WARN_COVERAGE=0.8` warning 门禁。

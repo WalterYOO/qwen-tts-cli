@@ -18,9 +18,9 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from .errors import InputError, UsageError
+from .mapped_text import mapped_normalize_text
 from .segmenter import _quote_depths
 from .subtitles import AlignItem
-from .textnorm import normalize_text
 
 LEXICON_SCHEMA_VERSION = 1
 _MARKER_RE = re.compile(r"\[\[([^\[\]]*)\]\]")
@@ -158,6 +158,9 @@ class PreparedText:
     spoken_text: str
     mapping: list[MapBlock]
     pauses: list[dict[str, int]] = field(default_factory=list)
+    # Raw-source span for every display character; lets callers map original
+    # cue boundaries through the one global lexicon projection.
+    source_spans: Optional[list[tuple[int, int]]] = None
 
 
 def parse_director_markers(text: str) -> tuple[str, list[dict[str, int]]]:
@@ -232,10 +235,16 @@ def project_text(
     verbatim for subtitles; the replacement is used by TTS.
     """
     if lexicon is None or not lexicon.entries:
-        display = normalize_text(text, language)
+        mapped = mapped_normalize_text(text, language)
+        display = mapped.text
         mapping = [MapBlock(i, i + 1, i, i + 1) for i in range(len(display))]
         _validate_mapping(display, display, mapping, source="display")
-        return PreparedText(display_text=display, spoken_text=display, mapping=mapping)
+        return PreparedText(
+            display_text=display,
+            spoken_text=display,
+            mapping=mapping,
+            source_spans=[(unit.start, unit.end) for unit in mapped.chars],
+        )
 
     normalized: list[tuple[str, int]] = []
     for index, char in enumerate(text):
@@ -254,19 +263,21 @@ def project_text(
     display_parts: list[str] = []
     spoken_parts: list[str] = []
     mapping: list[MapBlock] = []
+    source_spans: list[tuple[int, int]] = []
     display_cursor = 0
     display_length = 0
     spoken_length = 0
     match_cursor = 0
 
-    def append_identity(raw: str) -> None:
+    def append_identity(raw: str, raw_offset: int) -> None:
         nonlocal display_length, spoken_length
-        normalized_span = normalize_text(raw, language)
+        mapped = mapped_normalize_text(raw, language)
+        normalized_span = mapped.text
         if not normalized_span:
             return
         display_parts.append(normalized_span)
         spoken_parts.append(normalized_span)
-        for offset in range(len(normalized_span)):
+        for offset, unit in enumerate(mapped.chars):
             mapping.append(
                 MapBlock(
                     display_length + offset,
@@ -275,6 +286,7 @@ def project_text(
                     spoken_length + offset + 1,
                 )
             )
+            source_spans.append((raw_offset + unit.start, raw_offset + unit.end))
         display_length += len(normalized_span)
         spoken_length += len(normalized_span)
 
@@ -320,7 +332,7 @@ def project_text(
                 details={"term": chosen.term, "text": term_display},
             )
         if display_cursor < start_index:
-            append_identity(text[display_cursor:start_index])
+            append_identity(text[display_cursor:start_index], display_cursor)
         display_parts.append(term_display)
         spoken_parts.append(chosen.spoken)
         mapping.append(
@@ -332,6 +344,10 @@ def project_text(
                 chosen.term,
             )
         )
+        source_spans.extend(
+            (start_index + offset, start_index + offset + 1)
+            for offset in range(len(term_display))
+        )
         display_length += len(term_display)
         spoken_length += len(chosen.spoken)
         display_cursor = end_index
@@ -340,12 +356,17 @@ def project_text(
             match_cursor += 1
 
     if display_cursor < len(text):
-        append_identity(text[display_cursor:])
+        append_identity(text[display_cursor:], display_cursor)
 
     display_text = "".join(display_parts)
     spoken_text = "".join(spoken_parts)
     _validate_mapping(display_text, spoken_text, mapping, source="lexicon")
-    return PreparedText(display_text=display_text, spoken_text=spoken_text, mapping=mapping)
+    return PreparedText(
+        display_text=display_text,
+        spoken_text=spoken_text,
+        mapping=mapping,
+        source_spans=source_spans,
+    )
 
 
 def protected_ranges(mapping: Sequence[MapBlock]) -> list[tuple[int, int]]:
@@ -401,7 +422,13 @@ def slice_prepared(prepared: PreparedText, start: int, end: int) -> PreparedText
     display_text = prepared.display_text[start:end]
     spoken_text = "".join(spoken_parts)
     _validate_mapping(display_text, spoken_text, mapping, source="slice")
-    return PreparedText(display_text=display_text, spoken_text=spoken_text, mapping=mapping)
+    spans = prepared.source_spans
+    return PreparedText(
+        display_text=display_text,
+        spoken_text=spoken_text,
+        mapping=mapping,
+        source_spans=None if spans is None else list(spans[start:end]),
+    )
 
 
 def _is_content_char(char: str) -> bool:
@@ -444,13 +471,59 @@ def _locate_item(spoken_text: str, cursor: int, needle: str) -> int:
     return -1
 
 
-def spoken_items_to_display(
+def display_boundary_for_spoken(
+    mapping: Sequence[MapBlock],
+    spoken_index: int,
+    *,
+    edge: str,
+) -> int:
+    """Map a spoken boundary to display, snapping through lexicon blocks.
+
+    ``edge="end"`` snaps a window end forward to the end of a lexicon term;
+    ``edge="start"`` snaps a start backward to its beginning.  Split points can
+    therefore never produce half a term.
+    """
+    if edge not in ("start", "end"):
+        raise UsageError(f"invalid boundary edge: {edge!r}")
+    if not mapping:
+        if spoken_index == 0:
+            return 0
+        raise InputError(
+            "internal projection error: spoken boundary outside mapping",
+            details={"spoken_index": spoken_index},
+        )
+    total = mapping[-1].spoken_end
+    if spoken_index <= 0:
+        return 0
+    if spoken_index >= total:
+        return mapping[-1].display_end
+    for block in mapping:
+        if spoken_index == block.spoken_end:
+            return block.display_end
+        if spoken_index == block.spoken_start:
+            return block.display_start
+        if block.spoken_start < spoken_index < block.spoken_end:
+            if block.term is not None or (
+                block.display_end - block.display_start
+                != block.spoken_end - block.spoken_start
+            ):
+                return (
+                    block.display_start if edge == "start" else block.display_end
+                )
+            return block.display_start + (spoken_index - block.spoken_start)
+    raise InputError(
+        "internal projection error: spoken boundary not covered",
+        details={"spoken_index": spoken_index},
+    )
+
+
+def spoken_items_to_display_positions(
     display_text: str,
     spoken_text: str,
     mapping: Sequence[MapBlock],
     items: Sequence[AlignItem],
-) -> list[AlignItem]:
-    """Convert aligner items on spoken text into per-display-character items."""
+) -> list[tuple[int, AlignItem]]:
+    """Map items to ``(display_char_index, AlignItem)`` pairs, preserving slots."""
     spoken_times: list[Optional[tuple[float, float]]] = [None] * len(spoken_text)
     cursor = 0
     for item in items:
@@ -470,7 +543,7 @@ def spoken_items_to_display(
                 )
         cursor = index + len(needle)
 
-    display_items: list[AlignItem] = []
+    positioned: list[tuple[int, AlignItem]] = []
     for block in mapping:
         known = [
             value
@@ -489,11 +562,29 @@ def spoken_items_to_display(
             char_index = block.display_start + offset
             if char_index >= len(display_text):
                 break
-            display_items.append(
-                AlignItem(
-                    display_text[char_index],
-                    start + step * offset,
-                    start + step * (offset + 1),
+            positioned.append(
+                (
+                    char_index,
+                    AlignItem(
+                        display_text[char_index],
+                        start + step * offset,
+                        start + step * (offset + 1),
+                    ),
                 )
             )
-    return display_items
+    return positioned
+
+
+def spoken_items_to_display(
+    display_text: str,
+    spoken_text: str,
+    mapping: Sequence[MapBlock],
+    items: Sequence[AlignItem],
+) -> list[AlignItem]:
+    """Convert aligner items on spoken text into per-display-character items."""
+    return [
+        item
+        for _char_index, item in spoken_items_to_display_positions(
+            display_text, spoken_text, mapping, items
+        )
+    ]

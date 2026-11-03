@@ -7,12 +7,15 @@ normalisation without the runtime installed.
 
 from __future__ import annotations
 
+import gc
 import os
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
+
+import numpy as np
 
 from .catalog import ModelInfo
 from .errors import InputError, ModelError, UsageError
@@ -288,6 +291,51 @@ class AsrEngine:
             self.model = model
             _ASR_CACHE[key] = model
             return self
+
+    def transcribe_samples(
+        self,
+        samples: np.ndarray,
+        sr: int,
+        *,
+        language: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Transcribe an in-memory mono array without a temporary file.
+
+        Long-audio windowing uses plain ASR only; timestamps stay disabled so
+        qwen-asr never constructs a resident forced aligner.
+        """
+        if int(sr) <= 0:
+            raise InputError("sample rate must be positive", details={"sr": int(sr)})
+        data = np.asarray(samples, dtype=np.float32)
+        if data.ndim > 1:
+            data = data.mean(axis=1).astype(np.float32)
+        if data.size == 0:
+            raise InputError("cannot transcribe empty audio")
+        if not np.all(np.isfinite(data)):
+            raise InputError("audio contains NaN or Inf samples")
+        # Validate language before loading any weights.
+        lang_value = _resolve_language(self.model_info, language)
+        self.load()
+        try:
+            with stdout_to_stderr():
+                results = self.model.transcribe(
+                    (np.ascontiguousarray(data, dtype=np.float32), int(sr)),
+                    language=lang_value,
+                    return_time_stamps=False,
+                )
+        except Exception as exc:
+            raise ModelError(
+                f"ASR transcription failed: {exc}",
+                details={"model": self.model_info.name, "language": lang_value},
+            ) from exc
+        return normalize_transcription(results, timestamps=False)
+
+    def release(self) -> None:
+        """Drop this engine's model reference and the shared cache/backends."""
+        self.model = None
+        gc.collect()
+        clear_asr_cache()
+        gc.collect()
 
     def transcribe(
         self,

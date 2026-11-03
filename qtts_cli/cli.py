@@ -278,6 +278,30 @@ def build_parser() -> argparse.ArgumentParser:
     align.add_argument("--out-prefix", help="output prefix (default: audio stem)")
     align.add_argument("--lexicon", help="JSON pronunciation lexicon (spoken -> display)")
     align.add_argument("--recipe-out", help="write the alignment recipe here ('-' for stdout)")
+    align.add_argument(
+        "--window-seconds",
+        type=float,
+        default=270.0,
+        help="long-audio target core window in seconds (240-285, default: 270)",
+    )
+    align.add_argument(
+        "--window-overlap",
+        type=float,
+        default=3.0,
+        help="long-audio audio context overlap in seconds (>=2, default: 3)",
+    )
+    align.add_argument(
+        "--approximate",
+        action="store_true",
+        help=(
+            "skip ASR for long audio; use audio-proportional text ranges and "
+            "fixed-interval windows when silence planning fails (not with --srt)"
+        ),
+    )
+    align.add_argument(
+        "--asr-model",
+        help="ASR model path or name for long-audio anchoring (default: best local)",
+    )
     align.set_defaults(func=align_cmd.run, formatter=align_cmd.format_result)
 
     # -- project ------------------------------------------------------------ #
