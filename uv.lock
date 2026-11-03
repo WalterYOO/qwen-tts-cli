@@ -2448,6 +2448,9 @@ dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pyyaml" },
+    { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "soundfile" },
 ]
 
@@ -2481,6 +2484,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "qwen-asr", marker = "extra == 'align'", specifier = ">=0.0.6" },
     { name = "qwen-tts", marker = "extra == 'tts'", specifier = ">=0.1.1" },
+    { name = "scipy", specifier = ">=1.10" },
     { name = "soundfile", specifier = ">=0.12" },
     { name = "torch", marker = "extra == 'align'", specifier = ">=2.4" },
     { name = "torch", marker = "extra == 'tts'", specifier = ">=2.4" },
