@@ -11,6 +11,7 @@ from ..align_engine import AlignerEngine
 from ..audio_io import duration_s, read_audio
 from ..catalog import scan, select_aligner
 from ..errors import InputError, UsageError
+from ..lexicon import Lexicon, project_text, spoken_items_to_display
 from ..sidecar import SCHEMA_VERSION
 from ..subtitle_qc import check_subtitles, raise_quality_error
 from ..subtitles import (
@@ -24,7 +25,6 @@ from ..subtitles import (
     policy_from_args,
     render,
 )
-from ..textnorm import normalize_text
 from ..utils import atomic_write_json, atomic_write_text, emit_json, sha256_file, sha256_text
 from ..voice_store import utc_now
 
@@ -72,6 +72,7 @@ def _cue_ranges(cue_texts: list[str]) -> tuple[str, list[tuple[int, int]]]:
 
 def run(cfg, args) -> dict[str, Any]:
     raw_text, source, srt_cues = read_text_source(args)
+    lexicon = Lexicon.load(getattr(args, "lexicon", None))
 
     formats = normalize_formats(args.format) or ["srt"]
     policy = policy_from_args(args)
@@ -111,26 +112,60 @@ def run(cfg, args) -> dict[str, Any]:
 
     warnings: list[str] = []
     if srt_cues:
-        normalized_cues = [normalize_text(cue.text, args.language) for cue in srt_cues]
-        normalized, ranges = _cue_ranges(normalized_cues)
+        normalized_cues = [
+            project_text(cue.text, language=args.language, lexicon=lexicon).display_text
+            for cue in srt_cues
+        ]
+        normalized = "\n".join(normalized_cues)
         if not normalized.strip():
             raise InputError("input text is empty after normalization")
-        items, info = aligner.align(samples, sr, normalized, args.language)
-        cues = build_cues_for_ranges(
-            normalized, items, ranges, audio_duration=audio_s, repair_stats=repair_stats
-        )
+        if lexicon is not None:
+            projection = project_text(
+                "\n".join(cue.text for cue in srt_cues),
+                language=args.language,
+                lexicon=lexicon,
+            )
+            if projection.display_text != normalized:
+                raise InputError(
+                    "lexicon projection changed SRT cue boundaries; use --text instead"
+                )
+            spoken_text = projection.spoken_text
+            items, info = aligner.align(samples, sr, spoken_text, args.language)
+            display_items = spoken_items_to_display(
+                normalized, spoken_text, projection.mapping, items
+            )
+            _, ranges = _cue_ranges(normalized_cues)
+            cues = build_cues_for_ranges(
+                normalized,
+                display_items,
+                ranges,
+                audio_duration=audio_s,
+                repair_stats=repair_stats,
+            )
+        else:
+            spoken_text = normalized
+            items, info = aligner.align(samples, sr, normalized, args.language)
+            _, ranges = _cue_ranges(normalized_cues)
+            cues = build_cues_for_ranges(
+                normalized, items, ranges, audio_duration=audio_s, repair_stats=repair_stats
+            )
         for cue, original in zip(cues, srt_cues):
             cue.index = original.index
         # The "\n" join only feeds the aligner; cue content excludes it.
         expected_text = "".join(normalized_cues)
     else:
-        normalized = normalize_text(raw_text, args.language)
+        projection = project_text(raw_text, language=args.language, lexicon=lexicon)
+        normalized = projection.display_text
+        spoken_text = projection.spoken_text
         if not normalized.strip():
             raise InputError("input text is empty after normalization")
-        items, info = aligner.align(samples, sr, normalized, args.language)
+        items, info = aligner.align(samples, sr, spoken_text, args.language)
+        display_items = spoken_items_to_display(
+            normalized, spoken_text, projection.mapping, items
+        )
         cues = build_cues(
             normalized,
-            items,
+            display_items,
             granularity=args.granularity,
             fallback_duration=audio_s,
             audio_duration=audio_s,
@@ -141,7 +176,9 @@ def run(cfg, args) -> dict[str, Any]:
         )
         expected_text = normalized
 
-    matched_ratio = coverage(normalized, items)
+    # The aligner always sees spoken text, including the SRT path, so coverage
+    # must be measured against that same string (not the display projection).
+    matched_ratio = coverage(spoken_text, items)
     if matched_ratio < MIN_COVERAGE:
         raise InputError(
             f"forced alignment matched only {matched_ratio:.0%} of the text; "
@@ -215,6 +252,8 @@ def run(cfg, args) -> dict[str, Any]:
         "cues": [cue.to_dict() for cue in cues],
         "timing": timing,
     }
+    if lexicon is not None:
+        recipe["lexicon_sha256"] = lexicon.sha256
     if recipe_target == "-":
         emit_json(recipe)
     elif recipe_target is not None:

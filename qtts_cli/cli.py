@@ -71,10 +71,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     # -- say ---------------------------------------------------------------- #
     from .commands import align as align_cmd
+    from .commands import batch as batch_cmd
     from .commands import doctor as doctor_cmd
     from .commands import models as models_cmd
     from .commands import project as project_cmd
     from .commands import say as say_cmd
+    from .commands import script as script_cmd
     from .commands import voice as voice_cmd
 
     say = sub.add_parser("say", help="synthesize speech (builtin/voice/design)")
@@ -86,12 +88,15 @@ def build_parser() -> argparse.ArgumentParser:
                      help="with --stdin: read JSONL requests and emit JSONL results")
     say.add_argument("--out-dir", help="JSONL default output directory (default: current dir)")
     say.add_argument("--file", help="read text from a file")
-    say.add_argument("--script", help="read a plain-text script from a file")
+    say.add_argument("--script", help="read a plain-text or YAML/JSON multi-role script")
     say.add_argument("--voice",
                      help="builtin:Vivian | voice:NAME | design:DESCRIPTION")
-    say.add_argument("--language", default="auto",
+    # SUPPRESS lets `say --script` distinguish an explicit CLI default from an
+    # omitted option; missing values are resolved in commands.say.
+    say.add_argument("--language", default=argparse.SUPPRESS,
                      help="auto|Chinese|English|... (auto is decided per segment)")
-    say.add_argument("--instruct", help="style instruction (1.7B CustomVoice / VoiceDesign)")
+    say.add_argument("--instruct", default=argparse.SUPPRESS,
+                     help="style instruction (1.7B CustomVoice / VoiceDesign)")
     say.add_argument("--out", default=None, help="output file (default: out.wav), or '-' for stdout")
     say.add_argument("--format", choices=["wav", "flac"], help="container (default: from --out)")
     say.add_argument("--subtitle", help="comma list of srt,vtt,ass,json")
@@ -104,12 +109,59 @@ def build_parser() -> argparse.ArgumentParser:
         help="cue granularity (default: sentence)",
     )
     _add_subtitle_policy(say)
-    say.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
-    say.add_argument("--pause-ms", type=int, default=300, help="silence between segments")
+    say.add_argument("--max-new-tokens", type=int, default=argparse.SUPPRESS)
+    say.add_argument("--pause-ms", type=int, default=argparse.SUPPRESS,
+                     help="silence between segments")
     say.add_argument("--model", help="override the automatically selected model")
+    say.add_argument("--lexicon", help="JSON pronunciation lexicon (schema_version 1)")
     say.add_argument("--dry-run", action="store_true", help="print the plan without loading models")
     say.add_argument("--yes", action="store_true", help="non-interactive confirmation")
     say.set_defaults(func=say_cmd.run, formatter=say_cmd.format_result)
+
+    # -- script ------------------------------------------------------------- #
+    script = sub.add_parser("script", help="validate and compile multi-role scripts")
+    script_sub = script.add_subparsers(dest="script_command", required=True)
+
+    script_lint = script_sub.add_parser("lint", help="validate a script without writing a plan")
+    _add_common(script_lint, suppress=True)
+    script_lint.add_argument("file")
+    script_lint.add_argument("--model", help="override the automatically selected model")
+    script_lint.add_argument("--lexicon", help="JSON pronunciation lexicon")
+    script_lint.set_defaults(func=script_cmd.lint, formatter=script_cmd.format_result)
+
+    script_compile = script_sub.add_parser("compile", help="compile a deterministic plan")
+    _add_common(script_compile, suppress=True)
+    script_compile.add_argument("file")
+    script_compile.add_argument("-o", "--out", required=True, help="plan JSON path ('-' for stdout)")
+    script_compile.add_argument("--model", help="override the automatically selected model")
+    script_compile.add_argument("--lexicon", help="JSON pronunciation lexicon")
+    script_compile.set_defaults(func=script_cmd.compile, formatter=script_cmd.format_result)
+
+    # -- batch -------------------------------------------------------------- #
+    batch = sub.add_parser("batch", help="plan and run JSONL batch manifests")
+    batch_sub = batch.add_subparsers(dest="batch_command", required=True)
+
+    batch_plan = batch_sub.add_parser("plan", help="validate a manifest and write plan/status")
+    _add_common(batch_plan, suppress=True)
+    batch_plan.add_argument("manifest")
+    batch_plan.add_argument("--out-dir", required=True)
+    batch_plan.add_argument("--model", help="override the automatically selected model")
+    batch_plan.add_argument("--lexicon", help="JSON pronunciation lexicon")
+    batch_plan.set_defaults(func=batch_cmd.plan, formatter=batch_cmd.format_result)
+
+    batch_run = batch_sub.add_parser("run", help="execute a manifest")
+    _add_common(batch_run, suppress=True)
+    batch_run.add_argument("manifest")
+    batch_run.add_argument("--out-dir", required=True)
+    batch_run.add_argument("--jobs", type=int, default=1, help="scheduler concurrency (default: 1)")
+    batch_run.add_argument("--resume", action="store_true", help="reuse verified done jobs")
+    batch_run.add_argument("--retry", type=int, default=0, help="retry transient failures N times")
+    batch_run.add_argument("--fail-fast", action="store_true",
+                           help="stop scheduling after the first failure")
+    batch_run.add_argument("--watch", action="store_true", help="progress on stderr")
+    batch_run.add_argument("--model", help="override the automatically selected model")
+    batch_run.add_argument("--lexicon", help="JSON pronunciation lexicon")
+    batch_run.set_defaults(func=batch_cmd.run, formatter=batch_cmd.format_result)
 
     # -- voice -------------------------------------------------------------- #
     voice = sub.add_parser("voice", help="manage the voice asset library")
@@ -191,6 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_subtitle_policy(align)
     align.add_argument("--format", default="srt", help="comma list of srt,vtt,ass,json")
     align.add_argument("--out-prefix", help="output prefix (default: audio stem)")
+    align.add_argument("--lexicon", help="JSON pronunciation lexicon (spoken -> display)")
     align.add_argument("--recipe-out", help="write the alignment recipe here ('-' for stdout)")
     align.set_defaults(func=align_cmd.run, formatter=align_cmd.format_result)
 
@@ -277,6 +330,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     print(text, file=sys.stderr)
                 else:
                     print(text)
+        if "exit_code" in payload:
+            return int(payload["exit_code"])
         return 0 if payload.get("ok", True) else 1
     except QttsError as exc:
         if want_json:

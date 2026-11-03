@@ -23,11 +23,13 @@ def cache_key(
     sampling: dict[str, Any],
     seed: int,
     model_fingerprint: Optional[str] = None,
+    lexicon_sha256: Optional[str] = None,
 ) -> str:
     """sha256 over the canonical recipe inputs. qtts version is excluded by design."""
     return "sha256:" + sha256_json(
         {
             "text_normalized": text_normalized,
+            "lexicon_sha256": lexicon_sha256,
             "voice": voice_identity,
             "model_id": model_id,
             "model_revision": model_revision,

@@ -11,8 +11,17 @@ from .cache import AudioCache, cache_key
 from .capabilities import VoiceRef, parse_voice_ref, validate_capabilities
 from .catalog import ModelInfo, find_model, require_speaker, select
 from .errors import InputError
+from .lexicon import (
+    Lexicon,
+    MapBlock,
+    parse_director_markers,
+    project_text,
+    protected_ranges,
+    slice_prepared,
+)
 from .segmenter import segment_text, split_long
-from .textnorm import NORMALIZATION_VERSION, detect_language, normalize_text
+from .textnorm import NORMALIZATION_VERSION, detect_language
+from .utils import sha256_text
 from .voice_store import VoiceStore
 
 DEFAULT_PAUSE_MS = 300
@@ -59,9 +68,12 @@ class VoiceResolution:
             "ref": self.ref,
             "mode": self.mode,
             "model": self.model.model_id,
+            "model_revision": self.model.revision,
+            "model_fingerprint": self.model.fingerprint,
             "speaker": self.speaker,
             "voice_name": self.voice_name,
             "description": self.description,
+            "ref_text": self.ref_text,
             "icl": self.icl,
             "prompt_sha256": self.prompt_sha256,
             "ref_audio_sha256": self.ref_audio_sha256,
@@ -79,11 +91,19 @@ class SegmentPlan:
     estimated_duration_s: float
     cache_key: str
     source_index: int = 0
+    source_segment_id: Optional[str] = None
+    voice: Optional["VoiceResolution"] = None
+    display_text: Optional[str] = None
+    spoken_to_display: Optional[list[MapBlock]] = None
+    role: Optional[str] = None
+    seed: Optional[int] = None
+    max_new_tokens: Optional[int] = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "id": self.id,
             "text": self.text,
+            "display_text": self.display_text if self.display_text is not None else self.text,
             "language": self.language,
             "instruct": self.instruct,
             "pause_after_ms": self.pause_after_ms,
@@ -91,6 +111,20 @@ class SegmentPlan:
             "estimated_duration_s": round(self.estimated_duration_s, 3),
             "cache_key": self.cache_key,
         }
+        if self.role is not None:
+            payload["role"] = self.role
+        if self.source_segment_id is not None:
+            payload["source_segment_id"] = self.source_segment_id
+        if self.seed is not None:
+            payload["seed"] = self.seed
+        if self.max_new_tokens is not None:
+            payload["max_new_tokens"] = self.max_new_tokens
+        if self.voice is not None:
+            payload["voice"] = self.voice.to_dict()
+            payload["model"] = self.voice.model.model_id
+        if self.spoken_to_display is not None:
+            payload["spoken_to_display"] = [block.to_dict() for block in self.spoken_to_display]
+        return payload
 
 
 @dataclass
@@ -114,17 +148,29 @@ class GenerationPlan:
     dtype_name: str = "auto"
     device_name: Optional[str] = None
     normalization_version: int = NORMALIZATION_VERSION
+    display_text: Optional[str] = None
+    lexicon_sha256: Optional[str] = None
+    script_source: Optional[str] = None
+    leading_pause_ms: int = 0
+    trailing_pause_ms: int = 0
 
     @property
     def estimated_duration_s(self) -> float:
         pauses = sum(s.pause_after_ms for s in self.segments[:-1]) / 1000.0
-        return sum(s.estimated_duration_s for s in self.segments) + pauses
+        return (
+            sum(s.estimated_duration_s for s in self.segments)
+            + pauses
+            + (self.leading_pause_ms + self.trailing_pause_ms) / 1000.0
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": 1,
             "qtts_version": __version__,
             "text_chars": len(self.normalized_text),
+            "display_text": self.display_text if self.display_text is not None else self.normalized_text,
+            "lexicon_sha256": self.lexicon_sha256,
+            "script_source": self.script_source,
             "voice": self.voice.to_dict(),
             "language": self.language,
             "instruct": self.instruct,
@@ -132,6 +178,8 @@ class GenerationPlan:
             "sampling": self.sampling,
             "codec_rate": round(self.codec_rate, 4),
             "estimated_duration_s": round(self.estimated_duration_s, 3),
+            "leading_pause_ms": self.leading_pause_ms,
+            "trailing_pause_ms": self.trailing_pause_ms,
             "segments": [s.to_dict() for s in self.segments],
             "output": {"path": self.output, "format": self.format},
             "subtitle": {"formats": self.subtitle_formats, "granularity": self.granularity},
@@ -188,6 +236,16 @@ def resolve_voice(
                 "or run voice add --materialize-clone",
                 details={"voice": voice_ref.value, "path": str(store.dir_for(voice_ref.value))},
             )
+        identity: dict[str, Any] = {
+            "type": "voice",
+            "name": voice_ref.value,
+            "prompt_sha256": prompt_sha,
+            "mode": "icl" if icl else "xvec",
+        }
+        # ICL prompt items embed ref_text; editing it must invalidate cached
+        # audio even when prompt.safetensors is unchanged.
+        if icl:
+            identity["ref_text_sha256"] = sha256_text(ref_text or "")
         return VoiceResolution(
             ref=voice_ref.raw,
             mode="clone",
@@ -197,12 +255,7 @@ def resolve_voice(
             icl=icl,
             prompt_sha256=prompt_sha,
             ref_audio_sha256=source.get("ref_audio_sha256"),
-            identity={
-                "type": "voice",
-                "name": voice_ref.value,
-                "prompt_sha256": prompt_sha,
-                "mode": "icl" if icl else "xvec",
-            },
+            identity=identity,
         )
     if kind == "design":
         model = override or select(model_list, "design")
@@ -221,6 +274,181 @@ def resolve_voice(
     raise InputError(f"voice {voice_ref.value} has unsupported kind: {kind!r}")
 
 
+def _detect_segment_language(text: str, language: str) -> str:
+    seg_language = detect_language(text) if language.lower() == "auto" else language
+    if seg_language == "Auto":
+        seg_language = "Chinese" if any("一" <= ch <= "鿿" for ch in text) else "English"
+    return seg_language
+
+
+def _split_ranges(
+    text: str, limit: int, protected: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """Split display text by budget without cutting through a lexicon term."""
+    if len(text) <= limit or limit <= 0:
+        return [(0, len(text))]
+
+    def adjust(cut: int, start: int) -> int:
+        for term_start, term_end in protected:
+            if term_start < cut < term_end:
+                return term_start if term_start > start else term_end
+        return cut
+
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    while len(text) - cursor > limit:
+        candidate = split_long(text[cursor:], limit)[0]
+        cut = adjust(cursor + len(candidate), cursor)
+        if cut <= cursor:
+            cut = min(cursor + limit, len(text))
+        ranges.append((cursor, cut))
+        cursor = cut
+    if cursor < len(text):
+        ranges.append((cursor, len(text)))
+    return ranges
+
+
+def _split_piece(
+    prepared,
+    *,
+    language: str,
+    max_new_tokens: int,
+    rate: float,
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    """Split one sentence projection into budget-sized pieces."""
+    display_text = prepared.display_text
+    if not display_text:
+        return []
+    display_protected = protected_ranges(prepared.mapping)
+    limit = max_chars(
+        _detect_segment_language(prepared.spoken_text or display_text, language),
+        max_new_tokens,
+        rate,
+    )
+    if len(prepared.spoken_text) <= limit:
+        return [
+            {
+                "display_text": display_text,
+                "spoken_text": prepared.spoken_text,
+                "mapping": prepared.mapping,
+                "language": _detect_segment_language(
+                    prepared.spoken_text or display_text, language
+                ),
+                "pause_after_ms": 0,
+                "piece_index": 0,
+                "piece_count": 1,
+            }
+        ]
+    ratio = limit / max(1, len(prepared.spoken_text))
+    display_limit = max(1, int(len(display_text) * ratio))
+    ranges = _split_ranges(display_text, display_limit, display_protected)
+    if len(ranges) <= 1:
+        warnings.append(
+            "a segment exceeded the token budget but cannot be split without "
+            "cutting a lexicon term"
+        )
+        ranges = [(0, len(display_text))]
+    else:
+        warnings.append(
+            "a segment exceeded the token budget and was split into "
+            f"{len(ranges)} pieces"
+        )
+    pieces: list[dict[str, Any]] = []
+    for index, (start, end) in enumerate(ranges):
+        item = slice_prepared(prepared, start, end)
+        pieces.append(
+            {
+                "display_text": item.display_text,
+                "spoken_text": item.spoken_text,
+                "mapping": item.mapping,
+                "language": _detect_segment_language(
+                    item.spoken_text or item.display_text, language
+                ),
+                "pause_after_ms": 0,
+                "piece_index": index,
+                "piece_count": len(ranges),
+            }
+        )
+    return pieces
+
+
+def prepare_text_pieces(
+    text: str,
+    *,
+    language: str,
+    rate: float,
+    max_new_tokens: int,
+    pause_ms: int = DEFAULT_PAUSE_MS,
+    lexicon: Optional[Lexicon] = None,
+) -> tuple[str, list[dict[str, Any]], list[str], int, int]:
+    """Project raw text, split by sentence/budget, and resolve pause markers.
+
+    Order is raw -> markers -> lexicon display projection -> spoken projection
+    -> sentences/budget.  Returns ``(display_text, pieces, warnings,
+    leading_pause_ms, trailing_pause_ms)``.
+    """
+    clean, markers = parse_director_markers(text)
+    tokens: list[tuple[str, Optional[int]]] = []
+    cursor = 0
+    for marker in markers:
+        offset = max(cursor, min(int(marker["offset"]), len(clean)))
+        tokens.append((clean[cursor:offset], None))
+        tokens.append(("", int(marker["ms"])))
+        cursor = offset
+    tokens.append((clean[cursor:], None))
+
+    warnings: list[str] = []
+    pieces: list[dict[str, Any]] = []
+    pending_pause = 0
+    leading_pause = 0
+    trailing_pause = 0
+    sentence_ordinal = 0
+    for chunk_text, marker_pause in tokens:
+        if marker_pause is not None:
+            pending_pause += marker_pause
+            continue
+        if not chunk_text.strip():
+            continue
+        prepared = project_text(chunk_text, language=language, lexicon=lexicon)
+        chunk_pieces: list[dict[str, Any]] = []
+        for sentence in segment_text(prepared.display_text):
+            if not sentence:
+                continue
+            sentence_start = sum(len(p["display_text"]) for p in chunk_pieces)
+            sentence_projection = slice_prepared(
+                prepared, sentence_start, sentence_start + len(sentence)
+            )
+            split = _split_piece(
+                sentence_projection,
+                language=language,
+                max_new_tokens=max_new_tokens,
+                rate=rate,
+                warnings=warnings,
+            )
+            for piece in split:
+                piece["source_ordinal"] = sentence_ordinal
+                chunk_pieces.append(piece)
+            sentence_ordinal += 1
+        if not chunk_pieces:
+            continue
+        if not pieces:
+            leading_pause += pending_pause
+        else:
+            pieces[-1]["pause_after_ms"] = pending_pause
+        pending_pause = 0
+        for index, piece in enumerate(chunk_pieces):
+            piece["pause_after_ms"] = pause_ms if index < len(chunk_pieces) - 1 else 0
+        pieces.extend(chunk_pieces)
+    if pieces:
+        trailing_pause = pending_pause
+        pieces[-1]["pause_after_ms"] = 0
+        for piece in pieces:
+            piece["source_ordinal"] = piece.get("source_ordinal", 0)
+    display_text = "".join(piece["display_text"] for piece in pieces)
+    return display_text, pieces, warnings, leading_pause, trailing_pause
+
+
 def build_plan(
     cfg,
     *,
@@ -237,6 +465,7 @@ def build_plan(
     models: Iterable[ModelInfo],
     store: VoiceStore,
     model_override: Optional[str] = None,
+    lexicon: Optional[Lexicon] = None,
 ) -> GenerationPlan:
     if max_new_tokens <= 0:
         raise InputError("--max-new-tokens must be a positive integer")
@@ -261,9 +490,8 @@ def build_plan(
         description=voice.description,
     )
 
-    normalized = normalize_text(text, language)
-    if not normalized.strip():
-        raise InputError("input text is empty after normalization")
+    if not text.strip():
+        raise InputError("input text is empty")
 
     rate = codec_rate(voice.model)
     dtype_name = resolve_dtype_name(cfg)
@@ -271,27 +499,29 @@ def build_plan(
     sampling = dict(SAMPLING_DEFAULTS)
     sampling["max_new_tokens"] = int(max_new_tokens)
 
-    warnings: list[str] = []
-    raw_segments = segment_text(normalized)
-    expanded: list[tuple[str, int]] = []
-    for idx, seg in enumerate(raw_segments):
-        seg_language = detect_language(seg) if language.lower() == "auto" else language
-        if seg_language == "Auto":
-            seg_language = "Chinese" if any("一" <= ch <= "鿿" for ch in seg) else "English"
-        limit = max_chars(seg_language, max_new_tokens, rate)
-        pieces = split_long(seg, limit) if len(seg) > limit else [seg]
-        if len(pieces) > 1:
-            warnings.append(
-                f"segment {idx + 1} exceeded the token budget and was split into {len(pieces)} pieces"
-            )
-        for piece in pieces:
-            expanded.append((piece, idx))
+    display_text, pieces, warnings, leading_pause, trailing_pause = prepare_text_pieces(
+        text,
+        language=language,
+        rate=rate,
+        max_new_tokens=max_new_tokens,
+        pause_ms=pause_ms,
+        lexicon=lexicon,
+    )
+    if not display_text.strip():
+        raise InputError("input text is empty after normalization/director markers")
 
     segments: list[SegmentPlan] = []
-    for i, (seg_text, source_index) in enumerate(expanded, 1):
-        seg_language = detect_language(seg_text) if language.lower() == "auto" else language
-        if seg_language == "Auto":
-            seg_language = "Chinese" if any("一" <= ch <= "鿿" for ch in seg_text) else "English"
+    sentence_counts: dict[int, int] = {}
+    for piece in pieces:
+        sentence_counts[piece["source_ordinal"]] = sentence_counts.get(
+            piece["source_ordinal"], 0
+        ) + 1
+    sentence_ids = {
+        ordinal: f"s{index:03d}"
+        for index, ordinal in enumerate(sorted(sentence_counts), 1)
+    }
+    for i, piece in enumerate(pieces):
+        seg_language = piece["language"]
         # Validate the *resolved* per-segment language, including under
         # --language auto (codex P0-9).
         validate_capabilities(
@@ -302,12 +532,11 @@ def build_plan(
             icl=voice.icl,
             ref_text=voice.ref_text,
         )
-        is_last = i == len(expanded)
         doc_instruct = effective_instruct if voice.mode in ("builtin", "design") else None
         if voice.mode == "clone":
             doc_instruct = None  # Base ignores instruct by design
         key = cache_key(
-            text_normalized=seg_text,
+            text_normalized=piece["spoken_text"],
             voice_identity=voice.identity,
             model_id=voice.model.model_id,
             model_revision=voice.model.revision,
@@ -317,24 +546,36 @@ def build_plan(
             sampling=sampling,
             seed=int(cfg.seed),
             model_fingerprint=fingerprint,
+            lexicon_sha256=lexicon.sha256 if lexicon else None,
         )
+        base_id = sentence_ids[piece["source_ordinal"]]
+        if piece["piece_count"] > 1:
+            segment_id = f"{base_id}.p{piece['piece_index'] + 1}"
+        else:
+            segment_id = base_id
         segments.append(
             SegmentPlan(
-                id=f"s{i:03d}",
-                text=seg_text,
+                id=segment_id,
+                text=piece["spoken_text"],
                 language=seg_language,
                 instruct=doc_instruct,
-                pause_after_ms=0 if is_last else int(pause_ms),
-                estimated_tokens=estimate_tokens(seg_text, seg_language, rate),
-                estimated_duration_s=estimate_duration_s(seg_text, seg_language),
+                pause_after_ms=piece["pause_after_ms"],
+                estimated_tokens=estimate_tokens(piece["spoken_text"], seg_language, rate),
+                estimated_duration_s=estimate_duration_s(piece["spoken_text"], seg_language),
                 cache_key=key,
-                source_index=source_index,
+                source_index=i,
+                source_segment_id=base_id,
+                voice=voice,
+                display_text=piece["display_text"],
+                spoken_to_display=piece["mapping"],
+                seed=int(cfg.seed),
+                max_new_tokens=int(max_new_tokens),
             )
         )
 
     return GenerationPlan(
         text=text,
-        normalized_text=normalized,
+        normalized_text=display_text,
         voice=voice,
         segments=segments,
         sampling=sampling,
@@ -349,6 +590,10 @@ def build_plan(
         granularity=granularity,
         dtype_name=dtype_name,
         normalization_version=NORMALIZATION_VERSION,
+        display_text=display_text,
+        lexicon_sha256=lexicon.sha256 if lexicon else None,
+        leading_pause_ms=leading_pause,
+        trailing_pause_ms=trailing_pause,
     )
 
 
@@ -359,17 +604,23 @@ def rekey_plan(plan: GenerationPlan, *, dtype: str, device: Optional[str] = None
         return plan
     plan.dtype_name = dtype
     for seg in plan.segments:
+        voice = seg.voice or plan.voice
         seg.cache_key = cache_key(
             text_normalized=seg.text,
-            voice_identity=plan.voice.identity,
-            model_id=plan.voice.model.model_id,
-            model_revision=plan.voice.model.revision,
-            model_fingerprint=plan.voice.model.fingerprint or None,
+            voice_identity=voice.identity,
+            model_id=voice.model.model_id,
+            model_revision=voice.model.revision,
+            model_fingerprint=voice.model.fingerprint or None,
             dtype=dtype,
             language=seg.language,
             instruct=seg.instruct,
-            sampling=plan.sampling,
-            seed=plan.seed,
+            sampling=(
+                {**plan.sampling, "max_new_tokens": seg.max_new_tokens}
+                if seg.max_new_tokens is not None
+                else plan.sampling
+            ),
+            seed=int(seg.seed if seg.seed is not None else plan.seed),
+            lexicon_sha256=plan.lexicon_sha256,
         )
     return plan
 

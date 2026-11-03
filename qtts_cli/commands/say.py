@@ -20,19 +20,24 @@ from ..audio_io import (
     duration_s,
     read_audio,
     resolve_output_format,
+    silence_ms,
     write_audio,
     write_audio_stdout,
 )
 from ..cache import AudioCache
 from ..catalog import language_supported, scan, select_aligner
 from ..errors import CapabilityError, InputError, ModelError, QttsError, UsageError
+from ..lexicon import Lexicon, MapBlock, spoken_items_to_display
 from ..plan import (
+    DEFAULT_PAUSE_MS,
     GenerationPlan,
     attach_cache_stats,
     build_plan,
     rekey_plan,
     resolve_dtype_name,
 )
+from ..budget import DEFAULT_MAX_NEW_TOKENS
+from ..script import compile_script
 from ..sidecar import build_recipe, recipe_path
 from ..subtitle_qc import check_subtitles, raise_quality_error
 from ..subtitles import (
@@ -77,9 +82,9 @@ def read_input(args) -> tuple[str, str]:
         if not path.is_file():
             raise InputError(f"script file not found: {path}")
         if path.suffix.lower() in (".yaml", ".yml", ".json"):
-            raise UsageError(
-                "structured multi-role scripts are P1; P0 accepts plain text via --script or --file"
-            )
+            # Structured scripts are compiled by ``run`` before this helper is
+            # consulted; reaching here means a caller passed the wrong mode.
+            return "", str(path)
         return path.read_text(encoding="utf-8"), str(path)
     if not sys.stdin.isatty():
         return sys.stdin.read(), "stdin"
@@ -96,11 +101,42 @@ def run(
     engine_cache: Optional[dict[str, TtsEngine]] = None,
     aligner_cache: Optional[dict[str, AlignerEngine]] = None,
 ) -> dict[str, Any]:
-    if not getattr(args, "voice", None):
+    script_path = getattr(args, "script", None)
+    structured = bool(
+        script_path and Path(script_path).suffix.lower() in (".yaml", ".yml", ".json")
+    )
+    if not structured and not getattr(args, "voice", None):
         raise UsageError("--voice is required (builtin:NAME | voice:NAME | design:DESCRIPTION)")
-    text, source = read_input(args)
-    if not text.strip():
-        raise InputError("input text is empty")
+    if structured:
+        conflicts = [
+            name
+            for name in ("text", "file")
+            if getattr(args, name, None)
+        ]
+        if getattr(args, "stdin", False):
+            conflicts.append("--stdin")
+        if conflicts:
+            raise UsageError(
+                "--script cannot be combined with TEXT, --stdin or --file; "
+                f"got {', '.join(conflicts)}"
+            )
+        text, source = "", str(Path(script_path).expanduser())
+    else:
+        text, source = read_input(args)
+        if not text.strip():
+            raise InputError("input text is empty")
+
+    # CLI options are explicit defaults for structured scripts (see below);
+    # missing attributes come from the argparse SUPPRESS sentinels.
+    cli_language = getattr(args, "language", None)
+    cli_instruct = getattr(args, "instruct", None)
+    cli_max_new_tokens = getattr(args, "max_new_tokens", None)
+    cli_pause_ms = getattr(args, "pause_ms", None)
+    language_arg = "auto" if cli_language is None else cli_language
+    max_new_tokens_arg = (
+        DEFAULT_MAX_NEW_TOKENS if cli_max_new_tokens is None else cli_max_new_tokens
+    )
+    pause_ms_arg = DEFAULT_PAUSE_MS if cli_pause_ms is None else cli_pause_ms
 
     policy = policy_from_args(args)
     models = scan(cfg.model_dir)
@@ -110,6 +146,13 @@ def run(
             details={"model_dir": str(cfg.model_dir) if cfg.model_dir else None},
         )
     store = VoiceStore(cfg.data_dir)
+    lexicon_arg = getattr(args, "lexicon", None)
+    # Batch reuses this entry point and may pass an already-loaded Lexicon.
+    lexicon = (
+        lexicon_arg
+        if isinstance(lexicon_arg, Lexicon)
+        else Lexicon.load(lexicon_arg)
+    )
 
     out_target: str = args.out if args.out is not None else "out.wav"
     subtitle_formats = normalize_formats(args.subtitle)
@@ -135,24 +178,52 @@ def run(
     if out_target == "-" and subtitle_formats and sub_prefix is None:
         raise UsageError("--out - cannot host subtitle files; pass --subtitle-out-prefix")
 
-    fmt = resolve_output_format(None if out_target == "-" else out_target, args.format)
-
-    plan = build_plan(
-        cfg,
-        text=text,
-        voice_ref=args.voice,
-        language=args.language,
-        instruct=args.instruct,
-        max_new_tokens=args.max_new_tokens,
-        pause_ms=args.pause_ms,
-        output=None if out_target == "-" else out_target,
-        fmt=fmt,
-        subtitle_formats=subtitle_formats,
-        granularity=args.granularity,
-        models=models,
-        store=store,
-        model_override=args.model,
-    )
+    if structured:
+        plan = compile_script(
+            cfg,
+            script_path,
+            models=models,
+            store=store,
+            lexicon=lexicon,
+            model_override=args.model,
+            voice_default=getattr(args, "voice", None),
+            output=None if out_target == "-" else out_target,
+            fmt=args.format,
+            subtitle_formats=subtitle_formats,
+            granularity=args.granularity,
+            cli_language=cli_language,
+            cli_instruct=cli_instruct,
+            cli_max_new_tokens=cli_max_new_tokens,
+            cli_pause_ms=cli_pause_ms,
+        )
+        if args.format:
+            fmt = resolve_output_format(
+                None if out_target == "-" else out_target, args.format
+            )
+        elif out_target != "-" and Path(out_target).suffix.lower() in (".wav", ".flac"):
+            fmt = resolve_output_format(out_target, None)
+        else:
+            fmt = resolve_output_format(None, plan.format)
+        plan.format = fmt
+    else:
+        fmt = resolve_output_format(None if out_target == "-" else out_target, args.format)
+        plan = build_plan(
+            cfg,
+            text=text,
+            voice_ref=args.voice,
+            language=language_arg,
+            instruct=cli_instruct,
+            max_new_tokens=max_new_tokens_arg,
+            pause_ms=pause_ms_arg,
+            output=None if out_target == "-" else out_target,
+            fmt=fmt,
+            subtitle_formats=subtitle_formats,
+            granularity=args.granularity,
+            models=models,
+            store=store,
+            model_override=args.model,
+            lexicon=lexicon,
+        )
 
     # Subtitle prerequisites are checked here, before TTS weights load (P0-1).
     aligner_model = _prepare_aligner(models, plan) if subtitle_formats else None
@@ -184,33 +255,58 @@ def run(
     need_model = cfg.no_cache or any(
         not cache.exists(seg.cache_key, "wav") for seg in plan.segments
     )
-    engine_key = f"{plan.voice.model.path}|{cfg.device}|{plan.dtype_name}"
-    if engine_cache is not None:
-        # JSONL streams may mix builtin/voice/design models. Keep one live
-        # engine slot: evict and release the previous model before the next
-        # one can load (t10 fix #7). `_MODEL_CACHE` is global, so clear it too.
-        for old_key, old_engine in list(engine_cache.items()):
-            if old_key != engine_key:
+    engine_slot: dict[str, TtsEngine] = (
+        engine_cache if engine_cache is not None else {}
+    )
+    prompt_cache: dict[tuple[str, str], Any] = {}
+    last_engine: Optional[TtsEngine] = None
+    load_ms_total = 0.0
+
+    def acquire(voice):
+        """One live TTS model slot; release the previous model before loading."""
+        nonlocal last_engine, load_ms_total
+        key = f"{voice.model.path}|{cfg.device}"
+        for old_key, old_engine in list(engine_slot.items()):
+            if old_key != key:
                 old_engine.model = None
-                engine_cache.pop(old_key, None)
+                engine_slot.pop(old_key, None)
                 clear_model_cache()
-        engine = engine_cache.get(engine_key)
+                prompt_cache.clear()
+        engine = engine_slot.get(key)
         if engine is None:
-            engine = TtsEngine(cfg, plan.voice.model)
-            engine_cache[engine_key] = engine
-    else:
-        engine = TtsEngine(cfg, plan.voice.model)
-    prompt_items = None
-    if need_model:
+            engine = TtsEngine(cfg, voice.model)
+            engine_slot[key] = engine
         if engine.model is None:
             engine.load()
+            load_ms_total += float(engine.load_ms or 0.0)
         # The runtime dtype may differ from the platform guess; rebuild cache
         # keys so a CPU fp32 run never reads bf16 artefacts (P1-5).
         if engine.dtype_name and engine.dtype_name != plan.dtype_name:
             rekey_plan(plan, dtype=engine.dtype_name, device=engine.device)
             attach_cache_stats(plan, cache, "wav")
-        if plan.voice.mode == "clone":
-            prompt_items = engine.build_clone_prompt_items(store, plan.voice.voice_name or "")
+        last_engine = engine
+        return engine
+
+    def prompt_for(engine, voice):
+        if voice.mode != "clone":
+            return None
+        key = (str(voice.model.path), json.dumps(voice.identity, sort_keys=True))
+        if key not in prompt_cache:
+            prompt_cache[key] = engine.build_clone_prompt_items(
+                store, voice.voice_name or ""
+            )
+        return prompt_cache[key]
+
+    if need_model:
+        first_missing = next(
+            (
+                seg
+                for seg in plan.segments
+                if cfg.no_cache or not cache.exists(seg.cache_key, "wav")
+            ),
+            plan.segments[0],
+        )
+        acquire(first_missing.voice or plan.voice)
 
     generated_at = utc_now()
     segment_audio = []
@@ -218,20 +314,28 @@ def run(
     first_sr: Optional[int] = None
 
     for seg in plan.segments:
+        voice = seg.voice or plan.voice
         cached_path = None if cfg.no_cache else cache.lookup(seg.cache_key, "wav")
         if cached_path is not None:
             audio, sr = read_audio(cached_path)
             gen_info = {"cached": True, "generate_ms": 0.0}
+            last_engine = last_engine or engine_slot.get(
+                f"{voice.model.path}|{cfg.device}"
+            )
         else:
+            engine = acquire(voice)
+            sampling = dict(plan.sampling)
+            if seg.max_new_tokens is not None:
+                sampling["max_new_tokens"] = int(seg.max_new_tokens)
             audio, sr, gen_info = engine.generate(
                 text=seg.text,
                 language=seg.language,
-                mode=plan.voice.mode,
-                speaker=plan.voice.speaker,
-                instruct=seg.instruct if plan.voice.mode in ("builtin", "design") else None,
-                prompt_items=prompt_items,
-                sampling=plan.sampling,
-                seed=int(cfg.seed),
+                mode=voice.mode,
+                speaker=voice.speaker,
+                instruct=seg.instruct if voice.mode in ("builtin", "design") else None,
+                prompt_items=prompt_for(engine, voice),
+                sampling=sampling,
+                seed=int(seg.seed if seg.seed is not None else cfg.seed),
             )
             gen_info["cached"] = False
             if not cfg.no_cache:
@@ -244,10 +348,15 @@ def run(
         segment_meta.append(
             {
                 "id": seg.id,
+                "source_segment_id": seg.source_segment_id,
                 "cache_key": seg.cache_key,
                 "text_sha256": sha256_text(seg.text),
+                "display_sha256": sha256_text(seg.display_text or seg.text),
+                "voice": (voice.to_dict() if seg.voice is not None else voice.ref),
                 "language": seg.language,
                 "instruct": seg.instruct,
+                "seed": seg.seed,
+                "max_new_tokens": seg.max_new_tokens,
                 "pause_after_ms": seg.pause_after_ms,
                 "duration_ms": int(round(duration_s(audio, sr) * 1000)),
                 "cached": bool(gen_info.get("cached")),
@@ -258,7 +367,13 @@ def run(
     if first_sr is None:
         raise ModelError("no audio generated")
     sample_rate = first_sr
-    full = concat(segment_audio, sample_rate, [s.pause_after_ms for s in plan.segments])
+    core = concat(segment_audio, sample_rate, [s.pause_after_ms for s in plan.segments])
+    parts = [core]
+    if plan.leading_pause_ms:
+        parts.insert(0, silence_ms(int(plan.leading_pause_ms), sample_rate))
+    if plan.trailing_pause_ms:
+        parts.append(silence_ms(int(plan.trailing_pause_ms), sample_rate))
+    full = concat(parts, sample_rate) if len(parts) > 1 else core
     total_s = duration_s(full, sample_rate)
 
     warnings = list(plan.warnings)
@@ -286,7 +401,7 @@ def run(
         else:
             aligner = AlignerEngine(cfg, aligner_model)
         cues = []
-        offset = 0.0
+        offset = plan.leading_pause_ms / 1000.0
         for seg, audio, meta in zip(plan.segments, segment_audio, segment_meta):
             seg_duration = duration_s(audio, sample_rate)
             if seg_duration > MAX_ALIGN_SECONDS:
@@ -311,14 +426,23 @@ def run(
                     f"segment {seg.id} alignment coverage is {seg_coverage:.0%}; "
                     "unmatched characters reuse neighbouring timings"
                 )
+            display_text = seg.display_text or seg.text
+            mapping = seg.spoken_to_display
+            if mapping is None:
+                mapping = [
+                    MapBlock(i, i + 1, i, i + 1) for i in range(len(seg.text))
+                ]
+            display_items = spoken_items_to_display(
+                display_text, seg.text, mapping, items
+            )
             seg_cues = build_cues(
-                seg.text,
-                items,
+                display_text,
+                display_items,
                 granularity=args.granularity,
                 fallback_duration=seg_duration,
                 audio_duration=seg_duration,
                 policy=policy,
-                parent_ids=(f"seg:{seg.id}",),
+                parent_ids=(f"seg:{seg.source_segment_id or seg.id}",),
                 warnings=warnings,
                 stats=boundary_stats,
                 repair_stats=repair_stats,
@@ -326,7 +450,7 @@ def run(
             cues.extend(shift_cues(seg_cues, offset))
             offset += seg_duration + seg.pause_after_ms / 1000.0
         cues = monotonic(cues, audio_duration=total_s, repair_stats=repair_stats)
-        ensure_full_text(cues, plan.normalized_text)
+        ensure_full_text(cues, plan.display_text or plan.normalized_text)
         qc_report = check_subtitles(
             cues,
             granularity=args.granularity,
@@ -351,6 +475,8 @@ def run(
         write_audio(out_target, full, sample_rate, fmt)
 
     elapsed_ms = (time.perf_counter() - started) * 1000.0
+    runtime_dtype = (last_engine.dtype_name if last_engine else None) or plan.dtype_name
+    runtime_device = last_engine.device if last_engine else cfg.device
     recipe = build_recipe(
         qtts_version=__version__,
         text=plan.normalized_text,
@@ -364,7 +490,7 @@ def run(
             "id": plan.voice.model.model_id,
             "revision": plan.voice.model.revision,
             "fingerprint": plan.voice.model.fingerprint,
-            "dtype": engine.dtype_name or resolve_dtype_name(cfg),
+            "dtype": runtime_dtype or resolve_dtype_name(cfg),
             "path": str(plan.voice.model.path),
         },
         sampling=plan.sampling,
@@ -372,7 +498,7 @@ def run(
         created_at=generated_at,
         seed=plan.seed,
         normalization={"version": plan.normalization_version},
-        device=engine.device,
+        device=runtime_device,
         instruct=plan.instruct,
         language=plan.language,
         subtitle={
@@ -387,10 +513,36 @@ def run(
         else None,
         timing={
             "total_ms": round(elapsed_ms, 1),
-            "model_load_ms": round(engine.load_ms or 0.0, 1),
+            "model_load_ms": round(load_ms_total, 1),
             "generate_ms": round(sum(m.get("generate_ms") or 0.0 for m in segment_meta), 1),
         },
     )
+    voices = []
+    models_used = []
+    seen_voices: set[tuple[str, str]] = set()
+    seen_models: set[str] = set()
+    for seg in plan.segments:
+        voice = seg.voice or plan.voice
+        voice_key = (voice.ref, voice.model.model_id)
+        if voice_key not in seen_voices:
+            seen_voices.add(voice_key)
+            voices.append(voice.to_dict())
+        if voice.model.model_id not in seen_models:
+            seen_models.add(voice.model.model_id)
+            models_used.append(
+                {
+                    "id": voice.model.model_id,
+                    "revision": voice.model.revision,
+                    "fingerprint": voice.model.fingerprint,
+                    "path": str(voice.model.path),
+                }
+            )
+    recipe["voices"] = voices
+    recipe["models"] = models_used
+    if plan.script_source:
+        recipe["script_source"] = plan.script_source
+    if plan.lexicon_sha256:
+        recipe["lexicon_sha256"] = plan.lexicon_sha256
     if subtitle_formats and qc_report is not None:
         recipe["subtitle_qc"] = qc_report.to_dict()
     if recipe_target == "-":
@@ -408,13 +560,15 @@ def run(
         "sample_rate": sample_rate,
         "duration_s": round(total_s, 3),
         "voice": plan.voice.to_dict(),
+        "voices": voices,
+        "models": models_used,
         "language": plan.language,
         "seed": plan.seed,
         "segments": segment_meta,
         "sampling": plan.sampling,
         "cache": cache.stats.to_dict(),
-        "device": engine.device or "cache",
-        "dtype": engine.dtype_name or resolve_dtype_name(cfg),
+        "device": runtime_device or "cache",
+        "dtype": runtime_dtype or resolve_dtype_name(cfg),
         "timing": recipe["timing"],
         "recipe": recipe_target if recipe_target else None,
         "warnings": warnings,
@@ -468,14 +622,37 @@ def _recipe_target(recipe_arg, out_target: str, cfg, plan: GenerationPlan) -> Op
     if out_target != "-":
         return str(recipe_path(out_target))
     # No audio file to sit beside: keep the recipe in the data dir (P0-6).
-    digest = sha256_text(plan.normalized_text)[:16]
+    # Hash the whole generation request so identical text with a different
+    # voice/seed/sampling cannot overwrite another run's recipe.
+    request = {
+        "text": plan.display_text or plan.normalized_text,
+        "voice": plan.voice.identity,
+        "voice_ref": plan.voice.ref,
+        "model": plan.voice.model.model_id,
+        "seed": plan.seed,
+        "sampling": plan.sampling,
+        "language": plan.language,
+        "instruct": plan.instruct,
+        "lexicon_sha256": plan.lexicon_sha256,
+        "script_source": plan.script_source,
+        "segments": [[seg.id, seg.text, seg.cache_key] for seg in plan.segments],
+        "leading_pause_ms": plan.leading_pause_ms,
+        "trailing_pause_ms": plan.trailing_pause_ms,
+    }
+    digest = sha256_text(
+        json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )[:32]
     return str(Path(cfg.data_dir) / "recipes" / f"{digest}.recipe.json")
 
 
 def _estimate_memory(plan: GenerationPlan, with_aligner: bool) -> dict[str, Any]:
     """Rough peak-memory estimate for the dry-run report (PRD FR-P0-07)."""
-    size = plan.voice.model.size
-    weights_gb = 3.4 if size == "1b7" else 1.4
+    voices = [seg.voice or plan.voice for seg in plan.segments]
+    model_infos = {}
+    for voice in voices:
+        model_infos[voice.model.model_id] = voice.model
+    sizes = [model.size for model in model_infos.values()]
+    weights_gb = 3.4 if "1b7" in sizes else 1.4
     runtime_gb = 1.5
     aligner_gb = 1.2 if with_aligner else 0.0
     peak = weights_gb + runtime_gb + aligner_gb
@@ -486,7 +663,8 @@ def _estimate_memory(plan: GenerationPlan, with_aligner: bool) -> dict[str, Any]
     else:
         risk = "low"
     return {
-        "models": [plan.voice.model.model_id] + (["Qwen3-ForcedAligner-0.6B"] if with_aligner else []),
+        "models": sorted(model_infos)
+        + (["Qwen3-ForcedAligner-0.6B"] if with_aligner else []),
         "weights_gb": round(weights_gb, 1),
         "estimated_peak_gb": round(peak, 1),
         "risk": risk,
@@ -748,6 +926,7 @@ def run_jsonl(cfg, args) -> dict[str, Any]:
             max_new_tokens=getattr(args, "max_new_tokens", 2048),
             pause_ms=getattr(args, "pause_ms", 300),
             model=getattr(args, "model", None),
+            lexicon=getattr(args, "lexicon", None),
             dry_run=False,
             yes=True,
             max_cue_chars=getattr(args, "max_cue_chars", 42),

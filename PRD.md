@@ -680,3 +680,39 @@ qtts align
 - `qwen-asr` 缺失记录为 `available:false`/null；若项目声明字幕 formats，即使模型目录里有对齐器，也会先检查包可用性并直接报错（退出 3，等价 `--require-align`）。
 - 记录有效采样参数、seed、规范化版本、字幕策略、dtype/device、完整 Python 与包版本。`--project` 中的相对 `model_dir` 相对项目文件所在目录解析。
 - 锁文件为排序 JSON、无易变时间戳；所有校验和哈希在原子写入前完成；生成锁时不加载权重。
+
+### 13.5 P1 Wave 2 实现注记
+
+本节记录实现选择，不改变上面的需求定义。
+
+**通用计划与执行（FR-P1-02 基础）**
+
+- `SegmentPlan` 保存完整的 `VoiceResolution` 快照（ref/mode/model id/revision/fingerprint/speaker/description/ref_text/icl/prompt sha256/ref audio sha256/identity）；`GenerationPlan.voice` 只作为默认与旧 JSON 兼容字段。预算切分后的 id 形如 `s001.p2`，同时保存 `source_segment_id`；字幕 parent id 使用 source id，不依赖执行器临时编号。
+- 执行器始终只保留一个 TTS 模型槽；切换模型前释放旧 engine 并清空 clone prompt，prompt 按 `(model path, voice identity)` 缓存。所有 segment 的 voice/model/language/instruct/ref_text 在第一次 `TtsEngine.load()` 前完成校验。`--model` 与多模型脚本冲突时退出 2。
+- 多段文本聚合为 `"".join(display_text)`，不插入额外换行或空格，确保 `ensure_full_text()` 可验证。
+
+**多角色脚本（FR-P1-02）**
+
+- 脚本支持 YAML/JSON，`pyproject.toml` 声明 `PyYAML>=6.0`；缺依赖退出 3。YAML 使用 `safe_load` 等价路径，并拒绝重复 mapping key、多文档、任何 anchor/alias、超大文件与节点数；JSON 拒绝重复 key。
+- `defaults` 可被 segment 覆盖 `voice/language/instruct/seed/max_new_tokens/pause_after_ms`；`role` 仅透传，不自动映射 voice；`format` 为作业级参数，segment 中出现即 schema 错。缺省 id 自动生成 `s001...`；重复 id、未知字段、字段类型/整数错误、顶层未支持字段（含 `project`）均退出 2。一个 source segment 产出多个 piece 时，全部 piece 使用稳定后缀 id（`s001.p1`、`s001.p2`），`source_segment_id` 保持源 id。
+- `lint`/`compile` 都不加载模型，且先校验脚本语法/schema 再扫描模型。`compile` 输出排序 key、无时间戳、无 cache 状态/耗时/绝对 `script_source` 的 JSON；保留 revision/fingerprint。`lint` 语法/schema 错退出 2，未知 voice/能力冲突退出 4，错误 details 带 segment id 与字段路径。
+- `say --script` 复用同一编译器与单条执行器；`--dry-run` 的 plan 与 compile 的 segments 一致。TEXT/`--stdin`/`--file` 与 `--script` 互斥（退出 2）；显式 `--language/--instruct/--max-new-tokens/--pause-ms` 覆盖脚本 `defaults` 并进入 plan/recipe。
+- segment 的首尾 `[[pause:MS]]` 不丢弃：首段 leading、末段 trailing 落到计划全局字段，中间段合并进相邻 `pause_after_ms`。
+
+**文本投影、词典与导演标记（FR-P1-06）**
+
+- 固定顺序：raw → 抽取 director marker → 词典保护的 display 投影 → spoken 投影 → 分句/预算。marker 必须在数字规范化之前解析，否则 `[[pause:500]]` 的 `500` 会被改写。
+- 词典匹配使用原始文本的 NFKC+casefold canonical key（大小写/全角归一），最长匹配优先；重复 term（归一后相同）退出 4。未匹配片段各自 `normalize_text`，匹配项 display 保留原始 `term`、spoken 使用 `spoken`。
+- 映射是显式 `MapBlock` 字符区间，支持 1:1、1:N、N:1；构造后断言完整、连续、单调、无重叠、覆盖 display 与 spoken 两端。预算切分只在词条边界外切，切完不重新匹配词典。禁止用 `find()` 二次定位。
+- 对齐器读 spoken 文本，`spoken_items_to_display()` 顺序消费 aligner item（不使用 `find`）把时间投影到 display 字符，再调用现有 `build_cues()`；字幕渲染层不做替换。顺序定位只允许跳过标点/空白，跳过内容字符时该 item 视为未映射，交给 coverage/QC 暴露。`align --text/--text-file/--srt --lexicon` 同样映射回 display，且 coverage 一律按 aligner 实际读取的 spoken 文本计算。
+- `[[pause:MS]]` 只支持非负整数，可位于句首、句间、句尾或连续出现；连续标记求和，句首记 `leading_pause_ms`、句尾记 `trailing_pause_ms`，执行器用静音实现，字幕不含 marker。`speed/rate/pitch/emphasis/stress`、未知标记、未闭合/嵌套残留 `[[`/`]]` 均退出 2，不静默忽略。
+- 词典内容哈希进入缓存键；recipe 记录 `lexicon_sha256`。ICL clone 的 voice identity 另含 `ref_text_sha256`，修改 `voice.json` 的 `ref_text` 会使缓存失效；xvec 不受影响。
+
+**批量清单（FR-P1-01）**
+
+- manifest JSONL 字段与 `say --stdin --jsonl` 对齐：`id`（必填唯一）、`text`、`voice`、`language`、`instruct`、`out`、`format`、`subtitle`、`seed`、`max_new_tokens`、`pause_ms`。未知字段、坏 JSON/重复 key（退出 2）、重复 id、输出路径冲突、未知 voice、能力冲突都在任何生成前失败（退出 4）。`out` 只要有后缀就必须是 `.wav`/`.flac`，且与显式 `format` 一致。
+- `batch plan` 全量编译并写确定性 `plan.json` 与初始 `pending` 的 `status.jsonl`，不加载模型。`job_key` 覆盖 effective request（text、voice/model identity、language、instruct、seed、max_new_tokens、format、subtitle、pause_ms）、`lexicon_sha256` 与规范化输出路径，不使用 cache key。
+- `batch run` 复用单条 `say` 执行器与错误结构。任务按 model/voice/language/estimated length 排序分桶；`--jobs` 只并发调度，模型推理由全局锁串行（MPS 同样）。状态 `pending/running/done/failed/skipped` 由单线程调度器维护有序内存状态，串行原子重写 `status.jsonl`；每行记录 `last_error` 与 `transient`。
+- `--resume` 校验 `status=done`、job_key、输出存在且 sha256 匹配、recipe 存在且其中稳定 job_key 匹配；recipe 的 `created_at`/耗时/绝对路径不进入 job_key。`running` 恢复为 `pending`，`skipped` 下次重新调度；失败的 job 只有 `transient=true` 时才会在 `--resume --retry N` 下重新调度。
+- `--retry N` 只重试执行期 transient 失败（ModelError/OSError/RuntimeError），普通异常立即失败；不重试 Usage/Input/Capability/QC。记录 attempts、last_error 与 transient。`--fail-fast` 只停止调度新任务，在跑任务完成，未启动项标 `skipped`。
+- 进度与 `--watch` 只走 stderr；stdout 只有最终 summary。任一任务失败退出 6。
