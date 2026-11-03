@@ -240,7 +240,7 @@ def test_stdout_audio_recipe_falls_back_to_data_dir(model_dir: Path, tmp_path: P
 # --------------------------------------------------------------------------- #
 def test_partial_alignment_is_filled_and_clamped():
     text = "ABCDE"
-    cues = build_cues(text, [AlignItem("C", 0.1, 0.2)], audio_duration=1.0)
+    cues = build_cues(text, [AlignItem("C", 0.1, 0.2)], granularity="char", audio_duration=1.0)
     assert full_text(cues) == text
     assert all(0.0 <= cue.start <= cue.end <= 1.0 for cue in cues)
     for prev, cur in zip(cues, cues[1:]):
@@ -260,6 +260,7 @@ def test_zero_duration_at_audio_tail_is_reallocated():
     cues = build_cues(
         "AB",
         [AlignItem("A", 2.0, 2.1), AlignItem("B", 2.1, 2.2)],
+        granularity="char",
         audio_duration=2.0,
     )
     assert [cue.text for cue in cues] == ["A", "B"]
@@ -271,14 +272,14 @@ def test_zero_duration_at_audio_tail_is_reallocated():
 def test_impossible_cue_fit_raises():
     text = "你好世界你好世界"
     with pytest.raises(InputError, match="cannot fit"):
-        build_cues(text, [AlignItem(text, 0.0, 1.0)], audio_duration=0.005)
+        build_cues(text, [AlignItem(text, 0.0, 1.0)], granularity="char", audio_duration=0.005)
 
 
 def test_repeated_text_maps_sequentially():
     text = "abcabc"
     items = [AlignItem("a", 0.0, 0.1), AlignItem("b", 0.1, 0.2), AlignItem("c", 0.2, 0.3),
              AlignItem("a", 0.3, 0.4), AlignItem("b", 0.4, 0.5), AlignItem("c", 0.5, 0.6)]
-    cues = build_cues(text, items)
+    cues = build_cues(text, items, granularity="char")
     assert coverage(text, items) == pytest.approx(1.0)
     assert [c.text for c in cues] == ["a", "b", "c", "a", "b", "c"]
 

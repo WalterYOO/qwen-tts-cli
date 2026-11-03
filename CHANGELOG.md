@@ -18,6 +18,26 @@
 - `project init/lock`
 - 长音频对齐分窗（> 5 分钟）
 
+## [0.1.1] - 2026-11-03
+
+### Added
+
+- `--granularity sentence` for `say` and `align`：按句子分段生成 cue；`char` / `word` 保留。
+- 中英文逐句字幕与 `join(cue.text) == normalized_text` 的回归测试。
+
+### Changed
+
+- 字幕粒度默认从 `char` 改为 `sentence`，一句一 cue，修复中文 SRT 默认逐字、不可读的问题。
+- `GenerationPlan.granularity` 与 `build_plan()` 默认值同步为 `sentence`；`--dry-run` 与 recipe 报告同一值。
+
+### Fixed
+
+- 默认 SRT 输出不再把 CJK 文本拆成单字 cue。
+
+### Known Limitations
+
+- `sentence` 模式暂不切分超长句、不合并过短句；CPS 与行宽门禁属 P1。
+
 ## [0.1.0] - 2026-11-03
 
 首个 P0 / M0 版本。定位是「以原文为内容真值的本地语音制作工具」：统一音色资产，生成音频与时间轴，产出可复现配方。
