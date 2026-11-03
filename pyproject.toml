@@ -7,7 +7,7 @@ name = "qwen-tts-cli"
 version = "0.1.0"
 description = "Scriptable local Qwen3-TTS command line tool: say, voice assets, forced alignment, subtitles."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = { text = "Apache-2.0" }
 authors = [{ name = "qwen-tts-cli contributors" }]
 dependencies = [
@@ -35,3 +35,9 @@ addopts = "-q"
 markers = [
     "integration: requires local models and a torch runtime (set RUN_INTEGRATION=1)",
 ]
+
+[tool.uv]
+# qwen-tts 0.1.1 pins transformers==4.57.3, qwen-asr 0.0.6 pins ==4.57.6.
+# 4.57.6 is verified to run both in one process (PRD §3.3); override the
+# metadata pin so `uv sync --extra tts --extra align` can resolve.
+override-dependencies = ["transformers==4.57.6"]
