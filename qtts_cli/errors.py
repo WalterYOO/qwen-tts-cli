@@ -36,7 +36,14 @@ class QttsError(Exception):
         self.details = details or {}
 
     def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {"ok": False, "error": self.kind, "message": self.message}
+        # `code` is the process exit code, so machine callers can branch on a
+        # stable number (t10 P1 pre-review: unified numeric error code).
+        payload: dict[str, Any] = {
+            "ok": False,
+            "error": self.kind,
+            "code": self.code,
+            "message": self.message,
+        }
         if self.details:
             payload["details"] = self.details
         return payload
@@ -68,3 +75,10 @@ class ModelError(QttsError):
 class QCError(QttsError):
     def __init__(self, message: str, **kw: Any) -> None:
         super().__init__(message, EXIT_QC, kind="qc", **kw)
+
+
+class QualityError(QttsError):
+    """Subtitle quality gate failure (exit 5; FR-P1-05b)."""
+
+    def __init__(self, message: str, **kw: Any) -> None:
+        super().__init__(message, EXIT_QC, kind="quality", **kw)

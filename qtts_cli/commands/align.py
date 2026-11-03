@@ -12,14 +12,16 @@ from ..audio_io import duration_s, read_audio
 from ..catalog import scan, select_aligner
 from ..errors import InputError, UsageError
 from ..sidecar import SCHEMA_VERSION
+from ..subtitle_qc import check_subtitles, raise_quality_error
 from ..subtitles import (
     SrtCue,
     build_cues,
     build_cues_for_ranges,
     coverage,
-    full_text,
+    ensure_full_text,
     normalize_formats,
     parse_srt,
+    policy_from_args,
     render,
 )
 from ..textnorm import normalize_text
@@ -72,6 +74,14 @@ def run(cfg, args) -> dict[str, Any]:
     raw_text, source, srt_cues = read_text_source(args)
 
     formats = normalize_formats(args.format) or ["srt"]
+    policy = policy_from_args(args)
+    boundary_stats: dict[str, int] = {
+        "sentences": 0,
+        "splits": 0,
+        "hard_cuts": 0,
+        "merges": 0,
+    }
+    repair_stats: dict[str, int] = {}
     prefix = args.out_prefix
     if prefix is None:
         prefix = str(Path(args.audio).with_suffix(""))
@@ -99,13 +109,16 @@ def run(cfg, args) -> dict[str, Any]:
     aligner_model = select_aligner(models)
     aligner = AlignerEngine(cfg, aligner_model)
 
+    warnings: list[str] = []
     if srt_cues:
         normalized_cues = [normalize_text(cue.text, args.language) for cue in srt_cues]
         normalized, ranges = _cue_ranges(normalized_cues)
         if not normalized.strip():
             raise InputError("input text is empty after normalization")
         items, info = aligner.align(samples, sr, normalized, args.language)
-        cues = build_cues_for_ranges(normalized, items, ranges, audio_duration=audio_s)
+        cues = build_cues_for_ranges(
+            normalized, items, ranges, audio_duration=audio_s, repair_stats=repair_stats
+        )
         for cue, original in zip(cues, srt_cues):
             cue.index = original.index
         # The "\n" join only feeds the aligner; cue content excludes it.
@@ -121,11 +134,14 @@ def run(cfg, args) -> dict[str, Any]:
             granularity=args.granularity,
             fallback_duration=audio_s,
             audio_duration=audio_s,
+            policy=policy,
+            warnings=warnings,
+            stats=boundary_stats,
+            repair_stats=repair_stats,
         )
         expected_text = normalized
 
     matched_ratio = coverage(normalized, items)
-    warnings: list[str] = []
     if matched_ratio < MIN_COVERAGE:
         raise InputError(
             f"forced alignment matched only {matched_ratio:.0%} of the text; "
@@ -137,6 +153,26 @@ def run(cfg, args) -> dict[str, Any]:
             f"alignment coverage is {matched_ratio:.0%}; unmatched characters reuse "
             "neighbouring timings"
         )
+
+    qc_report = check_subtitles(
+        cues,
+        granularity=args.granularity,
+        audio_duration=audio_s,
+        policy=policy,
+        repairs=repair_stats,
+        # `--srt` boundaries are authoritative: report formatting findings as
+        # warnings instead of rejecting user-supplied cues.
+        formatting_strict=not bool(srt_cues),
+    )
+    # The text invariant is more fundamental than QC thresholds: a mismatch
+    # must be exit 4 even when QC would also report a threshold error (fix #4
+    # round 2).
+    ensure_full_text(cues, expected_text)
+    matched = True
+    for violation in qc_report.warnings:
+        warnings.append(f"subtitle QC warning: {violation.message} (cue {violation.cue})")
+    if not qc_report.ok:
+        raise_quality_error(qc_report)
 
     rendered = {
         fmt: render(cues, fmt, language=info.get("language"), granularity=args.granularity)
@@ -154,9 +190,6 @@ def run(cfg, args) -> dict[str, Any]:
             atomic_write_text(path, text)
             files[fmt] = str(path)
 
-    matched = full_text(cues) == expected_text
-    if not matched:
-        warnings.append("subtitle text differs from the normalized source text")
     timing = {"align_ms": info.get("align_ms"), "model_load_ms": round(aligner.load_ms or 0.0, 1)}
 
     recipe_target: Optional[str] = None
@@ -175,6 +208,9 @@ def run(cfg, args) -> dict[str, Any]:
                     "fingerprint": aligner_model.fingerprint, "language": info.get("language")},
         "language": info.get("language"),
         "granularity": args.granularity,
+        "subtitle_policy": policy.to_dict(),
+        "subtitle_boundaries": dict(boundary_stats),
+        "subtitle_qc": qc_report.to_dict(),
         "coverage": round(matched_ratio, 4),
         "cues": [cue.to_dict() for cue in cues],
         "timing": timing,
@@ -200,6 +236,8 @@ def run(cfg, args) -> dict[str, Any]:
         "text_matches_source": matched,
         "source": source,
         "timing": timing,
+        "subtitle_qc": qc_report.to_dict(),
+        "subtitle_boundaries": dict(boundary_stats),
         "warnings": warnings,
     }
 

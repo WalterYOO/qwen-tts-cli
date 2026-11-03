@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
+import json
+import re
 import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
 from .. import __version__
@@ -21,7 +25,7 @@ from ..audio_io import (
 )
 from ..cache import AudioCache
 from ..catalog import language_supported, scan, select_aligner
-from ..errors import CapabilityError, InputError, ModelError, UsageError
+from ..errors import CapabilityError, InputError, ModelError, QttsError, UsageError
 from ..plan import (
     GenerationPlan,
     attach_cache_stats,
@@ -30,8 +34,18 @@ from ..plan import (
     resolve_dtype_name,
 )
 from ..sidecar import build_recipe, recipe_path
-from ..subtitles import build_cues, coverage, full_text, monotonic, normalize_formats, render, shift_cues
-from ..tts_engine import TtsEngine
+from ..subtitle_qc import check_subtitles, raise_quality_error
+from ..subtitles import (
+    build_cues,
+    coverage,
+    ensure_full_text,
+    monotonic,
+    normalize_formats,
+    policy_from_args,
+    render,
+    shift_cues,
+)
+from ..tts_engine import TtsEngine, clear_model_cache
 from ..utils import atomic_write_json, atomic_write_text, emit_json, sha256_text
 from ..voice_store import VoiceStore, utc_now
 
@@ -40,10 +54,14 @@ from ..voice_store import VoiceStore, utc_now
 # Input
 # --------------------------------------------------------------------------- #
 def read_input(args) -> tuple[str, str]:
-    """Return (text, source description). Supports TEXT, '-', --file, --script."""
+    """Return (text, source description). Supports TEXT, '-', --stdin, --file, --script."""
     explicit = [name for name in ("text", "file", "script") if getattr(args, name, None)]
+    if getattr(args, "stdin", False):
+        explicit.append("stdin")
     if len(explicit) > 1:
-        raise UsageError("provide only one of TEXT, --file or --script")
+        raise UsageError("provide only one of TEXT, --stdin, --file or --script")
+    if getattr(args, "stdin", False):
+        return sys.stdin.read(), "stdin"
     if getattr(args, "text", None):
         text = args.text
         if text == "-":
@@ -71,11 +89,20 @@ def read_input(args) -> tuple[str, str]:
 # --------------------------------------------------------------------------- #
 # Run
 # --------------------------------------------------------------------------- #
-def run(cfg, args) -> dict[str, Any]:
+def run(
+    cfg,
+    args,
+    *,
+    engine_cache: Optional[dict[str, TtsEngine]] = None,
+    aligner_cache: Optional[dict[str, AlignerEngine]] = None,
+) -> dict[str, Any]:
+    if not getattr(args, "voice", None):
+        raise UsageError("--voice is required (builtin:NAME | voice:NAME | design:DESCRIPTION)")
     text, source = read_input(args)
     if not text.strip():
         raise InputError("input text is empty")
 
+    policy = policy_from_args(args)
     models = scan(cfg.model_dir)
     if not models:
         raise ModelError(
@@ -84,7 +111,7 @@ def run(cfg, args) -> dict[str, Any]:
         )
     store = VoiceStore(cfg.data_dir)
 
-    out_target: str = args.out if args.out is not None else "-"
+    out_target: str = args.out if args.out is not None else "out.wav"
     subtitle_formats = normalize_formats(args.subtitle)
     sub_prefix = _subtitle_prefix(args, out_target)
     recipe_arg = getattr(args, "recipe_out", None)
@@ -157,10 +184,26 @@ def run(cfg, args) -> dict[str, Any]:
     need_model = cfg.no_cache or any(
         not cache.exists(seg.cache_key, "wav") for seg in plan.segments
     )
-    engine = TtsEngine(cfg, plan.voice.model)
+    engine_key = f"{plan.voice.model.path}|{cfg.device}|{plan.dtype_name}"
+    if engine_cache is not None:
+        # JSONL streams may mix builtin/voice/design models. Keep one live
+        # engine slot: evict and release the previous model before the next
+        # one can load (t10 fix #7). `_MODEL_CACHE` is global, so clear it too.
+        for old_key, old_engine in list(engine_cache.items()):
+            if old_key != engine_key:
+                old_engine.model = None
+                engine_cache.pop(old_key, None)
+                clear_model_cache()
+        engine = engine_cache.get(engine_key)
+        if engine is None:
+            engine = TtsEngine(cfg, plan.voice.model)
+            engine_cache[engine_key] = engine
+    else:
+        engine = TtsEngine(cfg, plan.voice.model)
     prompt_items = None
     if need_model:
-        engine.load()
+        if engine.model is None:
+            engine.load()
         # The runtime dtype may differ from the platform guess; rebuild cache
         # keys so a CPU fp32 run never reads bf16 artefacts (P1-5).
         if engine.dtype_name and engine.dtype_name != plan.dtype_name:
@@ -222,10 +265,26 @@ def run(cfg, args) -> dict[str, Any]:
     subtitle_files: dict[str, str] = {}
     align_info: dict[str, Any] = {}
     coverages: list[float] = []
+    boundary_stats: dict[str, int] = {
+        "sentences": 0,
+        "splits": 0,
+        "hard_cuts": 0,
+        "merges": 0,
+    }
+    repair_stats: dict[str, int] = {}
+    qc_report = None
+    qc_failure = None
 
     if subtitle_formats:
         assert aligner_model is not None
-        aligner = AlignerEngine(cfg, aligner_model)
+        aligner_key = f"{aligner_model.path}|{cfg.device}|{plan.dtype_name}"
+        if aligner_cache is not None:
+            aligner = aligner_cache.get(aligner_key)
+            if aligner is None:
+                aligner = AlignerEngine(cfg, aligner_model)
+                aligner_cache[aligner_key] = aligner
+        else:
+            aligner = AlignerEngine(cfg, aligner_model)
         cues = []
         offset = 0.0
         for seg, audio, meta in zip(plan.segments, segment_audio, segment_meta):
@@ -258,13 +317,33 @@ def run(cfg, args) -> dict[str, Any]:
                 granularity=args.granularity,
                 fallback_duration=seg_duration,
                 audio_duration=seg_duration,
+                policy=policy,
+                parent_ids=(f"seg:{seg.id}",),
+                warnings=warnings,
+                stats=boundary_stats,
+                repair_stats=repair_stats,
             )
             cues.extend(shift_cues(seg_cues, offset))
             offset += seg_duration + seg.pause_after_ms / 1000.0
-        cues = monotonic(cues, audio_duration=total_s)
-        if full_text(cues) != plan.normalized_text:
-            warnings.append("subtitle text differs from the normalized source text; check alignment")
-        subtitle_files = _write_subtitles(cues, subtitle_formats, sub_prefix, plan, out_target)
+        cues = monotonic(cues, audio_duration=total_s, repair_stats=repair_stats)
+        ensure_full_text(cues, plan.normalized_text)
+        qc_report = check_subtitles(
+            cues,
+            granularity=args.granularity,
+            audio_duration=total_s,
+            policy=policy,
+            repairs=repair_stats,
+        )
+        for violation in qc_report.warnings:
+            warnings.append(
+                f"subtitle QC warning: {violation.message} (cue {violation.cue})"
+            )
+        if qc_report.ok:
+            subtitle_files = _write_subtitles(cues, subtitle_formats, sub_prefix, plan, out_target)
+        else:
+            # t10 contract: never write failing subtitles. Audio and recipe are
+            # kept as an audit trail; the command still exits 5.
+            qc_failure = qc_report
 
     if out_target == "-":
         write_audio_stdout(full, sample_rate, fmt)
@@ -296,7 +375,14 @@ def run(cfg, args) -> dict[str, Any]:
         device=engine.device,
         instruct=plan.instruct,
         language=plan.language,
-        subtitle={"formats": subtitle_formats, "granularity": args.granularity, "files": subtitle_files}
+        subtitle={
+            "formats": subtitle_formats,
+            "granularity": args.granularity,
+            "files": subtitle_files,
+            "policy": policy.to_dict(),
+            "boundaries": dict(boundary_stats),
+            "qc": qc_report.to_dict() if qc_report is not None else None,
+        }
         if subtitle_formats
         else None,
         timing={
@@ -305,10 +391,14 @@ def run(cfg, args) -> dict[str, Any]:
             "generate_ms": round(sum(m.get("generate_ms") or 0.0 for m in segment_meta), 1),
         },
     )
+    if subtitle_formats and qc_report is not None:
+        recipe["subtitle_qc"] = qc_report.to_dict()
     if recipe_target == "-":
         emit_json(recipe)
     elif recipe_target is not None:
         atomic_write_json(recipe_target, recipe)
+    if qc_failure is not None:
+        raise_quality_error(qc_failure)
 
     payload: dict[str, Any] = {
         "ok": True,
@@ -333,6 +423,8 @@ def run(cfg, args) -> dict[str, Any]:
         payload["subtitles"] = subtitle_files
         payload["align"] = align_info
         payload["align_coverage"] = round(min(coverages), 4) if coverages else None
+        payload["subtitle_qc"] = qc_report.to_dict() if qc_report is not None else None
+        payload["subtitle_boundaries"] = dict(boundary_stats)
     return payload
 
 
@@ -457,6 +549,264 @@ def _write_subtitles(cues, formats, prefix: Optional[str], plan: GenerationPlan,
         atomic_write_text(path, render(cues, fmt, language=plan.language, granularity=plan.granularity))
         files[fmt] = str(path)
     return files
+
+
+_SAFE_STEM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _safe_output_stem(record_id: str) -> str:
+    """Use the id only when it is a safe ASCII path component; else hash it."""
+    if _SAFE_STEM.match(record_id) and record_id not in (".", ".."):
+        return record_id
+    return f"qtts-{sha256_text(record_id)[:16]}"
+
+
+def _jsonl_emit(payload: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def _jsonl_error(
+    record_id: Any,
+    code: str,
+    message: str,
+    details: Optional[dict[str, Any]] = None,
+) -> None:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if details:
+        error["details"] = details
+    _jsonl_emit({"id": record_id, "status": "error", "error": error})
+
+
+def run_jsonl(cfg, args) -> dict[str, Any]:
+    """`say --stdin --jsonl`: one request per line, one result per line."""
+    if not getattr(args, "stdin", False):
+        raise UsageError("--jsonl requires --stdin")
+    if getattr(args, "json", False):
+        raise UsageError("--jsonl cannot be combined with --json")
+    if getattr(args, "out", None):
+        raise UsageError("--jsonl uses --out-dir; --out is not allowed")
+    if getattr(args, "recipe_out", None):
+        raise UsageError("--jsonl cannot use --recipe-out")
+    if getattr(args, "subtitle_out_prefix", None):
+        raise UsageError("--jsonl cannot use --subtitle-out-prefix")
+    if getattr(args, "dry_run", False):
+        raise UsageError("--jsonl cannot use --dry-run")
+    if getattr(args, "text", None) not in (None, "-"):
+        raise UsageError("--jsonl reads requests from stdin; a positional TEXT is not allowed")
+    if getattr(args, "file", None) or getattr(args, "script", None):
+        raise UsageError("--jsonl reads requests from stdin; --file/--script are not allowed")
+
+    out_dir_arg = getattr(args, "out_dir", None)
+    if out_dir_arg == "-":
+        raise UsageError("--out-dir cannot be '-'")
+    out_dir = Path(out_dir_arg or ".").expanduser()
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise InputError(f"cannot create --out-dir {out_dir}: {exc}") from exc
+
+    engine_cache: dict[str, TtsEngine] = {}
+    aligner_cache: dict[str, AlignerEngine] = {}
+    seen_ids: set[str] = set()
+    used_stems: dict[str, str] = {}
+    used_paths: dict[str, str] = {}
+    total = 0
+    ok_records = 0
+    failed = False
+
+    for line_number, raw_line in enumerate(sys.stdin, 1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        total += 1
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError as exc:
+            failed = True
+            _jsonl_error(None, "invalid_json", f"invalid JSON on line {line_number}: {exc.msg}",
+                         {"line": line_number, "column": exc.colno})
+            continue
+        if not isinstance(request, dict):
+            failed = True
+            _jsonl_error(None, "invalid_request", "each JSONL line must be an object")
+            continue
+
+        record_id = request.get("id")
+        if not isinstance(record_id, str) or not record_id:
+            failed = True
+            _jsonl_error(record_id if record_id is not None else None,
+                         "invalid_request", "id is required and must be a non-empty string")
+            continue
+        if record_id in seen_ids:
+            failed = True
+            _jsonl_error(record_id, "duplicate_id", "id must be unique within the stream")
+            continue
+        seen_ids.add(record_id)
+
+        stem = _safe_output_stem(record_id)
+        stem_key = stem.casefold()
+        if stem_key in used_stems:
+            failed = True
+            _jsonl_error(
+                record_id,
+                "id_filename_conflict",
+                f"output filename {stem!r} collides with id {used_stems[stem_key]!r} "
+                "(case-insensitive)",
+            )
+            continue
+        used_stems[stem_key] = record_id
+
+        text = request.get("text")
+        if not isinstance(text, str) or not text.strip():
+            failed = True
+            _jsonl_error(record_id, "invalid_request", "text is required and must be non-empty")
+            continue
+        voice = request.get("voice") or getattr(args, "voice", None)
+        if not isinstance(voice, str) or not voice:
+            failed = True
+            _jsonl_error(record_id, "invalid_request",
+                         "voice is required (record.voice or --voice)")
+            continue
+        language = request.get("language", getattr(args, "language", "auto"))
+        if not isinstance(language, str) or not language:
+            failed = True
+            _jsonl_error(record_id, "invalid_request", "language must be a non-empty string")
+            continue
+        instruct = request.get("instruct", getattr(args, "instruct", None))
+        if instruct is not None and not isinstance(instruct, str):
+            failed = True
+            _jsonl_error(record_id, "invalid_request", "instruct must be a string or null")
+            continue
+        seed = request.get("seed", cfg.seed)
+        if not isinstance(seed, int) or isinstance(seed, bool):
+            failed = True
+            _jsonl_error(record_id, "invalid_request", "seed must be an integer")
+            continue
+        subtitle = request.get("subtitle", getattr(args, "subtitle", None))
+        if subtitle is not None and not isinstance(subtitle, (str, list, tuple)):
+            failed = True
+            _jsonl_error(record_id, "invalid_request",
+                         "subtitle must be a string or a list of formats")
+            continue
+        out_field = request.get("out")
+        if out_field == "-":
+            failed = True
+            _jsonl_error(record_id, "invalid_request", "per-record out:'-' is not allowed")
+            continue
+        if out_field is not None and not isinstance(out_field, str):
+            failed = True
+            _jsonl_error(record_id, "invalid_request", "out must be a string path")
+            continue
+        requested_format = request.get("format") or getattr(args, "format", None)
+        if requested_format is not None and requested_format not in ("wav", "flac"):
+            failed = True
+            _jsonl_error(record_id, "invalid_request", "format must be wav or flac")
+            continue
+        if out_field:
+            out_path = Path(out_field).expanduser()
+            output_format = requested_format
+        else:
+            output_format = requested_format or "wav"
+            out_path = out_dir / f"{stem}.{output_format}"
+
+        # Canonicalize before generation: two ids (including relative aliases)
+        # must never silently overwrite each other's output (t10 fix #10).
+        try:
+            canonical_out = str(out_path.expanduser().resolve()).casefold()
+        except (OSError, RuntimeError) as exc:
+            failed = True
+            _jsonl_error(record_id, "invalid_request",
+                         f"cannot resolve output path {out_path}: {exc}")
+            continue
+        if canonical_out in used_paths:
+            failed = True
+            _jsonl_error(
+                record_id,
+                "output_path_conflict",
+                f"output path {out_path} is already used by id "
+                f"{used_paths[canonical_out]!r}",
+                {"path": str(out_path), "conflicts_with": used_paths[canonical_out]},
+            )
+            continue
+        used_paths[canonical_out] = record_id
+
+        record_args = SimpleNamespace(
+            text=text,
+            stdin=False,
+            file=None,
+            script=None,
+            voice=voice,
+            language=language,
+            instruct=instruct,
+            out=str(out_path),
+            format=output_format,
+            subtitle=subtitle,
+            subtitle_out_prefix=None,
+            recipe_out=None,
+            granularity=getattr(args, "granularity", "sentence"),
+            max_new_tokens=getattr(args, "max_new_tokens", 2048),
+            pause_ms=getattr(args, "pause_ms", 300),
+            model=getattr(args, "model", None),
+            dry_run=False,
+            yes=True,
+            max_cue_chars=getattr(args, "max_cue_chars", 42),
+            max_line_width=getattr(args, "max_line_width", 42),
+            max_cps=getattr(args, "max_cps", 20.0),
+            min_cue_seconds=getattr(args, "min_cue_seconds", 0.8),
+            max_cue_seconds=getattr(args, "max_cue_seconds", 7.0),
+            max_merge_gap_ms=getattr(args, "max_merge_gap_ms", 300),
+            no_subtitle_qc=getattr(args, "no_subtitle_qc", False),
+        )
+        record_cfg = dataclasses.replace(cfg, seed=int(seed), json=False)
+        try:
+            result = run(record_cfg, record_args, engine_cache=engine_cache,
+                         aligner_cache=aligner_cache)
+        except QttsError as exc:
+            failed = True
+            details = dict(exc.details)
+            details["exit_code"] = exc.code
+            _jsonl_error(record_id, exc.kind, exc.message, details)
+            continue
+        except Exception as exc:  # one bad request must not kill the stream
+            failed = True
+            _jsonl_error(record_id, "internal", str(exc))
+            continue
+
+        for warning in result.get("warnings") or []:
+            print(f"warning: {warning}", file=sys.stderr)
+            sys.stderr.flush()
+        metrics = {
+            "duration_s": result.get("duration_s"),
+            "sample_rate": result.get("sample_rate"),
+            "timing": result.get("timing"),
+            "cache": result.get("cache"),
+            "warnings": result.get("warnings") or [],
+        }
+        if result.get("subtitles"):
+            metrics["subtitles"] = result["subtitles"]
+            metrics["subtitle_qc"] = result.get("subtitle_qc")
+            metrics["subtitle_boundaries"] = result.get("subtitle_boundaries")
+        _jsonl_emit(
+            {
+                "id": record_id,
+                "status": "ok",
+                "output": result.get("output"),
+                "recipe": result.get("recipe"),
+                "metrics": metrics,
+            }
+        )
+        ok_records += 1
+
+    if total == 0:
+        raise UsageError("--jsonl received no requests on stdin")
+    return {
+        "ok": not failed,
+        "raw_stdout": True,
+        "exit_code": 6 if failed else 0,
+        "records": total,
+        "ok_records": ok_records,
+    }
 
 
 def format_result(payload: dict[str, Any]) -> str:

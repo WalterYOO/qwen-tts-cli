@@ -4,7 +4,7 @@
 
 > **原文是真值。** 字幕内容来自输入原文，ForcedAligner 只负责时间轴，ASR 只用于质检而不是改写内容。
 
-当前状态：**P0 / M0 已实现并通过审查**。P1/P2（批量、多角色脚本、ASR 质检、takes、serve 等）尚未实现，见[路线图](#路线图)。
+当前状态：**P0 / M0 已实现并通过审查；P1 Wave 1 已实现待审查**（字幕分段与质量门禁、JSONL stdin、音色归档、项目锁文件）。P1 其余能力与 P2（多角色脚本、ASR 质检、takes、serve 等）尚未实现，见[路线图](#路线图)。
 
 ---
 
@@ -37,8 +37,12 @@
 | **参考音频准入** | 时长、采样率、削波、静音比例、有效语音占比等检查；保存 consent/license 元数据 |
 | **文本流水线** | 数字/日期/金额/URL/emoji 规范化，语义分段，token/时长预算，逐段语言标记 |
 | **字幕与对齐** | `align` 和 `say --subtitle` 输出 SRT / VTT / ASS / JSON；内容逐字来自规范化原文 |
+| **字幕分段与门禁** | 超长句按次级标点切分、过短句同段合并；CPS / 行宽 / 时长 / 重叠 / 标点悬挂检查，可复现配方记录策略与 QC 报告 |
 | **可复现配方** | 每次生成写 `*.recipe.json`：seed、模型、dtype、采样参数、文本/音频/prompt 哈希 |
 | **缓存** | 内容哈希缓存；命中时不加载模型；缓存键包含模型 fingerprint 与实际 dtype |
+| **JSONL stdin** | `say --stdin --jsonl` 一行请求一行结果，失败隔离，模型在流内复用 |
+| **音色归档** | `voice export/import` 单文件 `.qttsvoice`，白名单成员、流式校验、原子替换 |
+| **项目锁文件** | `project init/lock` 固定模型全量 sha256、音色、采样参数、字幕策略与运行时版本 |
 | **计划与诊断** | `--dry-run` 不加载模型即可输出分段与预算；`doctor --bench` 产出本机性能基线 |
 | **机器可读** | 所有命令支持 `--json`；稳定退出码；错误走 stderr |
 
@@ -221,16 +225,19 @@ qtts [--config FILE] [--data-dir DIR] [--model-dir DIR] [--cache-dir DIR]
 ### `qtts say`
 
 ```text
-qtts say [TEXT | - | --file FILE | --script FILE]
+qtts say [TEXT | - | --file FILE | --script FILE | --stdin --jsonl]
   --voice builtin:NAME | voice:NAME | design:DESCRIPTION
   [--language auto|Chinese|English|...]
   [--instruct TEXT]
-  [--out FILE | -]
+  [--out FILE | -] [--out-dir DIR]
   [--format wav|flac]
   [--subtitle srt,vtt,ass,json]
   [--subtitle-out-prefix PREFIX | -]
   [--recipe-out FILE | -]
   [--granularity sentence|char|word]
+  [--max-cue-chars N] [--max-line-width N] [--max-cps N]
+  [--min-cue-seconds N] [--max-cue-seconds N] [--max-merge-gap-ms N]
+  [--no-subtitle-qc]
   [--max-new-tokens N]
   [--pause-ms N]
   [--model MODEL]
@@ -241,7 +248,11 @@ qtts say [TEXT | - | --file FILE | --script FILE]
 
 - `--instruct` 只支持 1.7B CustomVoice / VoiceDesign；Base、0.6B CustomVoice 收到会直接退出 4。
 - `--language auto` 按段判定并逐段校验。
-- `--granularity` 默认 `sentence`：一句一 cue；`char` 逐字（卡拉 OK/精修），`word` 按英文词。P1 再加超长句切分、短句合并与 CPS/行宽门禁。
+- `--granularity` 默认 `sentence`：初始一句一 span；超长句按次级标点切分，过短句仅在 `parent_ids` 完全相同时合并。`char` 逐字（卡拉 OK/精修），`word` 按英文词。未触发切分/合并时 cue 数等于句数。
+- 字幕策略默认：单 cue 最大 42 显示宽度、单行最大 42、CPS 20、最短 0.8s、最长 7s、合并最大静音间隔 300ms。CPS = 非空白可见显示宽度 / 渲染秒数（毫秒先量化；CJK/全角/emoji 宽 2，组合字符宽 0）；恰等于上限不算违规。短 cue 合并与 CPS 平衡都不会跨过超过 `--max-merge-gap-ms` 的静音。
+- 短句（如 `好。`）只告警；若其显示宽度不超过 `max_cps * min_cue_seconds`，即使当前时长导致 CPS 偏高，也只作为 warning。只有“可修复但仍超限”的格式/质量失败才退出 5。退出 5 时不写字幕文件，仍可写音频与配方，并在 `--json` 的 `details.subtitle_qc` 给出完整报告。
+- `--no-subtitle-qc` 只关闭阈值判定；重叠、越界、非正时长、非单调仍会修复，无法修复则退出 4，配方记录 `enabled:false` 与修复计数。
+- `--stdin --jsonl` 每行一个请求：`{"id","text","voice"?,"out"?}`；每行结果 `{"id","status":"ok","output","recipe","metrics"}` 或 `{"id","status":"error","error":{"code","message","details"}}`。单条失败继续，全部成功退出 0、任一失败退出 6、空 stdin 或启动参数错误退出 2。`--jsonl` 不能与 `--json`、`--out`、`--recipe-out`、`--subtitle-out-prefix`、`--dry-run`、位置文本或 `--out-dir -` 组合；`out` 必须是文件路径，不能是 `-`。
 - stdout 一次只能承载一个产物：`--out -`、`--json`、`--subtitle-out-prefix -`、`--recipe-out -` 互斥。
 - `--out -` 时 stdout 是纯音频，摘要写 stderr。
 
@@ -253,7 +264,11 @@ qtts voice list
 qtts voice inspect NAME
 qtts voice preview NAME [--text TEXT] [--out FILE] [--format wav|flac]
 qtts voice rm NAME [--yes]
+qtts voice export NAME -o FILE.qttsvoice [--force]
+qtts voice import FILE.qttsvoice [--name NAME] [--force]
 ```
+
+`.qttsvoice` 是 zip 容器，只允许 `manifest.json`、`voice.json`、`prompt.safetensors`、`ref.wav`、`preview.wav`；导入逐项校验路径、大小、压缩比、sha256 与 safetensors 结构，不使用 `extractall`，替换已有音色失败时回滚。
 
 `add` 的 clone 选项：
 
@@ -278,13 +293,34 @@ qtts align AUDIO
   [--granularity sentence|char|word]
   [--format srt,vtt,ass,json]
   [--out-prefix PREFIX]
+  [--max-cue-chars N] [--max-line-width N] [--max-cps N]
+  [--min-cue-seconds N] [--max-cue-seconds N] [--max-merge-gap-ms N]
+  [--no-subtitle-qc]
   [--recipe-out FILE | -]
 ```
 
 - 单样本对齐上限约 5 分钟；超过会退出 4（长音频分窗属 P1）。
 - 默认 `--granularity sentence`，按句子出 cue；`char` / `word` 可显式选择。
-- `--srt` 输入会保留原 cue 的编号和边界，只重算时间。
-- 字幕文本是该 cue 的规范化原文，覆盖率过低会告警或退出 4。
+- `--srt` 输入不会重新分组：输入 cue 边界优先于 TTS 计划段和原句边界，只重算时间；cue 文本保持逐字原文。
+- 字幕策略与质量门禁和 `say` 相同；`--srt` 输入不做 CPS/行宽等格式强校验，只做结构检查。
+- 无法修复的结构问题（重叠、越界、非正时长、非单调）退出 4；`--no-subtitle-qc` 下可修复的仍然修复并记录。
+
+### `qtts project`
+
+```text
+qtts project init [DIR] [--force]
+  --voice REF [--language LANG] [--format wav|flac] [--max-new-tokens N]
+  [--subtitle srt,vtt,ass,json] [--granularity sentence|char|word]
+  [--max-cue-chars N] [--max-line-width N] [--max-cps N]
+  [--min-cue-seconds N] [--max-cue-seconds N] [--max-merge-gap-ms N]
+  [--no-subtitle-qc]
+
+qtts project lock [--project FILE] [--out FILE]
+```
+
+- `init` 写 `qtts.project.json`（默认当前目录），已存在时需 `--force`。
+- `lock` 解析项目中的相对 `model_dir`（相对项目文件所在目录），为所有引用模型和音色记录**全量文件 sha256 与大小**；同时记录有效采样参数、seed、字幕策略、dtype/device、Python 与 `qwen-tts`/`qwen-asr`/`transformers`/`torch` 版本。`qwen-asr` 缺失时记为 `available:false`；需要字幕对齐但本机没有对齐器会退出 3。
+- 锁文件为排序后的 JSON，不含时间戳；所有校验和哈希在原子写入前完成。
 
 ### `qtts models`
 
@@ -339,6 +375,8 @@ preview.wav         # 试音
 └── recipes/          # --out - 时的配方落点
 ```
 
+项目文件由 `project init` 写到指定目录（默认当前目录）：`qtts.project.json`；`project lock` 默认在同目录写 `qtts.lock.json`。
+
 生成文件：
 
 | 文件 | 说明 |
@@ -377,7 +415,7 @@ preview.wav         # 试音
 | 3 | 模型或后端错误（加载、显存、依赖） |
 | 4 | 输入校验失败（音频不合格、能力不支持、对齐覆盖率过低） |
 | 5 | 质量门禁未通过 |
-| 6 | 批处理部分失败（P1） |
+| 6 | 批处理部分失败（`say --stdin --jsonl`） |
 | 130 | 用户中断 |
 
 ---
@@ -412,11 +450,14 @@ qtts_cli/
 ├── admit.py               # 参考音频准入检查
 ├── tts_engine.py          # qwen-tts 懒加载
 ├── align_engine.py        # qwen-asr ForcedAligner 懒加载
-├── subtitles.py           # 时间轴清洗与 SRT/VTT/ASS/JSON
+├── subtitles.py           # cue 分段/合并、时间轴清洗与 SRT/VTT/ASS/JSON
+├── subtitle_qc.py         # CPS/行宽/时长/结构门禁与 QC 报告
 ├── sidecar.py             # recipe 读写
+├── voice_archive.py       # .qttsvoice 导出/导入与安全校验
+├── project.py             # project init/lock
 ├── doctor.py              # 环境诊断与 bench
 ├── models_ops.py          # models list/pull/prune
-└── commands/              # say / voice / align / models / doctor
+└── commands/              # say / voice / align / project / models / doctor
 
 tests/
 ├── test_capabilities.py
@@ -424,6 +465,10 @@ tests/
 ├── test_subtitles.py
 ├── test_store_cache.py
 ├── test_cli.py
+├── test_p1_subtitles.py   # P1 字幕分段与门禁
+├── test_p1_jsonl.py       # P1 JSONL stdin
+├── test_p1_voice_archive.py
+├── test_p1_project.py
 ├── test_review_p0.py      # 审查回归
 ├── test_review_p1.py      # 审查回归
 └── test_integration_smoke.py
@@ -437,7 +482,8 @@ tests/
 - **模型能力差异**：VoiceDesign 仅 1.7B；Base 不支持 instruct；0.6B CustomVoice 的 instruct 会被静默丢弃，因此 CLI 在参数层直接报错。
 - **对齐器单样本约 5 分钟**：`say` 按段对齐，限制按段计算；超长音频的分窗策略属 P1。
 - **对齐器不能替代 ASR**：CER/WER 与自动 `ref_text` 需要 Qwen3-ASR，属 P1。
-- **逐句字幕 = 当前分段边界**：`sentence` 模式一句一 cue，不做过长切分或过短合并；这两项与 CPS/行宽门禁一起留给 P1。
+- **字幕三级边界**：`--srt` 输入 cue > TTS 计划段 > 原句。只有 `parent_ids` 完全一致时才合并；`--srt` 永不重新分组。切分/合并后仍逐字保留原文，`join(cue.text) == normalized_text`。
+- **硬切是最后手段**：只有找不到自然断点时才硬切，并记录策略/告警；引号内、数字和拉丁单词内不硬切。
 - **MPS 不保证 bit-perfect**：同 seed 可复现趋势，但跨设备/后端结果会漂移。
 - **依赖钉版冲突**：见[环境要求](#环境要求)；M0 采用单环境混装，桥接方案保留为 fallback。
 
@@ -449,15 +495,20 @@ tests/
 
 `say`、`voice add/list/inspect/preview/rm`、`align`、`models list/pull/prune`、`doctor [--bench]`、`--dry-run`、sidecar、缓存、能力矩阵、字幕四格式。
 
-### M1
+### P1 Wave 1（已实现，待审查）
 
-- JSONL 批处理（分桶、`--resume`、`--retry`、失败隔离）
+- 字幕 cue 分段策略（超长句切分 / 短句合并且不跨段）与 CPS / 行宽 / 时长门禁
+- `say --stdin --jsonl`（流内模型复用、逐条失败隔离、退出码 0/2/6）
+- `voice export/import`（`.qttsvoice` 安全归档）
+- `project init/lock`（全量模型 sha256、音色与运行时锁定）
+
+### M1（剩余）
+
+- JSONL 批处理 `batch plan/run`（分桶、`--jobs`、`--resume`、`--retry`）
 - 多角色脚本与 `script compile`
-- ASR `check`（CER/WER）
+- ASR `check`（CER/WER）、自动 `ref_text`
 - 多 take 资产库与自动选优
-- 字幕 cue 分段策略（超长句切分 / 短句合并）与 CPS / 行宽门禁
-- `voice export/import`
-- `project init/lock`
+- 发音词典、音频 QC
 - 长音频对齐分窗
 
 ### M2

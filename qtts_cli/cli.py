@@ -43,6 +43,23 @@ class QttsArgumentParser(argparse.ArgumentParser):
         raise UsageError(message)
 
 
+def _add_subtitle_policy(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--max-cue-chars", type=int, default=42,
+                        help="max cue display width (CJK counts 2; default: 42)")
+    parser.add_argument("--max-line-width", type=int, default=42,
+                        help="max rendered line width (default: 42)")
+    parser.add_argument("--max-cps", type=float, default=20.0,
+                        help="max non-whitespace characters per second (default: 20)")
+    parser.add_argument("--min-cue-seconds", type=float, default=0.8,
+                        help="minimum display duration; short cues warn (default: 0.8)")
+    parser.add_argument("--max-cue-seconds", type=float, default=7.0,
+                        help="maximum display duration (default: 7.0)")
+    parser.add_argument("--max-merge-gap-ms", type=int, default=300,
+                        help="max silence between cues that may merge (default: 300)")
+    parser.add_argument("--no-subtitle-qc", action="store_true",
+                        help="disable subtitle threshold gate (structural repairs still run)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = QttsArgumentParser(
         prog="qtts",
@@ -56,20 +73,26 @@ def build_parser() -> argparse.ArgumentParser:
     from .commands import align as align_cmd
     from .commands import doctor as doctor_cmd
     from .commands import models as models_cmd
+    from .commands import project as project_cmd
     from .commands import say as say_cmd
     from .commands import voice as voice_cmd
 
     say = sub.add_parser("say", help="synthesize speech (builtin/voice/design)")
     _add_common(say, suppress=True)
     say.add_argument("text", nargs="?", default=None, help="text, or '-' to read stdin")
+    say.add_argument("--stdin", action="store_true",
+                     help="read a single plain-text request from stdin")
+    say.add_argument("--jsonl", action="store_true",
+                     help="with --stdin: read JSONL requests and emit JSONL results")
+    say.add_argument("--out-dir", help="JSONL default output directory (default: current dir)")
     say.add_argument("--file", help="read text from a file")
     say.add_argument("--script", help="read a plain-text script from a file")
-    say.add_argument("--voice", required=True,
+    say.add_argument("--voice",
                      help="builtin:Vivian | voice:NAME | design:DESCRIPTION")
     say.add_argument("--language", default="auto",
                      help="auto|Chinese|English|... (auto is decided per segment)")
     say.add_argument("--instruct", help="style instruction (1.7B CustomVoice / VoiceDesign)")
-    say.add_argument("--out", default="out.wav", help="output file, or '-' for stdout")
+    say.add_argument("--out", default=None, help="output file (default: out.wav), or '-' for stdout")
     say.add_argument("--format", choices=["wav", "flac"], help="container (default: from --out)")
     say.add_argument("--subtitle", help="comma list of srt,vtt,ass,json")
     say.add_argument("--subtitle-out-prefix", help="prefix for subtitle files (or '-' for stdout)")
@@ -80,6 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="sentence",
         help="cue granularity (default: sentence)",
     )
+    _add_subtitle_policy(say)
     say.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     say.add_argument("--pause-ms", type=int, default=300, help="silence between segments")
     say.add_argument("--model", help="override the automatically selected model")
@@ -135,6 +159,20 @@ def build_parser() -> argparse.ArgumentParser:
     voice_rm.add_argument("--yes", action="store_true")
     voice_rm.set_defaults(func=voice_cmd.rm, formatter=voice_cmd.format_result)
 
+    voice_export = voice_sub.add_parser("export", help="export a voice as .qttsvoice")
+    _add_common(voice_export, suppress=True)
+    voice_export.add_argument("name")
+    voice_export.add_argument("-o", "--out", required=True, help="archive path (.qttsvoice)")
+    voice_export.add_argument("--force", action="store_true", help="overwrite an existing archive")
+    voice_export.set_defaults(func=voice_cmd.export, formatter=voice_cmd.format_result)
+
+    voice_import = voice_sub.add_parser("import", help="import a .qttsvoice archive")
+    _add_common(voice_import, suppress=True)
+    voice_import.add_argument("archive")
+    voice_import.add_argument("--name", help="install under a different name")
+    voice_import.add_argument("--force", action="store_true", help="replace an existing voice")
+    voice_import.set_defaults(func=voice_cmd.import_, formatter=voice_cmd.format_result)
+
     # -- align -------------------------------------------------------------- #
     align = sub.add_parser("align", help="align known text to audio")
     _add_common(align, suppress=True)
@@ -150,10 +188,36 @@ def build_parser() -> argparse.ArgumentParser:
         default="sentence",
         help="cue granularity (default: sentence)",
     )
+    _add_subtitle_policy(align)
     align.add_argument("--format", default="srt", help="comma list of srt,vtt,ass,json")
     align.add_argument("--out-prefix", help="output prefix (default: audio stem)")
     align.add_argument("--recipe-out", help="write the alignment recipe here ('-' for stdout)")
     align.set_defaults(func=align_cmd.run, formatter=align_cmd.format_result)
+
+    # -- project ------------------------------------------------------------ #
+    project = sub.add_parser("project", help="create and lock reproducible project files")
+    project_sub = project.add_subparsers(dest="project_command", required=True)
+
+    project_init = project_sub.add_parser("init", help="write qtts.project.json")
+    _add_common(project_init, suppress=True)
+    project_init.add_argument("directory", nargs="?", default=".",
+                              help="project directory (default: current directory)")
+    project_init.add_argument("--force", action="store_true")
+    project_init.add_argument("--voice", help="default voice reference")
+    project_init.add_argument("--language", default="auto")
+    project_init.add_argument("--format", choices=["wav", "flac"], default="wav")
+    project_init.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
+    project_init.add_argument("--subtitle", help="default subtitle formats, e.g. srt,json")
+    project_init.add_argument("--granularity", choices=["sentence", "char", "word"],
+                              default="sentence")
+    _add_subtitle_policy(project_init)
+    project_init.set_defaults(func=project_cmd.init, formatter=project_cmd.format_result)
+
+    project_lock = project_sub.add_parser("lock", help="write qtts.lock.json")
+    _add_common(project_lock, suppress=True)
+    project_lock.add_argument("--project", help="project file (default: ./qtts.project.json)")
+    project_lock.add_argument("--out", help="lock file (default: beside the project)")
+    project_lock.set_defaults(func=project_cmd.lock, formatter=project_cmd.format_result)
 
     # -- models ------------------------------------------------------------- #
     models = sub.add_parser("models", help="list, pull or prune local models")
@@ -193,7 +257,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         args = parser.parse_args(raw_argv)
         want_json = want_json or bool(getattr(args, "json", False))
         cfg = build_config(args)
-        payload = args.func(cfg, args)
+        if getattr(args, "jsonl", False):
+            # JSONL owns stdout: per-record lines are emitted by the command.
+            from .commands import say as say_cmd
+
+            payload = say_cmd.run_jsonl(cfg, args)
+        else:
+            payload = args.func(cfg, args)
+        if payload.get("raw_stdout"):
+            return int(payload.get("exit_code", 0))
         if cfg.json:
             emit_json(payload)
         else:

@@ -584,7 +584,7 @@ qtts align
 11. 英文文本走通完整链路：`say --language English` 生成音频，`--subtitle srt` 的字幕文本与原文逐字一致。
 12. `voice list` 能枚举并试听全部 9 个内置音色；任一 `builtin:<speaker>` 可用于 `say`。
 13. 同进程 smoke test：先 TTS 生成 wav，再对同一 wav + 原文调用 ForcedAligner，全部成功；该测试纳入回归。
-14. 默认 `--granularity sentence`：中文、英文多句文本的 cue 数等于句数，`join(cue.text)` 与规范化原文逐字一致；显式 `char` / `word` 行为与 0.1.0 一致；`align --srt` 仍保留原 cue 边界。
+14. 默认 `--granularity sentence`：未触发 split/merge 时 cue 数等于句数；任何模式下 `join(cue.text)` 与规范化原文逐字一致；显式 `char` / `word` 行为与 0.1.0 一致；`align --srt` 仍保留原 cue 边界且不重新分组。
 
 ---
 
@@ -638,3 +638,45 @@ qtts align
 - **take**：同一段文本的一次生成结果。
 - **recipe**：可复现一次生成所需的全部参数与哈希。
 - **plan**：编译后的生成计划（`GenerationPlan`），是所有执行器的唯一输入。
+
+### 13.4 P1 Wave 1 实现注记
+
+本节记录实现选择，不改变上面的需求定义。
+
+**字幕边界（FR-P1-05a）**
+
+- 三级优先级：`--srt` 输入 cue > TTS 计划段 > 原句。每个 span 带 `parent_ids`（如 `("seg:<id>", "sent:<n>")` 或 SRT cue id）；只有 `parent_ids` 完全一致时才合并。`--srt` 永不重新分组。
+- 流程是完整链路：文本初切 → 对齐 → 按约束分组/合并 → QC。切分后由字符时间表回填每个 span 的起止时间，再按 `--min-cue-seconds` / `--max-cue-seconds` / `--max-cue-chars` / `--max-cps` 重新平衡。
+- 保留字符偏移，不重新 `find()` cue 文本；不 strip；`join(cue.text) == normalized_text` 由测试覆盖重复文本、标点和空白。
+- 硬切只在没有自然断点时使用，并写 warning、记录切分策略；引号内、数字和拉丁单词内不硬切。
+
+**字幕策略与 QC（FR-P1-05b）**
+
+- 默认 `SubtitlePolicy(max_cue_chars=42, max_line_width=42, max_cps=20.0, min_cue_seconds=0.8, max_cue_seconds=7.0, max_merge_gap_ms=300, qc_enabled=True)`；`say` / `align` / `project init` 共用同一组参数。切分宽度取 `min(max_cue_chars, max_line_width)`，因为渲染器不自动换行。
+- 短 cue 合并和 CPS 平衡只在间隔不超过 `max_merge_gap_ms` 时进行，避免把相隔很远的片段合并成异常长 cue；任一侧缺少对齐时间时视为未知，不合并。
+- CPS = 非空白可见显示宽度 / `max(0, 渲染毫秒 / 1000)`。显示宽度按 Unicode：`east_asian_width` 的 W/F 计 2，组合字符计 0；时间先量化到毫秒，等于上限不算违规。
+- CPS 始终计算。若 `duration_s < min_cue_seconds` 且 `display_width <= max_cps * min_cue_seconds`，说明该 cue 在最短展示时长下本可满足 CPS，问题在时长，CPS 违规降为 warning（“好。”这类不可合并短句不退出 5）；长文本塞进短时长仍为 error。
+- 结构问题（重叠、越界、非正时长、非单调）始终修复并记录计数；无法修复退出 4。`--no-subtitle-qc` 只关闭阈值判定，不关闭结构修复，配方记录 `enabled:false` 和 `repairs`。
+- 过短/不可合并的 cue（如 `好。`）只告警，不退出 5；只有“可修复但修复后仍超限”的格式/质量失败退出 5。
+- 退出 5 的产物契约：不写字幕文件；`--json` 在 stderr 输出错误，`details.subtitle_qc` 含完整报告；音频与 recipe 可保留，便于定位。
+- `char` / `word` 只做结构检查；`--srt` 输入跳过 CPS/行宽等格式强校验。
+
+**JSONL stdin（FR-P1-08）**
+
+- `say --stdin --jsonl` 一行请求一行结果；`id` 必填且流内唯一（重复时首个保留、后续报错）；坏 JSON 行以 `id:null` 报错并继续。
+- 任意单条错误使最终退出码为 6；零错误为 0；空 stdin 或启动参数错误为 2。
+- 输出文件名不直接使用 raw `id`：安全 ASCII 直接用，否则 `qtts-<sha16>`；同时做 casefold 冲突检查。`--jsonl` 禁止 `--out -`、`--recipe-out -`、`--subtitle-out-prefix -`、`--json`；逐条 `out:"-"` 在处理前拒绝。
+- 模型按 `(path, device, dtype)` 在流内复用；测试断言同一模型只加载一次。
+
+**音色归档（FR-P1-10）**
+
+- `.qttsvoice` 是 zip；成员白名单固定为 `manifest.json`、`voice.json`、`prompt.safetensors`、`ref.wav`、`preview.wav`，实际成员必须与 manifest 列表完全一致。
+- 拒绝绝对路径、盘符、反斜杠、`..`、重复/大小写冲突、加密、目录/特殊成员；限制成员数、单成员大小、总大小和压缩比；从不 `extractall`，流式复制并计算 sha256。
+- `prompt.safetensors` 用 safetensors 安全 API 校验；`--force` 采用备份-重命名-回滚；`--name` 在哈希校验后改写 `voice.json.name` 再重新校验；导出先写临时文件再 `os.replace`。
+
+**项目锁（FR-P1-09）**
+
+- 锁文件必须记录所有引用模型权重/配置的**完整 sha256**，catalog fingerprint 只作为辅助；记录所有音色（含用户音色的 `voice.json`、prompt、参考音频哈希）。只要 `ref.wav` 存在就 hash 实际文件，即使 `voice.json` 未声明；声明了 `ref_audio` 但文件缺失则失败。
+- `qwen-asr` 缺失记录为 `available:false`/null；若项目声明字幕 formats，即使模型目录里有对齐器，也会先检查包可用性并直接报错（退出 3，等价 `--require-align`）。
+- 记录有效采样参数、seed、规范化版本、字幕策略、dtype/device、完整 Python 与包版本。`--project` 中的相对 `model_dir` 相对项目文件所在目录解析。
+- 锁文件为排序 JSON、无易变时间戳；所有校验和哈希在原子写入前完成；生成锁时不加载权重。

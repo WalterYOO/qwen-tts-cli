@@ -17,6 +17,7 @@ from ..sidecar import build_recipe, recipe_path, write_recipe
 from ..textnorm import NORMALIZATION_VERSION
 from ..tts_engine import TtsEngine, clear_model_cache
 from ..utils import confirm, is_tty, sha256_file
+from ..voice_archive import export_voice, import_voice
 from ..voice_store import VoiceStore, utc_now, validate_name
 
 DEFAULT_PREVIEW_TEXT = "你好，这是音色试听。Hello, this is a voice preview."
@@ -284,6 +285,9 @@ def _materialize_design(
         {
             "kind": "clone",
             "source": source,
+            # The design description is no longer an instruct once this is a
+            # clone profile; leaving it would silently reapply the prompt.
+            "default_instruct": None,
             "model": {"id": base_model.model_id, "revision": base_model.revision,
                       "fingerprint": base_model.fingerprint, "path": str(base_model.path)},
             "dtype": base_engine.dtype_name,
@@ -501,6 +505,16 @@ def preview(cfg, args) -> dict[str, Any]:
     }
 
 
+def export(cfg, args) -> dict[str, Any]:
+    store = VoiceStore(cfg.data_dir)
+    return export_voice(store, args.name, args.out, force=bool(args.force))
+
+
+def import_(cfg, args) -> dict[str, Any]:
+    store = VoiceStore(cfg.data_dir)
+    return import_voice(store, args.archive, name=args.name, force=bool(args.force))
+
+
 def rm(cfg, args) -> dict[str, Any]:
     store = VoiceStore(cfg.data_dir)
     if not store.exists(args.name):
@@ -525,6 +539,19 @@ def _split_tags(value: Optional[str]) -> list[str]:
 
 
 def format_result(payload: dict[str, Any]) -> str:
+    if payload.get("archive") and "replaced" in payload:
+        meta = payload.get("voice") or {}
+        action = "replaced" if payload.get("replaced") else "imported"
+        return (
+            f"{action} voice {meta.get('name')} from {payload['archive']} -> "
+            f"{payload['output']} ({', '.join(payload.get('files') or [])})"
+        )
+    if payload.get("archive"):
+        meta = payload.get("voice") or {}
+        return (
+            f"exported voice {meta.get('name')} -> {payload['archive']} "
+            f"({len(payload.get('files') or [])} files, sha256 {payload.get('archive_sha256')})"
+        )
     if "builtin" in payload and "voices" in payload:
         lines = ["built-in voices:"]
         for entry in payload["builtin"]:
