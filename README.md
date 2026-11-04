@@ -718,18 +718,19 @@ tests/
 - `voice export/import`（`.qttsvoice` 安全归档）
 - `project init/lock`（全量模型 sha256、音色与运行时锁定）
 
-### P1 Wave 2（已实现，待审查）
+### P1 Wave 2（已提交）
 
 - 多角色脚本 `script lint/compile` 与 `say --script`（逐段音色/模型/语言/instruct/seed）
 - 发音词典 `--lexicon` 与 `[[pause:MS]]` 导演标记（spoken/display 映射）
 - JSONL 批处理 `batch plan/run`（确定性计划、原子状态、`--jobs/--resume/--retry/--fail-fast`）
 
-### M1（剩余）
+### P1 Wave 3（已提交）
 
-- ASR `check`（CER/WER）、自动 `ref_text`
-- 多 take 资产库与自动选优
-- 音频 QC
-- 长音频对齐分窗
+- 音频 QC 与 ASR `check`（CER/WER、自动 `ref_text`、speaker similarity）
+- 长音频对齐分窗、静音切窗与近似文本映射
+- 多 take 资产库 `--takes/--select` 与 `takes list/compare/promote`
+
+FR-P1-01 至 FR-P1-11 均已实现并在本地提交；P1 期间版本号保持 0.1.x。
 
 ### M2
 
