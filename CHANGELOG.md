@@ -9,6 +9,7 @@
 
 ### Added
 
+- **多 take 资产库（FR-P1-04）**：`say --takes N --select cer,speaker-sim,lufs` 一次生成 2–16 个可复现 take，按准则优先级排序并自动选择；take 1 保留原 seed，后续 take 在 plan 与每个 segment 上依次加 `t−1`，溢出在生成前退出 2。新增 `takes list/compare/promote`（不加载模型），资产写入 `<data-dir>/takes/<job_id>/`，`job_id` 由规范化请求哈希得到；相同请求复用已完成 job，`scoring_failed` 只重试评分；job 锁、staging 发布、损坏隔离、sha256 校验与符号链接/路径穿越防护齐备。`--takes` 与 JSONL/batch 互斥；promote 只复制原始字节、不转码。
 - **长音频对齐（FR-P1-11）**：`align` 对 >300s 音频按合格静音切窗（core 240–285s、目标 270s、至少 2s 重叠、单窗 ≤300s），默认逐窗用 Qwen3-ASR 无时间戳转写做单调文本锚定，再逐窗调用 forced aligner，最后按全局字符归属合并并只构建一次 cue；新增 `--window-seconds`、`--window-overlap`、`--approximate`、`--asr-model`。SRT 输入以 cue 边界为硬锚点且不跑 ASR，`--srt --approximate` 在加载模型前退出 2；`--approximate` 按实际 audio 区间（含重叠）分配文本，静音计划无解时退化为固定间隔并 warning，时间倒退做确定性单调裁剪；末窗允许有界尾部溢出并裁剪。长路径报告/recipe 增加真实覆盖率门禁与 `windowing`，短音频保持原字节且 `windowing.enabled=false`。字幕与 recipe 先 staging 后原子提交且在失败时回滚，ASR 完全释放后才加载 aligner。
 - **多角色脚本**：`script lint FILE`、`script compile FILE -o PLAN.json`、`say --script FILE`，接受 YAML/JSON；逐段 `voice/language/instruct/seed/max_new_tokens/pause_after_ms`，缺省 id 自动生成，重复 id/未知字段/能力冲突在加载模型前失败；编译计划稳定可复现。
 - **词典与导演标记**：`say/align --lexicon` 让 TTS 读 `spoken`、字幕保留原文 `term`，显式 spoken→display 字符映射；`[[pause:MS]]` 支持句首/句间/句尾/连续出现，负数和 `speed/rate/pitch` 等不支持标记退出 2。
@@ -28,6 +29,7 @@
 
 ### Fixed
 
+- Wave 3c 返修：speaker-sim 的参考音色身份（名称/kind/prompt 与 ref 哈希/embedding 来源/评分版本）进入 canonical request、job_id 与每 take recipe，切换 `--reference-voice` 不再复用旧 job；`takes promote` 在 `scoring_failed` 上先校验音频/recipe 与更新后的 job，再写 job 和目标文件，失败不留半写产物；damaged job 重建失败会恢复备份；`--select cer` 在 TTS 前预检 `qwen_asr`；`takes list/compare` 校验音频哈希与 recipe；复用 job 与下游输出前校验 selected recipe；`validate_job` 补齐 segment 结构/seed/时间边界校验；`--out`/`--recipe-out`/字幕前缀禁止覆盖 job 资产。
 - 报告类命令的 canonical JSON 不再把进程 `exit_code` 写入文档，`--json` 与 `--report` 保持逐字节一致。
 - Wave 3a 返修：`check` 在任何音频/模型检查前校验并 canonicalize ASR 语言（非法语言恒退出 2）；小写语言名与规范名产生相同的数字/日期/货币归一化；`asr.language` 不再用参考语言回填，新增 `comparison_language`。
 - `voice add` 补齐 `--asr-model`，与 `check` 共用 `select_asr` 消歧；`say --qc --reference-voice` 在生成前校验 profile，失败不产生音频/recipe。

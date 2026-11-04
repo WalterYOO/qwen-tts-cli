@@ -105,6 +105,11 @@ def _runtime():
     return torch, Qwen3ASRModel
 
 
+def preflight_asr_runtime() -> None:
+    """Import the ASR runtime without loading model weights (exit 3 path)."""
+    _runtime()
+
+
 def _get(obj: Any, *names: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         for name in names:

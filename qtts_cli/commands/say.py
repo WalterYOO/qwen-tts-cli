@@ -44,6 +44,7 @@ from ..budget import DEFAULT_MAX_NEW_TOKENS
 from ..script import compile_script
 from ..sidecar import build_recipe, recipe_path
 from ..subtitle_qc import check_subtitles, raise_quality_error
+from ..takes import takes_request
 from ..subtitles import (
     build_cues,
     coverage,
@@ -109,6 +110,9 @@ def run(
     engine_cache: Optional[dict[str, TtsEngine]] = None,
     aligner_cache: Optional[dict[str, AlignerEngine]] = None,
 ) -> dict[str, Any]:
+    takes_spec = takes_request(args)
+    if takes_spec and getattr(args, "jsonl", False):
+        raise UsageError("--takes/--select cannot be combined with --jsonl")
     script_path = getattr(args, "script", None)
     structured = bool(
         script_path and Path(script_path).suffix.lower() in (".yaml", ".yml", ".json")
@@ -169,11 +173,14 @@ def run(
 
     qc_enabled = bool(getattr(args, "qc", False))
     qc_reference_voice = getattr(args, "reference_voice", None)
+    takes_speaker_sim = bool(takes_spec and "speaker-sim" in takes_spec[1])
     qc_thresholds = qc_thresholds_from_args(args) if qc_enabled else {}
     if qc_enabled:
         validate_qc_thresholds(qc_thresholds, has_text=True)
-    elif qc_reference_voice:
-        raise UsageError("--reference-voice requires --qc")
+    elif qc_reference_voice and not takes_speaker_sim:
+        raise UsageError(
+            "--reference-voice requires --qc or --select speaker-sim"
+        )
 
     # stdout has exactly one consumer (codex P0-2). Validate before any load.
     consumers: list[str] = []
@@ -198,7 +205,11 @@ def run(
         # Profile and Base/runtime prechecks run after pure parameter/output
         # validation but before any generation or audio write (t10 P1-4/P2).
         validate_qc_reference_voice(VoiceStore(cfg.data_dir), qc_reference_voice)
-        if not getattr(args, "dry_run", False):
+        if (
+            not getattr(args, "dry_run", False)
+            and qc_enabled
+            and not takes_speaker_sim
+        ):
             qc_precheck_speaker_similarity(
                 cfg, models, getattr(args, "model", None)
             )
@@ -260,7 +271,7 @@ def run(
     stdout_used = bool(consumers)
 
     if args.dry_run:
-        return {
+        payload = {
             "ok": True,
             "dry_run": True,
             "models_loaded": False,
@@ -280,6 +291,52 @@ def run(
                 "reference_voice": qc_reference_voice,
             },
         }
+        if takes_spec:
+            from ..takes_run import dry_run_details
+
+            takes_count, criteria = takes_spec
+            payload["takes"] = dry_run_details(
+                cfg,
+                args,
+                plan=plan,
+                models=models,
+                voice_store=store,
+                takes_count=takes_count,
+                criteria=criteria,
+                fmt=fmt,
+                out_target=out_target,
+                recipe_target=recipe_target,
+                subtitle_formats=subtitle_formats,
+                sub_prefix=sub_prefix,
+            )
+        return payload
+
+    if takes_spec:
+        from ..takes_run import run as run_takes
+
+        takes_count, criteria = takes_spec
+        return run_takes(
+            cfg,
+            args,
+            plan=plan,
+            models=models,
+            voice_store=store,
+            aligner_model=aligner_model,
+            cache=cache,
+            out_target=out_target,
+            fmt=fmt,
+            subtitle_formats=subtitle_formats,
+            sub_prefix=sub_prefix,
+            recipe_arg=recipe_arg,
+            recipe_target=recipe_target,
+            qc_enabled=qc_enabled,
+            qc_reference_voice=qc_reference_voice,
+            qc_thresholds=qc_thresholds,
+            source=source,
+            takes_count=takes_count,
+            criteria=criteria,
+            stdout_used=stdout_used,
+        )
 
     started = time.perf_counter()
     need_model = cfg.no_cache or any(
@@ -838,6 +895,8 @@ def _jsonl_error(
 
 def run_jsonl(cfg, args) -> dict[str, Any]:
     """`say --stdin --jsonl`: one request per line, one result per line."""
+    if takes_request(args) is not None:
+        raise UsageError("--takes/--select cannot be combined with --jsonl")
     if not getattr(args, "stdin", False):
         raise UsageError("--jsonl requires --stdin")
     if getattr(args, "json", False):
@@ -1100,6 +1159,13 @@ def format_result(payload: dict[str, Any]) -> str:
         f"timing: total {payload['timing']['total_ms']}ms (load {payload['timing']['model_load_ms']}ms, "
         f"generate {payload['timing']['generate_ms']}ms)",
     ]
+    takes = payload.get("takes")
+    if takes:
+        lines.append(
+            f"takes: job={takes['job_id']} selected={takes['selected']} "
+            f"criteria={','.join(takes.get('criteria') or [])} "
+            f"{'reused' if takes.get('reused') else 'generated'}"
+        )
     if payload.get("recipe"):
         lines.append(f"recipe: {payload['recipe']}")
     for fmt, path in (payload.get("subtitles") or {}).items():

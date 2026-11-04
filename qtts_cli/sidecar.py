@@ -56,6 +56,7 @@ def build_recipe(
         "model": {
             "id": model.get("id"),
             "revision": model.get("revision"),
+            "fingerprint": model.get("fingerprint"),
             "dtype": model.get("dtype"),
             "path": model.get("path"),
         },

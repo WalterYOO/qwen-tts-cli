@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
@@ -10,7 +11,7 @@ from .budget import DEFAULT_MAX_NEW_TOKENS, codec_rate, estimate_duration_s, est
 from .cache import AudioCache, cache_key
 from .capabilities import VoiceRef, parse_voice_ref, validate_capabilities
 from .catalog import ModelInfo, find_model, require_speaker, select
-from .errors import InputError
+from .errors import InputError, UsageError
 from .lexicon import (
     Lexicon,
     MapBlock,
@@ -25,6 +26,7 @@ from .utils import sha256_text
 from .voice_store import VoiceStore
 
 DEFAULT_PAUSE_MS = 300
+MAX_SEED = 2**31 - 1
 
 SAMPLING_DEFAULTS: dict[str, Any] = {
     "do_sample": True,
@@ -623,6 +625,61 @@ def rekey_plan(plan: GenerationPlan, *, dtype: str, device: Optional[str] = None
             lexicon_sha256=plan.lexicon_sha256,
         )
     return plan
+
+
+def validate_seed(seed: Any, *, label: str = "seed") -> int:
+    """Validate one effective seed without wrapping or truncating it (FR-P1-04)."""
+    try:
+        value = int(seed)
+    except (TypeError, ValueError) as exc:
+        raise UsageError(f"{label} must be an integer") from exc
+    if isinstance(seed, bool) or value != seed:
+        raise UsageError(f"{label} must be an integer")
+    if value < 0 or value > MAX_SEED:
+        raise UsageError(
+            f"{label} {value} is outside the supported range [0, {MAX_SEED}]",
+            details={"seed": value, "max": MAX_SEED},
+        )
+    return value
+
+
+def reseed_plan(plan: GenerationPlan, take_index: int) -> GenerationPlan:
+    """Return an independent copy of ``plan`` for one take.
+
+    Take 1 is an equivalent copy that preserves every parsed seed (including
+    per-segment script seeds). Take ``t`` adds ``t - 1`` to the plan seed and
+    to every segment's effective seed, then rekeys all segment cache keys.
+    The base plan is never mutated and cache keys never contain the job id or
+    take index (FR-P1-04).
+    """
+    if isinstance(take_index, bool) or not isinstance(take_index, int) or take_index < 1:
+        raise UsageError("take_index must be a positive integer")
+    delta = take_index - 1
+    clone = copy.deepcopy(plan)
+    clone.seed = validate_seed(int(plan.seed) + delta, label="take seed")
+    for index, seg in enumerate(clone.segments):
+        base = int(plan.segments[index].seed if plan.segments[index].seed is not None else plan.seed)
+        effective = validate_seed(base + delta, label=f"segment {seg.id} seed")
+        seg.seed = effective
+        voice = seg.voice or clone.voice
+        seg.cache_key = cache_key(
+            text_normalized=seg.text,
+            voice_identity=voice.identity,
+            model_id=voice.model.model_id,
+            model_revision=voice.model.revision,
+            model_fingerprint=voice.model.fingerprint or None,
+            dtype=clone.dtype_name,
+            language=seg.language,
+            instruct=seg.instruct,
+            sampling=(
+                {**clone.sampling, "max_new_tokens": seg.max_new_tokens}
+                if seg.max_new_tokens is not None
+                else clone.sampling
+            ),
+            seed=effective,
+            lexicon_sha256=clone.lexicon_sha256,
+        )
+    return clone
 
 
 def attach_cache_stats(plan: GenerationPlan, cache: AudioCache, fmt: str = "wav") -> GenerationPlan:

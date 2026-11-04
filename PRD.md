@@ -784,3 +784,36 @@ qtts align
 - `align --json` 与 recipe 增加 `windowing`：`enabled`、`approximate`、`window_seconds`、`overlap_seconds`、`min/max_window_seconds`、ASR model/revision/fingerprint、warnings，以及每窗的样本号、时间、core/display/spoken 区间、转录 sha256、item 数。短音频保持 `{"enabled": false}` 且不选择 ASR；长音频 length、窗口计划和 cue 在固定 fake 输入下确定，recipe 的 `created_at`/timing 仍是诊断字段。
 - `--approximate` 不构造 ASR，按每窗实际 `audio_start_s/audio_end_s` 分配字符（允许相邻区间重叠），边界落在词典 term 内部时 start 吸附 term start、end 吸附 term end；静音计划无解时使用固定间隔并在 payload/recipe/stderr 报告固定间隔 warning。`--srt --approximate` 在模型加载前退出 2。缺 ASR 模型时默认长路径退出 3；`select_asr()` 与 `select_aligner()` 都在任何 ASR 权重加载前完成，aligner 缺失时 ASR 调用次数为 0。
 - 长路径覆盖率来自逐窗 aligner 的原始逐字符 item（不是合并后补齐全部字符的结果），写入 `windowing.matched_ratio` 与 recipe `coverage`，并复用短路径的 `MIN_COVERAGE=0.3` 退出 4、`WARN_COVERAGE=0.8` warning 门禁。
+
+### 13.8 P1 Wave 3c 实现注记
+
+本节记录多 take 资产库的实现选择，不改变 §13 的需求定义。
+
+**请求身份与 seed**
+
+- `job_id` 由规范化请求的 `sha256_json` 前 16 位加 `tk_` 前缀得到。canonical request 覆盖 schema/特征/归一化版本、文本与 display/词典哈希、voice identity、语言、instruct、采样参数、codec 采样率、max tokens、停顿、format、运行时身份、逐段文本哈希/voice/seed、模型身份、seed 向量、选择准则/`lufs_target`、speaker-sim 参考身份与打分模型；不覆盖输出路径、recipe 路径、QC 阈值、字幕开关、耗时与脚本路径。
+- `runtime_identity()` 不导入 torch：显式 device 原样使用；`auto` 在 Darwin/arm64 预测 `mps`，否则有 `nvidia-smi` 预测 `cuda:0`，再否则 `cpu`；dtype 按显式配置或预测设备给出。dry-run 与实际运行调用同一函数，因此 job_id 一致；加载后若真实 dtype 不同，仍按既有 `rekey_plan` 处理缓存，recipe 记录实际 runtime。
+- speaker-sim 的参考身份包含 `name`、`kind`、`prompt_sha256`、`ref_audio_sha256`、`embedding_source`（prompt/ref_wav）与 `scoring_version="speaker-sim.v1"`；显式 `--reference-voice` 与单一 clone 自动选择都会写入 canonical request 与每个 take recipe。仅 QC 使用 `--reference-voice` 时不影响 job 身份。
+- take 1 沿用用户给出的 plan seed 与逐段 seed；take `t` 在 plan 与每个 segment 上同时加 `t−1`。派生 seed 必须仍在 `[0, 2**31−1]`，否则在生成前退出 2。`reseed_plan()` 深拷贝计划并重算每段 `cache_key`；缓存键只依赖有效 seed，不依赖 job/take id。
+- 同一 job 已完整发布时直接复用，不加载模型；`scoring_failed` 状态只重试评分，不重新生成音频。`job.json` 与请求哈希不一致视为 canonical mismatch 退出 4。
+
+**存储、锁与发布**
+
+- 资产根为 `<data-dir>/takes/`；每个 job 使用 `<job_id>/job.json`、`take-NN.wav|flac`、`take-NN.recipe.json`。生成先写 `.staging-<job_id>-<random>/`，完成后 fsync 并 rename 发布；文档不宣称目录替换是原子事务。
+- 每个 job 用 `.locks/<job_id>.lock` 上的 `flock` 串行化生成、评分与 promote。已存在但损坏/缺文件的 job 在锁内隔离为 `.damaged-<random>` 后重建；发布失败恢复旧目录，重建期间生成失败且目标不存在时同样恢复隔离目录。读取拒绝符号链接；take 音频按 `audio_sha256` 校验，recipe 校验 `job_id`、`take_id`、`audio.file` 与去前缀后的哈希。
+- 路径碰撞键为 resolve 后的路径，Darwin 上额外做 casefold，Unicode 统一 NFC，避免大小写不敏感文件系统绕过覆盖保护。
+
+**评分与模型驻留**
+
+- 准则顺序即优先级：`cer` 升序、`speaker-sim` 降序、`lufs` 取 `abs(lufs − lufs_target)` 升序；全部使用未舍入值，最后按 take id 打破平局，排序完成后才写入舍入展示值。`rank_takes()` 显式接收 `lufs_target`，不在函数体内引用模块常量。
+- 预检在任何 TTS 之前完成：`cer` 选择并校验 ASR 语言，并通过 `preflight_asr_runtime()` 在 dry-run 之外确认 `qwen_asr`/torch 可导入（缺失退出 3）；`speaker-sim` 要求恰好一个 voice identity（或显式 `--reference-voice` 的 clone profile），design/builtin 且无参考退出 2，Base 能力缺失退出 3；`lufs` 无外部依赖。`--reference-voice` 在 takes 模式下必须与 `--qc` 或 `speaker-sim` 同用。
+- 驻留顺序固定为：全部 TTS → 释放 → ASR → 释放 → Base 说话人/QC → 释放 → 选中 take 的 aligner。CER 对每个 segment 使用 `seg.text` 转写，微平均 `sum(distance)/sum(reference_units)`；单段超过 300 秒退出 4。speaker-sim 按记录的 segment 时长切片，参考 embedding 只提取一次、Base 引擎只加载一次，统计加权均值与最小值，绝不对整条长 take 计算。
+- 每个 take 始终记录 LUFS 与 true peak；未选准则的指标为 `null` 并写 `unavailable` 稳定原因。字幕与 QC 只针对选中 take；下游 QC 失败退出 5 时不删除已完成的 job。
+
+**CLI 与限制**
+
+- `--takes N --select ...` 必须成对出现，`N` 为 2–16，select 非空、去重、是 `cer,speaker-sim,lufs` 的子集。与 `--stdin --jsonl`、`--jsonl`、batch 清单互斥并在模型加载/生成前退出 2；单文件 `--script` 允许。
+- `--dry-run` 输出 N 个 take 的 seed 向量、选择依赖/预检、预计输出路径，不创建 takes 目录，也不导入 torch/qwen_tts/qwen_asr。
+- `takes list`、`takes compare [--ids]` 在输出前校验全部 take 的音频哈希与 recipe，损坏退出 4 且不输出成功 payload。`takes promote --id N --out FILE|- [--format]` 不加载模型，只复制原始字节、不转码；目标后缀必须与 job 格式一致；不得覆盖 job.json、任一 take 音频或 recipe（已选中且目标即源文件是唯一的幂等 no-op）。promote 是 `scoring_failed` job 的人工转正路径：先校验音频/recipe 并验证更新后的 job，再把状态改为 `complete`、写入 selected，最后才落盘；job 写入失败不产生目标文件，替换失败会尽力回滚 job。
+- `_downstream()` 在任何 QC/字幕/输出副作用之前构建 job 资产保护集合；`--out`、`--recipe-out`、字幕前缀命中 `job.json`、任一 take 音频或 recipe 时退出 2。选中 take 的 recipe 在复用与写出前统一校验，损坏时退出 4 且 stdout 不产生音频字节。
+- `JOB_ID` 限制为 `[A-Za-z0-9._-]{1,64}` 并只在 `<data-dir>/takes/` 下解析；绝对路径、穿越、符号链接退出 2，job/take 缺失、损坏、哈希或音频结构异常退出 4，评分/模型失败退出 3。

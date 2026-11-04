@@ -95,6 +95,13 @@ def read_manifest(path: str | Path) -> tuple[list[dict[str, Any]], str]:
             ) from exc
         if not isinstance(request, dict):
             raise _line_error(line_number, "invalid_request", "each line must be an object")
+        if "takes" in request or "select" in request:
+            raise UsageError(
+                f"manifest line {line_number}: multi-take selection is not "
+                "supported in batch manifests; run `qtts say --takes N "
+                "--select ...` instead",
+                details={"line": line_number, "code": "unsupported_takes"},
+            )
         unknown = set(request) - _MANIFEST_KEYS
         if unknown:
             raise _line_error(

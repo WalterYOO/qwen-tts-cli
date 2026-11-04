@@ -287,6 +287,35 @@ qtts say "你好。" --voice "builtin:Vivian" --qc \
 
 `qc` 的阈值全部可选，未显式给出的指标只测量不判定。`lufs_integrated` 用 BS.1770-4（K-weighting、400ms 块、绝对 -70 LUFS 与相对 -10 LU 门限），`true_peak_dbtp` 至少 4x 过采样；数字静音、音频过短或 scipy 不可用时返回 `null`，并在 `unavailable` 中以稳定枚举说明原因，绝不编造数值。`--reference-voice` 额外计算说话人余弦相似度，需要 Base 模型。`--json` 与 `--report` 生成逐字节相同的排序 JSON，不含绝对路径、时间戳或耗时。
 
+### 11. 多 take 资产库
+
+```bash
+# 连续生成 2 个 take，按响度接近 -16 LUFS 选择，选中结果写到 hello.wav
+qtts say "你好。" --voice "builtin:Vivian" --takes 2 --select lufs \
+  --out hello.wav --json
+
+# 不加载模型地查看、比较与提升 take
+qtts takes list tk_0123456789abcdef --json
+qtts takes compare tk_0123456789abcdef --ids 1,2
+qtts takes promote tk_0123456789abcdef --id 2 --out chosen.wav
+```
+
+`--takes N --select cer,speaker-sim,lufs` 成对出现，`N` 为 2–16；`--select` 是逗号分隔、去重、非空的 `cer,speaker-sim,lufs` 子集，顺序即优先级。每个 take 在基准 seed 上依次加 `t−1`（同时作用于 plan 与所有 segment），因此同一请求可复现。take 1 保留用户给出的全部 seed。
+
+生成结束后按准则排序：`cer` 升序、`speaker-sim` 降序（按段时长加权均值，另记最小值）、`lufs` 取 `abs(lufs − (-16.0))` 升序；并列按 take id。无论是否被选中，LUFS 与 true peak 都会记录；未选准则的指标为 `null` 并附 `unavailable` 原因。`cer` 需要本地 ASR：缺失 `qwen_asr` 会在任何 TTS 生成之前退出 3。`speaker-sim` 要求单个克隆音色（或用 `--reference-voice` 指定参考，且必须同时带 `--qc` 或 `speaker-sim`）。显式或隐含的参考音色身份（名称、kind、prompt/ref 音频哈希、embedding 来源、评分版本）进入 canonical request 和 job_id；切换参考音色不会复用旧 job。
+
+资产库位于 `<data-dir>/takes/`：
+
+```text
+takes/.locks/<job_id>.lock
+takes/<job_id>/job.json
+takes/<job_id>/take-01.wav
+takes/<job_id>/take-01.recipe.json
+...
+```
+
+`job_id` 由规范化请求哈希得到（`tk_` + 16 位十六进制）。请求完全一致时直接复用已完成的 job；仅评分失败时只重试评分，不重新生成音频。`job.json` 损坏或缺文件时旧目录被隔离为 `.damaged-*` 后重建；重建期间生成失败会把隔离目录恢复回原位。`takes list/compare` 在输出前校验每个 take 的音频 sha256 与 recipe 身份/哈希，任何损坏退出 4 且不输出成功 payload。`takes list/compare/promote` 都不加载模型；`promote` 只复制所选 take 的原始字节，不转码，因此目标后缀必须与 job 格式一致。`promote` 也是 `scoring_failed` job 的人工转正路径：先校验音频与 recipe，再把状态改为 `complete` 并写入 selected，最后才落盘；任一步失败不会留下半写的目标文件。`--out`、`--recipe-out` 与字幕前缀不得覆盖 `job.json`、任一 take 音频或 recipe。`--takes` 与 `--stdin --jsonl`、`--jsonl` 和 batch 清单互斥（退出 2）。
+
 ---
 
 ## 命令参考
@@ -322,6 +351,7 @@ qtts say [TEXT | - | --file FILE | --script FILE | --stdin --jsonl]
   [--max-new-tokens N]
   [--pause-ms N]
   [--model MODEL]
+  [--takes N --select cer,speaker-sim,lufs] [--asr-model PATH|ID]
   [--qc] [--reference-voice NAME]
   [--max-clipping-ratio N] [--target-lufs N --lufs-tolerance N]
   [--max-true-peak-dbtp N] [--max-dc-offset N] [--max-silence-ratio N]
@@ -341,6 +371,7 @@ qtts say [TEXT | - | --file FILE | --script FILE | --stdin --jsonl]
 - `--no-subtitle-qc` 只关闭阈值判定；重叠、越界、非正时长、非单调仍会修复，无法修复则退出 4，配方记录 `enabled:false` 与修复计数。
 - `--qc` 对最终音频（含首尾停顿）运行同一套 `audio_qc.analyze()`，指标写入 `--json` 的 `qc` 字段与 recipe；不指定阈值时只测量，越界时音频与报告仍完整写出并退出 5。`--reference-voice` 必须与 `--qc` 同时使用，且会额外加载 Base 模型计算说话人相似度；不带它时 `--qc` 不加载任何额外模型。
 - `--qc --reference-voice` 在纯参数/输出组合校验之后、任何生成或写音频之前，依次做 profile 文件级校验、Base 模型解析与类级 embedding 能力探测（不加载权重）；profile 不存在、Base 缺失或运行时无该能力时不会产生音频或 recipe。`--dry-run` 只做 profile 文件级校验，不导入 torch/qwen_tts。
+- `--takes N --select ...` 生成 2–16 个 take 并写入 `<data-dir>/takes/` 资产库（见[多 take 资产库](#11-多-take-资产库)）。两者必须同时出现；不能与 `--stdin --jsonl`、`--jsonl` 或 batch 清单同用，可与单文件 `--script` 和 `--dry-run` 同用。`--asr-model` 只用于 `--select cer` 选择 ASR 模型；`--reference-voice` 在 takes 模式下需要 `--qc` 或 `speaker-sim`，否则退出 2。
 - `--stdin --jsonl` 每行一个请求：`{"id","text","voice"?,"out"?}`；每行结果 `{"id","status":"ok","output","recipe","metrics"}` 或 `{"id","status":"error","error":{"code","message","details"}}`。单条失败继续，全部成功退出 0、任一失败退出 6、空 stdin 或启动参数错误退出 2。`--jsonl` 不能与 `--json`、`--out`、`--recipe-out`、`--subtitle-out-prefix`、`--dry-run`、位置文本或 `--out-dir -` 组合；`out` 必须是文件路径，不能是 `-`。
 - stdout 一次只能承载一个产物：`--out -`、`--json`、`--subtitle-out-prefix -`、`--recipe-out -` 互斥。
 - `--out -` 时 stdout 是纯音频，摘要写 stderr。未指定 `--recipe-out` 时，recipe 写到 data-dir 的 `recipes/<request hash>.recipe.json`；hash 覆盖 voice identity、seed、sampling、language、instruct 与逐段 cache key，避免相同文本的不同请求互相覆盖。
@@ -371,6 +402,20 @@ qtts batch run MANIFEST.jsonl --out-dir DIR
 - `run` 复用单条 `say` 执行器与错误结构；默认 `--jobs 1`。任务按模型/音色/语言/估算时长分桶排序，调度可并发，但模型推理由全局锁串行（MPS 同样只保留一个模型槽）。状态为 `pending/running/done/failed/skipped`，由单线程调度器原子重写；`job_key` 包含 `lexicon_sha256`。
 - `--resume` 要求 `status=done`、`job_key` 相同、输出存在且 sha256 匹配、recipe 存在且其 `job_key` 匹配；`running` 恢复为 `pending`，`skipped` 下次重新调度。`--retry N` 只重试执行期 transient 失败（ModelError/OSError/RuntimeError），普通异常立即失败；status 记录 `attempts`、`last_error` 与 `transient`，`--resume --retry` 只重新调度 `transient=true` 的失败；`--fail-fast` 只停止调度新任务，未启动项标 `skipped`。
 - 进度与 `--watch` 只写 stderr；stdout 只有最终 summary（`--json` 为单个对象）。任一任务失败退出 6。
+
+### `qtts takes`
+
+```text
+qtts takes list JOB_ID [--json]
+qtts takes compare JOB_ID [--ids 1,2,3] [--json]
+qtts takes promote JOB_ID --id N (--out FILE | --out -) [--format wav|flac] [--json]
+```
+
+- `JOB_ID` 必须匹配 `[A-Za-z0-9._-]{1,64}`，只解析 `<data-dir>/takes/` 下的目录；绝对路径、`..` 穿越或符号链接退出 2，job 不存在退出 4。三个子命令都不加载任何模型。
+- `list` 输出 job 状态、选择准则、每个 take 的 seed/rank/指标与 selected 标记；`--json` 直接输出原始 `job.json`。
+- `compare` 默认比较全部 take，`--ids` 可限定并保持 job 内顺序；输出含指标、`unavailable` 原因与 `rank`。未知/重复 id 分别退出 4/2。
+- `promote` 把指定 take 的原始字节复制到 `--out`，或写到 stdout（`--out -`，此时不能与 `--json` 同用）。promote 不转码：目标后缀必须与 job 格式一致，未知后缀或格式不符退出 2；不允许覆盖 `job.json`、任一 take 音频或 recipe（提升到自身是幂等 no-op）。成功后更新 `selected`/`selected_at` 并校验源文件 sha256。
+- 资产库布局与 job 复用语义见[多 take 资产库](#11-多-take-资产库)；job/take 缺失、损坏、哈希不匹配或音频结构异常退出 4，评分/模型失败退出 3。
 
 ### `qtts check`
 
@@ -574,7 +619,7 @@ preview.wav         # 试音
 | 0 | 成功 |
 | 2 | 参数/用法错误 |
 | 3 | 模型或后端错误（加载、显存、依赖） |
-| 4 | 输入校验失败（音频不合格、能力不支持、对齐覆盖率过低） |
+| 4 | 输入校验失败（音频不合格、能力不支持、对齐覆盖率过低、takes job/take 缺失或损坏） |
 | 5 | 质量门禁未通过（`check` 错误率超阈值、`qc`/`say --qc` 显式阈值越界、字幕 QC） |
 | 6 | 批处理部分失败（`say --stdin --jsonl`、`batch run`） |
 | 130 | 用户中断 |
@@ -589,7 +634,8 @@ PYTHONPATH=. pytest tests -q
 
 # 集成测试：需要本地模型与 MPS/CUDA（含 Qwen3-ASR-0.6B）
 QTTS_SMOKE_MODEL_DIR=/path/to/models RUN_INTEGRATION=1 PYTHONPATH=. \
-  pytest tests/test_integration_smoke.py tests/test_integration_wave3a.py -q
+  pytest tests/test_integration_smoke.py tests/test_integration_wave3a.py \
+    tests/test_integration_wave3c.py -q
 
 # lint
 ruff check qtts_cli tests

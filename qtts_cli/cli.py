@@ -100,6 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     from .commands import qc as qc_cmd
     from .commands import say as say_cmd
     from .commands import script as script_cmd
+    from .commands import takes as takes_cmd
     from .commands import voice as voice_cmd
 
     say = sub.add_parser("say", help="synthesize speech (builtin/voice/design)")
@@ -141,6 +142,12 @@ def build_parser() -> argparse.ArgumentParser:
                      help="measure the final assembled audio (no extra model without --reference-voice)")
     say.add_argument("--reference-voice",
                      help="clone profile used for speaker similarity (loads Base)")
+    say.add_argument("--takes", type=int, default=argparse.SUPPRESS,
+                     help="generate N takes (2-16); requires --select")
+    say.add_argument("--select", default=argparse.SUPPRESS,
+                     help="selection criteria priority, e.g. cer,speaker-sim,lufs")
+    say.add_argument("--asr-model", default=argparse.SUPPRESS,
+                     help="ASR model for --select cer (local path or repo id)")
     _add_qc_thresholds(say)
     say.add_argument("--dry-run", action="store_true", help="print the plan without loading models")
     say.add_argument("--yes", action="store_true", help="non-interactive confirmation")
@@ -382,6 +389,30 @@ def build_parser() -> argparse.ArgumentParser:
     _add_qc_thresholds(qc)
     qc.add_argument("--report", help="write a deterministic JSON report")
     qc.set_defaults(func=qc_cmd.run, formatter=qc_cmd.format_result)
+
+    # -- takes -------------------------------------------------------------- #
+    takes = sub.add_parser("takes", help="inspect and promote multi-take assets")
+    takes_sub = takes.add_subparsers(dest="takes_command", required=True)
+
+    takes_list = takes_sub.add_parser("list", help="summarize a takes job")
+    _add_common(takes_list, suppress=True)
+    takes_list.add_argument("job_id")
+    takes_list.set_defaults(func=takes_cmd.list_jobs, formatter=takes_cmd.format_result)
+
+    takes_compare = takes_sub.add_parser("compare", help="compare take metrics")
+    _add_common(takes_compare, suppress=True)
+    takes_compare.add_argument("job_id")
+    takes_compare.add_argument("--ids", help="comma-separated take ids (default: all)")
+    takes_compare.set_defaults(func=takes_cmd.compare, formatter=takes_cmd.format_result)
+
+    takes_promote = takes_sub.add_parser("promote", help="promote a take selection")
+    _add_common(takes_promote, suppress=True)
+    takes_promote.add_argument("job_id")
+    takes_promote.add_argument("--id", type=int, required=True, help="take id")
+    takes_promote.add_argument("--out", required=True, help="destination file or '-'")
+    takes_promote.add_argument("--format", choices=["wav", "flac"],
+                               help="must match the job format (no transcoding)")
+    takes_promote.set_defaults(func=takes_cmd.promote, formatter=takes_cmd.format_result)
 
     return parser
 
