@@ -5,7 +5,7 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.2.0] - 2026-11-04
 
 ### Added
 
@@ -43,10 +43,6 @@
 - `align --srt --lexicon` 的 coverage 按 aligner 实际读取的 spoken 文本计算；顺序投影只跳过标点/空白，不再跳过内容字符。
 - batch `job_key` 纳入 `lexicon_sha256`；显式 `format` 不再绕过输出后缀校验；仅 transient 失败重试，永久失败不会因 `--resume --retry` 复活；status 使用 `last_error`/`transient`，manifest 重复 key 退出 2。
 - ICL clone 的 `ref_text` 进入 voice identity/cache key；`--out -` 的 fallback recipe 使用完整请求 hash 命名。
-
-### Planned
-
-- 多 take 资产库与自动选优
 
 ## [0.1.1] - 2026-11-03
 
