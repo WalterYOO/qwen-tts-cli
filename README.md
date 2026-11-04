@@ -4,7 +4,7 @@
 
 > **原文是真值。** 字幕内容来自输入原文，ForcedAligner 只负责时间轴，ASR 只用于质检而不是改写内容。
 
-当前状态：**P0 / M0 已实现并通过审查；P1 Wave 1 已提交，Wave 2 已实现待审查**（多角色脚本、词典/导演标记、批量清单；Wave 1 包含字幕分段与质量门禁、JSONL stdin、音色归档、项目锁文件）。ASR 质检、takes、serve 等 P2 能力尚未实现，见[路线图](#路线图)。
+当前状态：**P1 已全部实现并发布 0.2.0；P2 Wave 1a 的音频后处理 `post` 已提交**。其余 P2 能力（serve、bench、audiobook/dub、插件与后端抽象、微调）尚未实现，见[路线图](#路线图)。
 
 ---
 
@@ -46,6 +46,7 @@
 | **批量清单** | `batch plan/run` 全量预校验 JSONL、确定性计划、单线程原子状态、并发调度、`--resume/--retry/--fail-fast` |
 | **ASR 质检** | `check AUDIO` 用 Qwen3-ASR 转写，按语言自动选 CER/WER，输出编辑距离、错误片段与可选阈值门禁 |
 | **音频 QC** | `qc AUDIO` 测量响度（BS.1770 LUFS）、true peak、削波、DC、静音与语速；阈值全部可选，`say --qc` 复用同一实现 |
+| **音频后处理** | `post` 完成静音修剪、声道转换、重采样、响度归一化、`lookahead-min-4x` true-peak 限幅与 wav/flac/mp3/m4a 编码，最终 true peak 以发布文件解码测量为准 |
 | **自动参考文本** | `voice add --kind clone --auto-ref-text` 用 ASR 转写参考音频，作为 ICL 的 `ref_text` 并记录来源与模型 |
 | **音色归档** | `voice export/import` 单文件 `.qttsvoice`，白名单成员、流式校验、原子替换 |
 | **项目锁文件** | `project init/lock` 固定模型全量 sha256、音色、采样参数、字幕策略与运行时版本 |
@@ -287,7 +288,23 @@ qtts say "你好。" --voice "builtin:Vivian" --qc \
 
 `qc` 的阈值全部可选，未显式给出的指标只测量不判定。`lufs_integrated` 用 BS.1770-4（K-weighting、400ms 块、绝对 -70 LUFS 与相对 -10 LU 门限），`true_peak_dbtp` 至少 4x 过采样；数字静音、音频过短或 scipy 不可用时返回 `null`，并在 `unavailable` 中以稳定枚举说明原因，绝不编造数值。`--reference-voice` 额外计算说话人余弦相似度，需要 Base 模型。`--json` 与 `--report` 生成逐字节相同的排序 JSON，不含绝对路径、时间戳或耗时。
 
-### 11. 多 take 资产库
+### 11. 音频后处理
+
+```bash
+# 归一化到 -16 LUFS，并按 -1 dBTP 限幅；输出 FLAC
+qtts post raw.wav --out final.flac --lufs -16 --true-peak -1
+
+# 批量重采样、转单声道并裁掉首尾静音
+qtts post a.wav b.flac --out-dir build --format wav \
+  --sample-rate 48000 --channels mono --trim-silence
+
+# 只计算与测量，不写文件
+qtts post raw.wav --out-dir build --format mp3 --bitrate 192k --dry-run --json
+```
+
+`post` 的输入只接受 `.wav`/`.flac`。处理顺序固定为：读取 → 静音修剪 → 声道转换 → 重采样 → 响度增益 → true-peak 限幅 → 最终测量 → 编码。`--lufs` 未配 `--true-peak` 时默认使用 -1.0 dBTP；限幅采用 `lookahead-min-4x`（4x 过采样 gain 包络、5ms attack、50ms release，不做 sample clipping），必要时再施加静态安全衰减。`true_peak_ceiling_scope` 固定为 `encoded`：WAV/FLAC 写临时文件后读回测量，mp3/m4a 编码后解码回 24-bit WAV 测量；超出上限时最多重编码 2 次，仍不达标则该文件失败且不会替换最终输出。`wav/flac` 默认 PCM_24（可 `--bit-depth 16`），`mp3/m4a` 使用 ffmpeg 的 `libmp3lame`/`aac`，默认 192k。输出后缀与 `--format` 必须一致；`--out-dir` 要求显式 `--format`。`--dry-run` 完成全部预检与内存 DSP，但不创建目录、不编码、不写报告；`--json` 与 `--report` 逐字节一致。路径碰撞（输入/输出/报告、symlink、大小写与 NFC）在写任何文件前退出 2。
+
+### 12. 多 take 资产库
 
 ```bash
 # 连续生成 2 个 take，按响度接近 -16 LUFS 选择，选中结果写到 hello.wav
@@ -371,7 +388,7 @@ qtts say [TEXT | - | --file FILE | --script FILE | --stdin --jsonl]
 - `--no-subtitle-qc` 只关闭阈值判定；重叠、越界、非正时长、非单调仍会修复，无法修复则退出 4，配方记录 `enabled:false` 与修复计数。
 - `--qc` 对最终音频（含首尾停顿）运行同一套 `audio_qc.analyze()`，指标写入 `--json` 的 `qc` 字段与 recipe；不指定阈值时只测量，越界时音频与报告仍完整写出并退出 5。`--reference-voice` 必须与 `--qc` 同时使用，且会额外加载 Base 模型计算说话人相似度；不带它时 `--qc` 不加载任何额外模型。
 - `--qc --reference-voice` 在纯参数/输出组合校验之后、任何生成或写音频之前，依次做 profile 文件级校验、Base 模型解析与类级 embedding 能力探测（不加载权重）；profile 不存在、Base 缺失或运行时无该能力时不会产生音频或 recipe。`--dry-run` 只做 profile 文件级校验，不导入 torch/qwen_tts。
-- `--takes N --select ...` 生成 2–16 个 take 并写入 `<data-dir>/takes/` 资产库（见[多 take 资产库](#11-多-take-资产库)）。两者必须同时出现；不能与 `--stdin --jsonl`、`--jsonl` 或 batch 清单同用，可与单文件 `--script` 和 `--dry-run` 同用。`--asr-model` 只用于 `--select cer` 选择 ASR 模型；`--reference-voice` 在 takes 模式下需要 `--qc` 或 `speaker-sim`，否则退出 2。
+- `--takes N --select ...` 生成 2–16 个 take 并写入 `<data-dir>/takes/` 资产库（见[多 take 资产库](#12-多-take-资产库)）。两者必须同时出现；不能与 `--stdin --jsonl`、`--jsonl` 或 batch 清单同用，可与单文件 `--script` 和 `--dry-run` 同用。`--asr-model` 只用于 `--select cer` 选择 ASR 模型；`--reference-voice` 在 takes 模式下需要 `--qc` 或 `speaker-sim`，否则退出 2。
 - `--stdin --jsonl` 每行一个请求：`{"id","text","voice"?,"out"?}`；每行结果 `{"id","status":"ok","output","recipe","metrics"}` 或 `{"id","status":"error","error":{"code","message","details"}}`。单条失败继续，全部成功退出 0、任一失败退出 6、空 stdin 或启动参数错误退出 2。`--jsonl` 不能与 `--json`、`--out`、`--recipe-out`、`--subtitle-out-prefix`、`--dry-run`、位置文本或 `--out-dir -` 组合；`out` 必须是文件路径，不能是 `-`。
 - stdout 一次只能承载一个产物：`--out -`、`--json`、`--subtitle-out-prefix -`、`--recipe-out -` 互斥。
 - `--out -` 时 stdout 是纯音频，摘要写 stderr。未指定 `--recipe-out` 时，recipe 写到 data-dir 的 `recipes/<request hash>.recipe.json`；hash 覆盖 voice identity、seed、sampling、language、instruct 与逐段 cache key，避免相同文本的不同请求互相覆盖。
@@ -415,7 +432,7 @@ qtts takes promote JOB_ID --id N (--out FILE | --out -) [--format wav|flac] [--j
 - `list` 输出 job 状态、选择准则、每个 take 的 seed/rank/指标与 selected 标记；`--json` 直接输出原始 `job.json`。
 - `compare` 默认比较全部 take，`--ids` 可限定并保持 job 内顺序；输出含指标、`unavailable` 原因与 `rank`。未知/重复 id 分别退出 4/2。
 - `promote` 把指定 take 的原始字节复制到 `--out`，或写到 stdout（`--out -`，此时不能与 `--json` 同用）。promote 不转码：目标后缀必须与 job 格式一致，未知后缀或格式不符退出 2；不允许覆盖 `job.json`、任一 take 音频或 recipe（提升到自身是幂等 no-op）。成功后更新 `selected`/`selected_at` 并校验源文件 sha256。
-- 资产库布局与 job 复用语义见[多 take 资产库](#11-多-take-资产库)；job/take 缺失、损坏、哈希不匹配或音频结构异常退出 4，评分/模型失败退出 3。
+- 资产库布局与 job 复用语义见[多 take 资产库](#12-多-take-资产库)；job/take 缺失、损坏、哈希不匹配或音频结构异常退出 4，评分/模型失败退出 3。
 
 ### `qtts check`
 
@@ -450,6 +467,26 @@ qtts qc AUDIO [--text TEXT|--text-file FILE] [--language auto]
 - 音频按原始声道读取；mono/stereo 支持，超过 2 声道退出 4。数字静音或能力缺失的指标为 `null`，原因写在 `unavailable`。
 - 语速阈值需要非空 `--text`/`--text-file`（全空白等同于未提供，退出 2）；`--target-lufs` 与 `--lufs-tolerance` 必须成对出现。
 - `--reference-voice` 必须是 clone profile，需要 Base 模型提供 `extract_speaker_embedding()`；该能力在加载权重前做类级探测。`--model` 路径不存在、非 clone 或无可用 Base 统一退出 3。
+
+### `qtts post`
+
+```text
+qtts post INPUT [INPUT ...] (--out FILE | --out-dir DIR)
+  [--lufs N] [--true-peak DBTP]
+  [--sample-rate HZ] [--channels keep|mono|stereo]
+  [--format wav|flac|mp3|m4a] [--bitrate 192k] [--bit-depth 16|24]
+  [--trim-silence] [--trim-threshold-dbfs -50] [--trim-min-silence-s 0.2]
+  [--trim-padding-ms 50] [--trim-mode leading|trailing|both]
+  [--dry-run] [--report FILE] [--json]
+```
+
+- 输入只支持 `.wav`/`.flac`（后缀大小写不敏感）；mp3/m4a 输入、无后缀、未知后缀或目录退出 2。`--out` 只接受一个输入；`--out` 与 `--out-dir` 互斥且必须给一个。
+- 输出格式解析：`--out` 有已知后缀时 `--format` 若给出必须一致，否则用后缀；`--out` 无后缀时必须给 `--format` 并追加后缀；`--out` 未知后缀即使给了 `--format` 也退出 2；`--out-dir` 必须给 `--format`，文件名为 `<input stem>.<format>`。
+- `--out -`、`--out-dir -`、`--report -` 和 `--dry-run --report` 均退出 2。输入/输出/report 在写文件前做规范化碰撞检查（`resolve(strict=False)`、NFC、大小写折叠，含 symlink），任一碰撞退出 2；多输入还校验规范化 basename 唯一。
+- 全局错误（参数范围、路径/格式、ffmpeg/encoder 缺失）退出 2/3 且 0 写入；逐文件错误（解码、指标不可用、trim 后为空、DSP/编码/IO）写入 `files[].error`。全部成功退出 0；部分失败退出 6；全部失败退出输入顺序第一个错误码；单输入失败返回该错误码。
+- `--lufs` 范围 [-70, 0]，`--true-peak` ≤ 0，`--sample-rate` 范围 [8000, 192000]；`--bit-depth` 只用于 wav/flac，`--bitrate` 只用于 mp3/m4a，trim 细项必须与 `--trim-silence` 同用，违反退出 2。静音且未请求响度/true-peak 时可透传；显式请求的指标不可用、或 trim 后为空时该文件退出 4。
+- 报告 `schema_version` 为 1，顶层含 `request`（含 `true_peak_ceiling_scope: "encoded"`）与 `files[]`；每项含 `input_format/output_format/codec/encoder/dsp_version`、`before/after_dsp/after_encoded`、`applied`（`gain_db/limiter_reduction_db/safety_attenuation_db/limiter_algorithm/encode_retries/encoder_margin_db`）与稳定 `warnings`。`--json` 与 `--report` 逐字节一致；进程 `exit_code` 不写入 canonical 文档。
+- `--dry-run` 仍做路径/碰撞/ffmpeg 预检和内存 DSP，但不创建目录、不编码、不写报告；`output` 为计划路径，`output_sha256` 与 `after_encoded` 为 `null`。`--report` 写失败退出 4，但已成功写出的音频保留，stdout/JSON 仍包含同一 `files[]` 并在顶层给出 `error`。
 
 ### `qtts voice`
 
@@ -734,9 +771,10 @@ FR-P1-01 至 FR-P1-11 均已实现并在本地提交；P1 期间版本号保持 
 
 ### M2
 
+- 音频后处理 `post`（FR-P2-05，已提交：响度归一化、true-peak 限幅、重采样、声道转换、静音修剪与编码）
 - `serve` 与 OpenAI 兼容 `/v1/audio/speech`
 - 可插拔后端（DashScope / vLLM-Omni batch）
-- 有声书 / dub / 后处理 / bench
+- 有声书 / dub / bench
 - 微调工作流包装
 - 插件 SDK
 

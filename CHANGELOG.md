@@ -5,6 +5,12 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Added
+
+- **音频后处理（FR-P2-05）**：`qtts post INPUT ... (--out FILE | --out-dir DIR)` 按固定顺序完成静音修剪、声道转换、重采样、BS.1770-4 响度归一化、`lookahead-min-4x` true-peak 限幅与 wav/flac/mp3/m4a 编码。`--lufs` 未配 `--true-peak` 时默认 -1.0 dBTP；最终 true peak 以发布文件 PCM 解码测量为准（mp3/m4a 编码后解码回 24-bit WAV），必要时最多重编码 2 次，仍超限则该文件失败且不替换输出。输入仅接受 wav/flac；输出后缀与 `--format` 必须一致，输入/输出/report 在写入前做 symlink、大小写与 NFC 规范化碰撞检查。多输入逐文件报告，部分失败退出 6；`--dry-run` 不创建目录、不编码、不写报告；`--json` 与 `--report` 逐字节一致。
+
 ## [0.2.0] - 2026-11-04
 
 ### Added

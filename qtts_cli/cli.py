@@ -96,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     from .commands import check as check_cmd
     from .commands import doctor as doctor_cmd
     from .commands import models as models_cmd
+    from .commands import post as post_cmd
     from .commands import project as project_cmd
     from .commands import qc as qc_cmd
     from .commands import say as say_cmd
@@ -389,6 +390,51 @@ def build_parser() -> argparse.ArgumentParser:
     _add_qc_thresholds(qc)
     qc.add_argument("--report", help="write a deterministic JSON report")
     qc.set_defaults(func=qc_cmd.run, formatter=qc_cmd.format_result)
+
+    # -- post --------------------------------------------------------------- #
+    post = sub.add_parser(
+        "post", help="normalize loudness, limit true peak, resample and encode audio"
+    )
+    _add_common(post, suppress=True)
+    post.add_argument("inputs", nargs="+", help="input .wav/.flac files")
+    destination = post.add_mutually_exclusive_group()
+    destination.add_argument("--out", help="single output file")
+    destination.add_argument("--out-dir", help="output directory (requires --format)")
+    post.add_argument("--lufs", type=float, help="target integrated loudness (LUFS)")
+    post.add_argument(
+        "--true-peak", type=float, help="true-peak ceiling in dBTP (default with --lufs: -1.0)"
+    )
+    post.add_argument("--sample-rate", type=int, help="target sample rate in Hz")
+    post.add_argument(
+        "--channels", choices=["keep", "mono", "stereo"], default="keep"
+    )
+    post.add_argument("--format", choices=["wav", "flac", "mp3", "m4a"])
+    post.add_argument("--bitrate", default=argparse.SUPPRESS, help="mp3/m4a bitrate (default: 192k)")
+    post.add_argument(
+        "--bit-depth",
+        type=int,
+        choices=[16, 24],
+        default=argparse.SUPPRESS,
+        help="wav/flac bit depth (default: 24)",
+    )
+    post.add_argument("--trim-silence", action="store_true")
+    post.add_argument(
+        "--trim-threshold-dbfs", type=float, default=argparse.SUPPRESS
+    )
+    post.add_argument(
+        "--trim-min-silence-s", type=float, default=argparse.SUPPRESS
+    )
+    post.add_argument(
+        "--trim-padding-ms", type=int, default=argparse.SUPPRESS
+    )
+    post.add_argument(
+        "--trim-mode",
+        choices=["leading", "trailing", "both"],
+        default=argparse.SUPPRESS,
+    )
+    post.add_argument("--dry-run", action="store_true")
+    post.add_argument("--report", help="write a deterministic JSON report")
+    post.set_defaults(func=post_cmd.run, formatter=post_cmd.format_result)
 
     # -- takes -------------------------------------------------------------- #
     takes = sub.add_parser("takes", help="inspect and promote multi-take assets")
