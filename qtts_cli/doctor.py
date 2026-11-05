@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib.util
 import platform
-import resource
 import shutil
 import sys
 import time
@@ -13,7 +12,7 @@ from typing import Any, Optional
 
 from . import __version__
 from .catalog import ModelInfo, scan
-from .utils import human_bytes
+from .utils import human_bytes, peak_rss_bytes
 
 PINNED_TRANSFORMERS = {"qwen_tts": "4.57.3", "qwen_asr": "4.57.6"}
 BENCH_SENTENCES = (
@@ -183,9 +182,7 @@ def gather(cfg) -> dict[str, Any]:
 
 
 def _peak_rss_bytes() -> int:
-    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    # macOS reports bytes; Linux reports KiB.
-    return int(usage if platform.system() == "Darwin" else usage * 1024)
+    return peak_rss_bytes()
 
 
 def run_bench(cfg, models: Optional[list[ModelInfo]] = None) -> dict[str, Any]:

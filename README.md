@@ -4,7 +4,7 @@
 
 > **原文是真值。** 字幕内容来自输入原文，ForcedAligner 只负责时间轴，ASR 只用于质检而不是改写内容。
 
-当前状态：**P1 已全部实现并发布 0.2.0；P2 Wave 1a 的音频后处理 `post` 已提交**。其余 P2 能力（serve、bench、audiobook/dub、插件与后端抽象、微调）尚未实现，见[路线图](#路线图)。
+当前状态：**P1 已全部实现并发布 0.2.0；P2 Wave 1a 的音频后处理 `post` 与 Wave 1b 的 `bench` 已提交**。其余 P2 能力（serve、audiobook/dub、插件与后端抽象、微调）尚未实现，见[路线图](#路线图)。
 
 ---
 
@@ -304,7 +304,26 @@ qtts post raw.wav --out-dir build --format mp3 --bitrate 192k --dry-run --json
 
 `post` 的输入只接受 `.wav`/`.flac`。处理顺序固定为：读取 → 静音修剪 → 声道转换 → 重采样 → 响度增益 → true-peak 限幅 → 最终测量 → 编码。`--lufs` 未配 `--true-peak` 时默认使用 -1.0 dBTP；限幅采用 `lookahead-min-4x`（4x 过采样 gain 包络、5ms attack、50ms release，不做 sample clipping），必要时再施加静态安全衰减。`true_peak_ceiling_scope` 固定为 `encoded`：WAV/FLAC 写临时文件后读回测量，mp3/m4a 编码后解码回 24-bit WAV 测量；超出上限时最多重编码 2 次，仍不达标则该文件失败且不会替换最终输出。`wav/flac` 默认 PCM_24（可 `--bit-depth 16`），`mp3/m4a` 使用 ffmpeg 的 `libmp3lame`/`aac`，默认 192k。输出后缀与 `--format` 必须一致；`--out-dir` 要求显式 `--format`。`--dry-run` 完成全部预检与内存 DSP，但不创建目录、不编码、不写报告；`--json` 与 `--report` 逐字节一致。路径碰撞（输入/输出/报告、symlink、大小写与 NFC）在写任何文件前退出 2。
 
-### 12. 多 take 资产库
+### 12. 性能基准
+
+```bash
+# 冒烟基准：内置中英各一句，重复 3 次
+qtts bench --suite smoke --runs 3 --json
+
+# 批量短句 + CER 门禁（需要本地 ASR）
+qtts bench --suite batch --count 16 --cer --max-cer 0.05
+
+# 长文本分段基准，并计算与参考音色的相似度
+qtts bench --suite longform --text-file script.txt \
+  --speaker-sim --reference-voice alice --min-speaker-similarity 0.75
+
+# 只解析模型/音色与计划，不加载模型、不写文件
+qtts bench --suite smoke --dry-run
+```
+
+`bench` 的计时使用外部 `time.perf_counter()` 未舍入值聚合：`runs[].wall_s` 不含加载，`metrics.wall_s` 含加载但不含评分/报告，`rtf` 取每 run 中位数，`wall_rtf = 全场 wall_s / 全场 audio_s`。默认 `--suite smoke` 跑内置中英各一句；`batch` 从 16 条短句按语言过滤后循环取 `--count`；`longform` 用 `--text` > `--text-file` > 内置长文，经 `plan.build_plan()` 分段后逐段生成。`--dry-run` 只做目录/元数据/文件存在性与计划，不 import torch/qwen、不加载权重、不创建文件。真实运行时严格按 TTS → 释放 → ASR（可选）→ 释放 → Base（可选）单驻留顺序，`finally` 释放所有已加载模型。CER 按字符编辑距离、逐 case 语言转写；speaker-sim 优先使用 clone profile 的 `ref_spk_embedding`，否则用同一 Base 从 `ref.wav` 提取，并在报告中记录 `reference_embedding_source`。`--json` 与 `--report` 逐字节一致；门禁失败输出完整 payload、`ok=false`、`gate_failures[]` 并退出 5；报告写失败退出 4。
+
+### 13. 多 take 资产库
 
 ```bash
 # 连续生成 2 个 take，按响度接近 -16 LUFS 选择，选中结果写到 hello.wav
@@ -487,6 +506,27 @@ qtts post INPUT [INPUT ...] (--out FILE | --out-dir DIR)
 - `--lufs` 范围 [-70, 0]，`--true-peak` ≤ 0，`--sample-rate` 范围 [8000, 192000]；`--bit-depth` 只用于 wav/flac，`--bitrate` 只用于 mp3/m4a，trim 细项必须与 `--trim-silence` 同用，违反退出 2。静音且未请求响度/true-peak 时可透传；显式请求的指标不可用、或 trim 后为空时该文件退出 4。
 - 报告 `schema_version` 为 1，顶层含 `request`（含 `true_peak_ceiling_scope: "encoded"`）与 `files[]`；每项含 `input_format/output_format/codec/encoder/dsp_version`、`before/after_dsp/after_encoded`、`applied`（`gain_db/limiter_reduction_db/safety_attenuation_db/limiter_algorithm/encode_retries/encoder_margin_db`）与稳定 `warnings`。`--json` 与 `--report` 逐字节一致；进程 `exit_code` 不写入 canonical 文档。
 - `--dry-run` 仍做路径/碰撞/ffmpeg 预检和内存 DSP，但不创建目录、不编码、不写报告；`output` 为计划路径，`output_sha256` 与 `after_encoded` 为 `null`。`--report` 写失败退出 4，但已成功写出的音频保留，stdout/JSON 仍包含同一 `files[]` 并在顶层给出 `error`。
+
+### `qtts bench`
+
+```text
+qtts bench --suite smoke|batch|longform
+  [--model ID] [--voice builtin:NAME|voice:NAME]
+  [--language auto|Chinese|English]
+  [--text TEXT | --text-file FILE]
+  [--count N] [--runs N]
+  [--cer] [--asr-model ID]
+  [--speaker-sim --reference-voice NAME]
+  [--max-cer R] [--min-speaker-similarity S]
+  [--dry-run] [--report FILE] [--json]
+```
+
+- `--suite` 必填。`--text`/`--text-file` 只用于 `longform`；`--count` 只用于 `batch`（默认 8，范围 1–64）；`--runs` 范围 1–10。`--voice` 只接受 `builtin:`/`voice:`，`design:` 退出 2；缺省为选中 builtin 模型的第一个 speaker。
+- `--cer` 选本地 ASR（`--asr-model` 只能与它同用）；`--speaker-sim` 必须配 `--reference-voice`；`--max-cer`/`--min-speaker-similarity` 必须分别配 `--cer`/`--speaker-sim`。参数组合错误退出 2。
+- 模型选择：显式 `--model` 未找到/不支持退出 3，同名歧义退出 2，`find_model` 不静默取第一个；未知 builtin speaker、voice profile/prompt/ref 缺失、voice 与 model kind 不兼容退出 4；显式 `--model` 为 Base/Design 且未给 `--voice` 退出 2；ASR 未找到 3、歧义 2。
+- 指标：`load_ms`、`cold_first_segment_ms`、`warm_first_segment_ms`、`wall_s`、`generate_s`、`audio_s`、`rtf`、`wall_rtf`、`segments_per_run/total`、`segments_per_s`、`process_peak_rss_bytes`、`peak_rss_delta_bytes`、可选 `device_memory_mb/device_memory_kind`、`cer/cer_distance/cer_units`、`speaker_similarity/speaker_segments_scored/speaker_segments_total`。`cases[]` 含所有 run 的 id、文本 sha256、语言、instruct、seed、max_new_tokens 与计时。
+- `--dry-run` 不加载模型、不 import torch/qwen_tts/qwen_asr、不写文件；`metrics` 全 `null`、`runs=[]`、`cases[].run=null`，并给出 `requirements`。`--report -` 与 `--dry-run --report` 退出 2。
+- 门禁失败不抛异常：完整 payload 照常输出/写报告，`ok=false`、`gate_failures[]`、退出 5；指标为 `null` 且显式给门禁同样退出 5。报告写失败退出 4，已算出的 payload 仍输出。`--json` 与 `--report` 逐字节一致，canonical 不含 `exit_code`。
 
 ### `qtts voice`
 
@@ -703,9 +743,11 @@ qtts_cli/
 ├── sidecar.py             # recipe 读写
 ├── voice_archive.py       # .qttsvoice 导出/导入与安全校验
 ├── project.py             # project init/lock
-├── doctor.py              # 环境诊断与 bench
+├── postprocess.py         # 响度/true-peak/重采样/静音修剪纯 DSP
+├── benchmark.py           # bench 语料、计时聚合、CER/speaker 评分
+├── doctor.py              # 环境诊断与 doctor --bench
 ├── models_ops.py          # models list/pull/prune
-└── commands/              # say / script / batch / voice / align / project / models / doctor
+└── commands/              # say / script / batch / voice / align / project / models / doctor / post / bench
 
 tests/
 ├── test_capabilities.py
@@ -772,9 +814,10 @@ FR-P1-01 至 FR-P1-11 均已实现并在本地提交；P1 期间版本号保持 
 ### M2
 
 - 音频后处理 `post`（FR-P2-05，已提交：响度归一化、true-peak 限幅、重采样、声道转换、静音修剪与编码）
+- 可复现性能基准 `bench`（FR-P2-06，已提交：smoke/batch/longform、CER、speaker-sim、dry-run 与 canonical 报告）
 - `serve` 与 OpenAI 兼容 `/v1/audio/speech`
 - 可插拔后端（DashScope / vLLM-Omni batch）
-- 有声书 / dub / bench
+- 有声书 / dub
 - 微调工作流包装
 - 插件 SDK
 

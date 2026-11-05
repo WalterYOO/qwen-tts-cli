@@ -7,6 +7,8 @@ import errno
 import hashlib
 import json
 import os
+import platform
+import resource
 import sys
 import tempfile
 from pathlib import Path
@@ -165,6 +167,13 @@ def human_bytes(n: int) -> str:
             return f"{n:.1f}{unit}" if unit != "B" else f"{n}B"
         n /= step
     return f"{n:.1f}TiB"
+
+
+def peak_rss_bytes() -> int:
+    """Process-lifetime peak RSS in bytes (macOS bytes, Linux KiB)."""
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # macOS reports bytes; Linux reports KiB.
+    return int(usage if platform.system() == "Darwin" else usage * 1024)
 
 
 def ensure_dir(path: str | os.PathLike[str]) -> Path:

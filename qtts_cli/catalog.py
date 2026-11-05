@@ -315,6 +315,28 @@ def _asr_version(model: ModelInfo) -> float:
     return 0.0
 
 
+def looks_like_explicit_path(spec: str) -> bool:
+    """True when ``spec`` denotes a filesystem path, not a name/repo id.
+
+    Absolute paths, ``~``, ``./``/``../`` and Windows separators are always
+    paths.  A plain ``org/name`` repo id retains its historical suffix
+    matching; deeper slash specs (``models/Qwen3-ASR-0.6B``) are paths.
+    """
+    value = str(spec).strip()
+    if not value:
+        return False
+    if value.startswith("~") or "\\" in value:
+        return True
+    if Path(value).is_absolute():
+        return True
+    if value in (".", "..") or value.startswith("./") or value.startswith("../"):
+        return True
+    if "/" in value:
+        parts = [part for part in value.split("/") if part]
+        return len(parts) != 2
+    return False
+
+
 def select_asr(models: Iterable[ModelInfo], spec: Optional[str] = None) -> ModelInfo:
     """Pick an ASR model by local path, repo id/directory name, or best local.
 
@@ -339,6 +361,11 @@ def select_asr(models: Iterable[ModelInfo], spec: Optional[str] = None) -> Model
                     details={"path": str(path), "kind": info.kind},
                 )
             return info
+        if looks_like_explicit_path(needle):
+            raise ModelError(
+                f"ASR model path not found: {needle}",
+                details={"path": str(path)},
+            )
         candidates = [m for m in models if m.kind == "asr"]
         basename = needle.rstrip("/").split("/")[-1]
         for predicate in (

@@ -164,11 +164,23 @@ def cosine_similarity(
     b = np.asarray(second, dtype=np.float64).reshape(-1)
     if a.size == 0 or a.shape != b.shape:
         return None
+    # NaN/Inf would otherwise poison the aggregate metric and make the
+    # canonical report unserialisable (``allow_nan=False``).
+    if not np.all(np.isfinite(a)) or not np.all(np.isfinite(b)):
+        return None
     norm_a = float(np.linalg.norm(a))
     norm_b = float(np.linalg.norm(b))
+    if not (math.isfinite(norm_a) and math.isfinite(norm_b)):
+        return None
     if norm_a == 0.0 or norm_b == 0.0:
         return None
-    return float(np.clip(np.dot(a, b) / (norm_a * norm_b), -1.0, 1.0))
+    dot = float(np.dot(a, b))
+    if not math.isfinite(dot):
+        return None
+    value = dot / (norm_a * norm_b)
+    if not math.isfinite(value):
+        return None
+    return float(np.clip(value, -1.0, 1.0))
 
 
 def _embedding_pair(reference_embedding: Any, audio_embedding: Any) -> tuple[Any, Any]:

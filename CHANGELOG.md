@@ -10,6 +10,7 @@
 ### Added
 
 - **音频后处理（FR-P2-05）**：`qtts post INPUT ... (--out FILE | --out-dir DIR)` 按固定顺序完成静音修剪、声道转换、重采样、BS.1770-4 响度归一化、`lookahead-min-4x` true-peak 限幅与 wav/flac/mp3/m4a 编码。`--lufs` 未配 `--true-peak` 时默认 -1.0 dBTP；最终 true peak 以发布文件 PCM 解码测量为准（mp3/m4a 编码后解码回 24-bit WAV），必要时最多重编码 2 次，仍超限则该文件失败且不替换输出。输入仅接受 wav/flac；输出后缀与 `--format` 必须一致，输入/输出/report 在写入前做 symlink、大小写与 NFC 规范化碰撞检查。多输入逐文件报告，部分失败退出 6；`--dry-run` 不创建目录、不编码、不写报告；`--json` 与 `--report` 逐字节一致。
+- **性能基准（FR-P2-06）**：新增 `qtts bench --suite smoke|batch|longform`，支持 `--model/--voice/--language/--text/--text-file/--count/--runs/--cer/--asr-model/--speaker-sim/--reference-voice/--max-cer/--min-speaker-similarity/--dry-run/--report/--json`。计时用外部 `perf_counter` 未舍入值聚合，`rtf` 取每 run 中位数、`wall_rtf=全场 wall/全场 audio`；TTS → 释放 → ASR（可选）→ 释放 → Base（可选）单驻留，`finally` 保证释放。CER 逐 case 按该段语言转写并累计字符编辑距离；speaker-sim 优先 prompt `ref_spk_embedding`、否则用同一 Base 从 `ref.wav` 提取，任一段空/零/维度不符时整体为 `null` 并记录已评分段数。`--dry-run` 只做元数据/文件/计划检查，不 import torch/qwen、不加载权重、不写文件；`--json` 与 `--report` 逐字节一致，门禁失败输出完整 payload 并退出 5，报告写失败退出 4。
 
 ## [0.2.0] - 2026-11-04
 

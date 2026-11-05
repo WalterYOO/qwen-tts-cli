@@ -93,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
     # -- say ---------------------------------------------------------------- #
     from .commands import align as align_cmd
     from .commands import batch as batch_cmd
+    from .commands import bench as bench_cmd
     from .commands import check as check_cmd
     from .commands import doctor as doctor_cmd
     from .commands import models as models_cmd
@@ -435,6 +436,51 @@ def build_parser() -> argparse.ArgumentParser:
     post.add_argument("--dry-run", action="store_true")
     post.add_argument("--report", help="write a deterministic JSON report")
     post.set_defaults(func=post_cmd.run, formatter=post_cmd.format_result)
+
+    # -- bench -------------------------------------------------------------- #
+    bench = sub.add_parser(
+        "bench", help="run reproducible local TTS benchmarks (smoke/batch/longform)"
+    )
+    _add_common(bench, suppress=True)
+    bench.add_argument("--suite", required=True, choices=["smoke", "batch", "longform"])
+    bench.add_argument("--model", help="TTS model id or path override")
+    bench.add_argument(
+        "--voice", help="builtin:NAME or voice:NAME (design: is not supported)"
+    )
+    bench.add_argument(
+        "--language", choices=["auto", "Chinese", "English"], default="auto"
+    )
+    text_group = bench.add_mutually_exclusive_group()
+    text_group.add_argument("--text", help="longform text (suite longform only)")
+    text_group.add_argument(
+        "--text-file", help="longform UTF-8 text file (suite longform only)"
+    )
+    bench.add_argument(
+        "--count",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="batch case count, 1-64 (default: 8)",
+    )
+    bench.add_argument("--runs", type=int, default=1, help="runs, 1-10 (default: 1)")
+    bench.add_argument("--cer", action="store_true", help="score CER with a local ASR")
+    bench.add_argument("--asr-model", help="ASR model id or path (requires --cer)")
+    bench.add_argument(
+        "--speaker-sim",
+        action="store_true",
+        help="score speaker similarity (requires --reference-voice)",
+    )
+    bench.add_argument(
+        "--reference-voice", help="clone profile used as the similarity reference"
+    )
+    bench.add_argument("--max-cer", type=float, help="fail when CER exceeds this")
+    bench.add_argument(
+        "--min-speaker-similarity",
+        type=float,
+        help="fail when speaker similarity is below this",
+    )
+    bench.add_argument("--dry-run", action="store_true", help="plan without loading models")
+    bench.add_argument("--report", help="write a deterministic JSON report")
+    bench.set_defaults(func=bench_cmd.run, formatter=bench_cmd.format_result)
 
     # -- takes -------------------------------------------------------------- #
     takes = sub.add_parser("takes", help="inspect and promote multi-take assets")
