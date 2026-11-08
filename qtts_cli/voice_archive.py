@@ -60,6 +60,12 @@ def export_voice(
 ) -> dict[str, Any]:
     meta = store.require(name)
     kind = str(meta.get("kind"))
+    if kind == "finetune":
+        raise InputError(
+            "finetune profiles are machine-local; copy the checkpoint and re-register "
+            "on the target machine",
+            details={"voice": name, "kind": kind},
+        )
     voice_dir = store.dir_for(name)
     members: dict[str, bytes] = {}
 
@@ -199,7 +205,10 @@ def _parse_manifest(raw: bytes) -> dict[str, Any]:
         raise InputError("manifest.name must be a string")
     validate_name(name)
     if manifest.get("kind") not in ("clone", "design"):
-        raise InputError("manifest.kind must be clone or design")
+        raise InputError(
+            "manifest.kind must be clone or design; finetune profiles are "
+            "machine-local and cannot be imported"
+        )
     files = manifest.get("files")
     if not isinstance(files, list) or not files:
         raise InputError("manifest.files must be a non-empty list")

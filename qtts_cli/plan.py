@@ -10,7 +10,7 @@ from . import __version__
 from .budget import DEFAULT_MAX_NEW_TOKENS, codec_rate, estimate_duration_s, estimate_tokens, max_chars
 from .cache import AudioCache, cache_key
 from .capabilities import VoiceRef, parse_voice_ref, validate_capabilities
-from .catalog import ModelInfo, find_model, require_speaker, select
+from .catalog import ModelInfo, find_model, load_model, require_speaker, select
 from .errors import InputError, UsageError
 from .lexicon import (
     Lexicon,
@@ -22,7 +22,7 @@ from .lexicon import (
 )
 from .segmenter import segment_text, split_long
 from .textnorm import NORMALIZATION_VERSION, detect_language
-from .utils import sha256_text
+from .utils import sha256_file, sha256_text
 from .voice_store import VoiceStore
 
 DEFAULT_PAUSE_MS = 300
@@ -247,6 +247,96 @@ def resolve_voice(
     # voice:<name>
     meta = store.require(voice_ref.value)
     kind = str(meta.get("kind"))
+    if kind == "finetune":
+        if model_override is not None:
+            raise InputError(
+                f"voice {voice_ref.value} is bound to its finetune checkpoint; --model cannot override it",
+                details={"voice": voice_ref.value, "model": model_override},
+            )
+        source = meta.get("source") or {}
+        speaker_source = source.get("speaker")
+        model_path = (meta.get("model") or {}).get("path")
+        if not isinstance(speaker_source, str) or not speaker_source.strip():
+            raise InputError(
+                f"finetune voice {voice_ref.value} has no source.speaker",
+                details={"voice": voice_ref.value},
+            )
+        if not isinstance(model_path, str) or not model_path.strip():
+            raise InputError(
+                f"finetune voice {voice_ref.value} has no model.path",
+                details={"voice": voice_ref.value},
+            )
+        model = load_model(model_path)
+        if model.kind != "builtin" or model.tts_model_type != "custom_voice":
+            raise InputError(
+                f"finetune voice {voice_ref.value} checkpoint is not a builtin custom_voice model",
+                details={
+                    "voice": voice_ref.value,
+                    "kind": model.kind,
+                    "tts_model_type": model.tts_model_type,
+                },
+            )
+        canonical = model.canonical_speaker(speaker_source)
+        if canonical is None:
+            raise InputError(
+                f"finetune voice {voice_ref.value} speaker {speaker_source!r} is not in its checkpoint",
+                details={"voice": voice_ref.value, "speaker": speaker_source},
+            )
+        checkpoint_sha = source.get("checkpoint_sha256")
+        if not isinstance(checkpoint_sha, str) or not checkpoint_sha:
+            raise InputError(
+                f"finetune voice {voice_ref.value} has no source.checkpoint_sha256",
+                details={"voice": voice_ref.value},
+            )
+        weights = model.path / "model.safetensors"
+        try:
+            size = weights.stat().st_size if weights.is_file() else None
+        except OSError:
+            size = None
+        expected_size = source.get("weights_size")
+        config_expected = source.get("config_sha256")
+        try:
+            config_sha = sha256_file(model.path / "config.json")
+        except OSError:
+            config_sha = None
+        if (
+            size is None
+            or not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+            or size != expected_size
+            or not isinstance(config_expected, str)
+            or config_sha != config_expected
+        ):
+            raise InputError(
+                "checkpoint changed since registration; re-register with "
+                "`qtts finetune train --register-only --force`",
+                details={
+                    "voice": voice_ref.value,
+                    "path": str(model.path),
+                    "weights_size": size,
+                    "expected_weights_size": expected_size,
+                    "config_sha256": config_sha,
+                },
+            )
+        # A fresh ModelInfo is used: the cache fingerprint must be the
+        # registration hash, not the checkpoint directory's cheap fingerprint.
+        model.fingerprint = checkpoint_sha[:16]
+        identity: dict[str, Any] = {
+            "type": "finetune",
+            "voice": voice_ref.value,
+            "speaker": canonical,
+            "checkpoint_sha256": checkpoint_sha,
+        }
+        if backend_identity:
+            identity["backend"] = backend_identity
+        return VoiceResolution(
+            ref=voice_ref.raw,
+            mode="builtin",
+            model=model,
+            speaker=canonical,
+            voice_name=voice_ref.value,
+            identity=identity,
+        )
     if kind == "clone":
         model = override or select(model_list, "clone")
         source = meta.get("source") or {}

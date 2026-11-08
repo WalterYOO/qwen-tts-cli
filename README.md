@@ -50,6 +50,7 @@
 | **音频 QC** | `qc AUDIO` 测量响度（BS.1770 LUFS）、true peak、削波、DC、静音与语速；阈值全部可选，`say --qc` 复用同一实现 |
 | **音频后处理** | `post` 完成静音修剪、声道转换、重采样、响度归一化、`lookahead-min-4x` true-peak 限幅与 wav/flac/mp3/m4a 编码，最终 true peak 以发布文件解码测量为准 |
 | **视频配音** | `dub build` 解析 SRT/CMX3600 子集 EDL，逐句合成、按帧放置、静音补齐与 `atempo` 时长适配；支持逐角色音色/stems、视频背景 bed、mux、响度与 true-peak |
+| **模型微调** | `finetune prepare/train/eval` 调用官方脚本准备 JSONL、训练与评测；校验/选择 checkpoint，注册为 `voice:` profile，并以 CER/说话人相似度门禁评测 |
 | **自动参考文本** | `voice add --kind clone --auto-ref-text` 用 ASR 转写参考音频，作为 ICL 的 `ref_text` 并记录来源与模型 |
 | **音色归档** | `voice export/import` 单文件 `.qttsvoice`，白名单成员、流式校验、原子替换 |
 | **项目锁文件** | `project init/lock` 固定模型全量 sha256、音色、采样参数、字幕策略与运行时版本 |
@@ -406,6 +407,33 @@ qtts dub build subs.srt --project dub.yaml --dry-run --json
 
 发布采用固定顺序：最终音频 → stems 与 `timeline.json` → mux 的 mp4 → manifest 最后。每个文件都先写 UUID 临时文件再原子替换，但**没有跨文件 journal**：这是逐文件原子性，不是整组事务。SIGINT/SIGTERM 在第一次替换前会清理临时文件并让命令以 130 退出；第一次替换成功后信号被推迟到整组发布完成，然后打印 `interrupted after publish` 并以 130 退出。若进程被 SIGKILL 或机器掉电中断在多次替换之间，磁盘上可能留下新旧混合的一组文件；重跑同一命令（必要时 `--force`）即可重建。用法错误退出 2，输入/路径/时间轴/锁错误退出 4，模型/后端/ffmpeg/DSP 失败退出 3，overflow fail 退出 5。
 
+### 16. 微调音色（finetune）
+
+```bash
+# 1) 校验数据集音频并生成官方 prepare_data.py 所需的 raw JSONL，
+#    再调用官方脚本产出带 audio_codes 的训练 JSONL
+qtts finetune prepare --project finetune.yaml
+
+# 2) 调用官方 sft_12hz.py；成功后校验 checkpoint、原子发布输出目录
+#    并把选中的 checkpoint 注册为 voice profile
+qtts finetune train --project finetune.yaml --register alice
+
+# 3) 用保留文本评测：CER（本地 ASR）与说话人相似度（Base 模型）
+qtts finetune eval --project finetune.yaml --voice alice \
+  --asr-model Qwen3-ASR-0.6B --max-cer 0.1
+
+# 只校验/规划，不启动子进程、不加载模型、不取锁、不写文件
+qtts finetune train --project finetune.yaml --dry-run --json
+```
+
+项目文件为严格 YAML/JSON（`schema_version: 1`，未知/重复键、alias、多文档、NUL 与超限输入均退出 4），包含 `dataset`（参考音频与逐条文本）、可选 `prepare`、`train`（官方仓库目录、初始化模型、输出目录、speaker 名）、`register`（目标 profile 名与 `consent.rights_confirmed`）与 `eval`（文本条目、可选 ASR/Base 模型与阈值）。所有路径展开 `~` 并相对项目文件解析；输出目录不得包含或位于数据集、官方仓库、模型、JSONL、`data-dir` 或目标 profile 内，参与发布的路径必须两两不同。
+
+`prepare` 先校验每条音频为 24 kHz 单声道 WAV、时长 0.5–30 s（参考音频 2–30 s）、文本非空且不超过 2000 字符，写出确定性的 `<project>.raw.jsonl`，再以 `--device`（默认 `auto`，仅作为元数据传递，不在进程内解析）调用 `prepare_data.py`；输出写入 `<output>.tmp`，校验每行 16 列 `audio_codes` 后再原子替换。`train` 以固定 argv 调用 `sft_12hz.py`，子进程输出实时转发到 stderr（`--quiet` 抑制），非零退出保留 `<output_dir>.partial` 并退出 3。校验通过的 checkpoint 目录为 `checkpoint-epoch-<N>`（规范十进制），必须包含 `config.json`、非空 `model.safetensors`、`speech_tokenizer/`，且 `catalog.load_model` 识别为 `custom_voice` builtin、包含目标 speaker。发布使用 `.old` 备份与延迟信号处理器：提交点前失败/中断回滚旧目录并保留 `.partial`，提交点后保留新目录并以 130 退出。注册只写 profile 元数据（权重/config 哈希、数据集路径哈希、训练参数与 consent），不复制、移动或链接 checkpoint；`--register-only` 只为已有输出注册或重新注册。
+
+`eval` 从项目/epoch、`--checkpoint` 或 `--voice` 三选一解析 checkpoint；`--voice` 走与 `say` 相同的 profile 完整性检查（权重 size 与 config sha256）并使用 profile 的 speaker，不能与 `--checkpoint` 同用。逐条按 item → eval → dataset 语言优先级解析语言，复用单个 TTS engine，生成后立即释放并清缓存，再按需加载 ASR/Base；音频写到 `<audio-dir>/<index:04d>.wav`（原子替换）。`metrics` 的 CER 与相似度键集严格按是否请求出现，聚合不可用时为 `null`；任一阈值失败输出完整 payload 并退出 5。`--dry-run` 只解析并报告 checkpoint/speaker/模型/阈值。
+
+并发保护：每次非 dry-run 调用按固定顺序取项目锁 `.<project>.finetune.lock` 与 artifact 锁（`<output>.lock`、`<jsonl>.lock` 或 checkpoint 父目录），均为非阻塞 `flock`；冲突退出 4，锁文件保留。SIGINT/SIGTERM 首次转发给子进程组，第二次恢复默认行为；提交阶段信号延迟到 rename/回滚完成。`prepare`/`train` 成功时 stdout 只写一个 JSON（`--json`），所有进度与子进程输出走 stderr；中断返回 130 且 stdout 为空。
+
 ---
 
 ## HTTP 服务
@@ -727,6 +755,32 @@ qtts bench --suite smoke|batch|longform
 - 指标：`load_ms`、`cold_first_segment_ms`、`warm_first_segment_ms`、`wall_s`、`generate_s`、`audio_s`、`rtf`、`wall_rtf`、`segments_per_run/total`、`segments_per_s`、`process_peak_rss_bytes`、`peak_rss_delta_bytes`、可选 `device_memory_mb/device_memory_kind`、`cer/cer_distance/cer_units`、`speaker_similarity/speaker_segments_scored/speaker_segments_total`。`cases[]` 含所有 run 的 id、文本 sha256、语言、instruct、seed、max_new_tokens 与计时。
 - `--dry-run` 不加载模型、不 import torch/qwen_tts/qwen_asr、不写文件；`metrics` 全 `null`、`runs=[]`、`cases[].run=null`，并给出 `requirements`。`--report -` 与 `--dry-run --report` 退出 2。
 - 门禁失败不抛异常：完整 payload 照常输出/写报告，`ok=false`、`gate_failures[]`、退出 5；指标为 `null` 且显式给门禁同样退出 5。报告写失败退出 4，已算出的 payload 仍输出。`--json` 与 `--report` 逐字节一致，canonical 不含 `exit_code`。
+
+### `qtts finetune`
+
+```text
+qtts finetune prepare --project FILE
+  [--tokenizer-model-path DIR] [--raw-jsonl FILE] [--output-jsonl FILE]
+  [--device auto|CPU] [--force] [--dry-run] [--offline] [--quiet] [--json]
+
+qtts finetune train --project FILE
+  [--train-jsonl FILE] [--init-model-path DIR] [--output-dir DIR]
+  [--finetuning-dir DIR] [--python CMD_OR_PATH] [--speaker-name NAME]
+  [--batch-size N] [--lr FLOAT] [--epochs N] [--checkpoint last|N|DIR]
+  [--register NAME] [--register-only] [--force] [--dry-run] [--offline] [--json]
+
+qtts finetune eval --project FILE
+  [--voice NAME | --checkpoint last|N|DIR]
+  [--asr-model SPEC] [--base-model SPEC]
+  [--max-cer R] [--min-speaker-similarity S] [--audio-dir DIR]
+  [--dry-run] [--json]
+```
+
+- `--project` 必填且后缀为 `.yaml`/`.yml`/`.json`。所有数值选项按官方默认回退：batch size 2、lr `2e-05`、epochs 3；`--python` 缺省为当前解释器，含路径分隔符时解析为绝对路径，否则用 `shutil.which`。
+- `--force` 仅 `prepare` 与 `train` 接受：覆盖输出 JSONL、删除 `.partial` 并替换已有输出目录；`eval` 没有 `--force`，生成的音频总是原子替换。
+- `train --register-only` 不启动训练、不重命名输出，只为已存在的 checkpoint 写入 profile；没有 `register.name`/`--register` 时退出 2。
+- 退出码：参数/组合错误 2；子进程/checkpoint/哈希/IO 失败 3；项目、路径、锁、选择器与 profile 冲突 4；评测门禁 5；中断 130。
+- `--offline` 只向子进程环境加入 `HF_HUB_OFFLINE=1`/`TRANSFORMERS_OFFLINE=1`；`--dry-run` 不 import torch/qwen_tts/qwen_asr/dashscope/vllm_omni，不取锁、不建目录、不写文件。
 
 ### `qtts serve`
 

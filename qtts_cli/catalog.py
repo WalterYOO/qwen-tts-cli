@@ -255,6 +255,33 @@ def _read_revision(model_dir: Path) -> Optional[str]:
     return None
 
 
+def load_model(path: str | Path) -> ModelInfo:
+    """Load one TTS model directory without scanning the model dir."""
+    candidate = Path(path).expanduser()
+    resolved = candidate.resolve(strict=False)
+    if not resolved.exists():
+        raise InputError(
+            f"model directory not found: {resolved}", details={"path": str(resolved)}
+        )
+    if not resolved.is_dir():
+        raise InputError(
+            f"model path is not a directory: {resolved}",
+            details={"path": str(resolved)},
+        )
+    if not (resolved / "config.json").is_file():
+        raise InputError(
+            f"model directory has no config.json: {resolved}",
+            details={"path": str(resolved)},
+        )
+    info = _load_one(resolved)
+    if info is None or info.kind not in ("builtin", "clone", "design"):
+        raise InputError(
+            f"not a supported TTS model directory: {resolved}",
+            details={"path": str(resolved)},
+        )
+    return info
+
+
 def scan(model_dir: Path | str | None) -> list[ModelInfo]:
     """Enumerate usable local model directories. Never raises for missing dir."""
     if model_dir is None:

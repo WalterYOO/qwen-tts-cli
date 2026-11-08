@@ -114,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     from .commands import check as check_cmd
     from .commands import doctor as doctor_cmd
     from .commands import dub as dub_cmd
+    from .commands import finetune as finetune_cmd
     from .commands import models as models_cmd
     from .commands import plugins as plugins_cmd
     from .commands import post as post_cmd
@@ -555,6 +556,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(dub_build, suppress=True)
     _add_backend_flags(dub_build)
     dub_cmd.add_arguments(dub_build)
+
+    # -- finetune ----------------------------------------------------------- #
+    finetune = sub.add_parser(
+        "finetune", help="prepare, train and evaluate a finetuned voice"
+    )
+    finetune_cmd.add_arguments(finetune)
 
     # -- takes -------------------------------------------------------------- #
     takes = sub.add_parser("takes", help="inspect and promote multi-take assets")

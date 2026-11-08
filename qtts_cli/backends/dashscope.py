@@ -208,8 +208,8 @@ class DashScopeBackend:
 
     def build_clone_prompt_items(self, store, voice_name: str) -> Any:
         raise CapabilityError(
-            "dashscope backend supports builtin voices only; enrolled clone/design "
-            "voices must be referenced as builtin:VOICE_ID",
+            "dashscope backend supports builtin voices only; enrolled "
+            "clone/design/finetune voices must be referenced as builtin:VOICE_ID",
             details={"backend": self.name, "voice": voice_name},
         )
 
@@ -227,8 +227,8 @@ class DashScopeBackend:
     ) -> tuple[np.ndarray, int, dict[str, Any]]:
         if mode != "builtin":
             raise CapabilityError(
-                "dashscope backend supports builtin voices only; enrolled clone/design "
-                "voices must be referenced as builtin:VOICE_ID",
+                "dashscope backend supports builtin voices only; enrolled "
+                "clone/design/finetune voices must be referenced as builtin:VOICE_ID",
                 details={"backend": self.name, "mode": mode},
             )
         if instruct:
@@ -291,8 +291,8 @@ def preflight_voice_ref(raw_ref: str) -> None:
     parsed = parse_voice_ref(raw_ref)
     if parsed.kind != "builtin":
         raise CapabilityError(
-            "dashscope backend supports builtin voices only; enrolled clone/design "
-            "voices must be referenced as builtin:VOICE_ID",
+            "dashscope backend supports builtin voices only; enrolled "
+            "clone/design/finetune voices must be referenced as builtin:VOICE_ID",
             details={"backend": "dashscope", "voice": raw_ref},
         )
 
@@ -307,8 +307,8 @@ def preflight(plan, cfg, args) -> None:
         seen.add(id(voice))
         if voice.mode != "builtin":
             raise CapabilityError(
-                "dashscope backend supports builtin voices only; enrolled clone/design "
-                "voices must be referenced as builtin:VOICE_ID",
+                "dashscope backend supports builtin voices only; enrolled "
+                "clone/design/finetune voices must be referenced as builtin:VOICE_ID",
                 details={"backend": "dashscope", "mode": voice.mode},
             )
     has_instruct = bool(plan.instruct) or any(

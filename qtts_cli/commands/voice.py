@@ -10,10 +10,10 @@ from .. import __version__
 from ..admit import check_ref_audio
 from ..asr_engine import AsrEngine, clear_asr_cache
 from ..audio_io import duration_s, resolve_output_format, write_audio
-from ..capabilities import validate_capabilities
+from ..capabilities import VoiceRef, validate_capabilities
 from ..catalog import ModelInfo, find_model, scan, select, select_asr
 from ..errors import InputError, ModelError, UsageError
-from ..plan import SAMPLING_DEFAULTS, resolve_dtype_name
+from ..plan import SAMPLING_DEFAULTS, resolve_dtype_name, resolve_voice
 from ..sidecar import build_recipe, recipe_path, write_recipe
 from ..textnorm import NORMALIZATION_VERSION
 from ..tts_engine import TtsEngine, clear_model_cache
@@ -421,13 +421,24 @@ def inspect(cfg, args) -> dict[str, Any]:
     store = VoiceStore(cfg.data_dir)
     meta = store.require(name)
     preview = store.dir_for(name) / "preview.wav"
-    return {
+    payload = {
         "ok": True,
         "kind": meta.get("kind"),
         "voice": meta,
         "prompt_sha256": store.prompt_sha256(name),
         "preview": str(preview) if preview.is_file() else None,
     }
+    if meta.get("kind") == "finetune":
+        source = meta.get("source") or {}
+        model = meta.get("model") or {}
+        path = model.get("path")
+        payload["checkpoint"] = {
+            "path": path,
+            "exists": bool(path) and Path(str(path)).is_dir(),
+            "speaker": source.get("speaker"),
+            "fingerprint": model.get("fingerprint"),
+        }
+    return payload
 
 
 # --------------------------------------------------------------------------- #
@@ -474,6 +485,15 @@ def preview(cfg, args) -> dict[str, Any]:
             instr = description
             ref = f"voice:{name}"
             voice_name = None
+        elif kind == "finetune":
+            resolution = resolve_voice(models, store, VoiceRef("voice", name))
+            target_model = resolution.model
+            speaker = resolution.speaker
+            mode = "builtin"
+            description = None
+            instr = None
+            ref = f"voice:{name}"
+            voice_name = name
         else:
             raise InputError(f"voice {name} has unsupported kind: {kind!r}")
 
@@ -576,7 +596,8 @@ def import_(cfg, args) -> dict[str, Any]:
 
 def rm(cfg, args) -> dict[str, Any]:
     store = VoiceStore(cfg.data_dir)
-    if not store.exists(args.name):
+    meta = store.get(args.name)
+    if meta is None:
         raise InputError(f"voice not found: {args.name}")
     if not args.yes:
         if not is_tty():
@@ -585,7 +606,10 @@ def rm(cfg, args) -> dict[str, Any]:
             # Cancellation is not a failure (PRD exit codes; codex P1-7).
             return {"ok": True, "cancelled": True, "voice": args.name}
     store.remove(args.name)
-    return {"ok": True, "removed": args.name}
+    payload: dict[str, Any] = {"ok": True, "removed": args.name}
+    if meta.get("kind") == "finetune":
+        payload["checkpoint"] = (meta.get("model") or {}).get("path")
+    return payload
 
 
 # --------------------------------------------------------------------------- #
@@ -651,6 +675,11 @@ def format_result(payload: dict[str, Any]) -> str:
     if payload.get("output"):
         return f"wrote {payload['output']} ({payload['duration_s']}s)"
     if payload.get("removed"):
+        if payload.get("checkpoint"):
+            return (
+                f"removed voice {payload['removed']}; checkpoint left at "
+                f"{payload['checkpoint']}"
+            )
         return f"removed voice {payload['removed']}"
     if payload.get("cancelled"):
         return "cancelled"
