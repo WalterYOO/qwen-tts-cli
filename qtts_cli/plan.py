@@ -64,6 +64,7 @@ class VoiceResolution:
     prompt_sha256: Optional[str] = None
     ref_audio_sha256: Optional[str] = None
     identity: dict[str, Any] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -196,29 +197,51 @@ def resolve_voice(
     voice_ref: VoiceRef,
     *,
     model_override: Optional[str] = None,
+    backend_identity: Optional[str] = None,
+    require_clone_prompt: bool = True,
+    speaker_policy: str = "strict",
 ) -> VoiceResolution:
+    if speaker_policy not in ("strict", "canonical_or_passthrough"):
+        raise UsageError(f"unknown speaker policy: {speaker_policy!r}")
     model_list = list(models)
     override = find_model(model_list, model_override) if model_override else None
 
     if voice_ref.kind == "builtin":
         model = override or select(model_list, "builtin")
-        speaker = require_speaker(model, voice_ref.value)
+        warnings: list[str] = []
+        if speaker_policy == "strict":
+            speaker = require_speaker(model, voice_ref.value)
+        else:
+            speaker = model.canonical_speaker(voice_ref.value)
+            if speaker is None:
+                speaker = voice_ref.value
+                warnings.append(
+                    f"backend voice {speaker!r} is not in the known list; "
+                    "passing it through"
+                )
+        identity: dict[str, Any] = {"type": "builtin", "speaker": speaker}
+        if backend_identity:
+            identity["backend"] = backend_identity
         return VoiceResolution(
             ref=voice_ref.raw,
             mode="builtin",
             model=model,
             speaker=speaker,
-            identity={"type": "builtin", "speaker": speaker},
+            identity=identity,
+            warnings=warnings,
         )
 
     if voice_ref.kind == "design":
         model = override or select(model_list, "design")
+        identity = {"type": "design", "description": voice_ref.value}
+        if backend_identity:
+            identity["backend"] = backend_identity
         return VoiceResolution(
             ref=voice_ref.raw,
             mode="design",
             model=model,
             description=voice_ref.value,
-            identity={"type": "design", "description": voice_ref.value},
+            identity=identity,
         )
 
     # voice:<name>
@@ -231,8 +254,8 @@ def resolve_voice(
         icl = str(source.get("mode") or "icl").lower() == "icl"
         prompt_sha = store.prompt_sha256(voice_ref.value)
         # Fail before loading Base weights if the frozen prompt is missing
-        # (codex P0-9).
-        if prompt_sha is None:
+        # (codex P0-9).  Backends that only need ref.wav (vllm-omni) opt out.
+        if prompt_sha is None and require_clone_prompt:
             raise InputError(
                 f"voice {voice_ref.value} has no prompt.safetensors; re-add the voice "
                 "or run voice add --materialize-clone",
@@ -248,6 +271,8 @@ def resolve_voice(
         # audio even when prompt.safetensors is unchanged.
         if icl:
             identity["ref_text_sha256"] = sha256_text(ref_text or "")
+        if backend_identity:
+            identity["backend"] = backend_identity
         return VoiceResolution(
             ref=voice_ref.raw,
             mode="clone",
@@ -265,13 +290,20 @@ def resolve_voice(
         description = source.get("description")
         if not description:
             raise InputError(f"voice {voice_ref.value} has no design description")
+        resolved_identity = {
+            "type": "design",
+            "voice": voice_ref.value,
+            "description": description,
+        }
+        if backend_identity:
+            resolved_identity["backend"] = backend_identity
         return VoiceResolution(
             ref=voice_ref.raw,
             mode="design",
             model=model,
             voice_name=voice_ref.value,
             description=description,
-            identity={"type": "design", "voice": voice_ref.value, "description": description},
+            identity=resolved_identity,
         )
     raise InputError(f"voice {voice_ref.value} has unsupported kind: {kind!r}")
 
@@ -468,6 +500,9 @@ def build_plan(
     store: VoiceStore,
     model_override: Optional[str] = None,
     lexicon: Optional[Lexicon] = None,
+    backend_identity: Optional[str] = None,
+    require_clone_prompt: bool = True,
+    speaker_policy: str = "strict",
 ) -> GenerationPlan:
     if max_new_tokens <= 0:
         raise InputError("--max-new-tokens must be a positive integer")
@@ -475,7 +510,15 @@ def build_plan(
         raise InputError("--pause-ms must be >= 0")
 
     parsed = parse_voice_ref(voice_ref)
-    voice = resolve_voice(models, store, parsed, model_override=model_override)
+    voice = resolve_voice(
+        models,
+        store,
+        parsed,
+        model_override=model_override,
+        backend_identity=backend_identity,
+        require_clone_prompt=require_clone_prompt,
+        speaker_policy=speaker_policy,
+    )
 
     effective_instruct = instruct
     if voice.mode == "design" and not effective_instruct:
@@ -501,7 +544,7 @@ def build_plan(
     sampling = dict(SAMPLING_DEFAULTS)
     sampling["max_new_tokens"] = int(max_new_tokens)
 
-    display_text, pieces, warnings, leading_pause, trailing_pause = prepare_text_pieces(
+    display_text, pieces, piece_warnings, leading_pause, trailing_pause = prepare_text_pieces(
         text,
         language=language,
         rate=rate,
@@ -509,6 +552,7 @@ def build_plan(
         pause_ms=pause_ms,
         lexicon=lexicon,
     )
+    warnings = list(voice.warnings) + list(piece_warnings)
     if not display_text.strip():
         raise InputError("input text is empty after normalization/director markers")
 

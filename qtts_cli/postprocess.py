@@ -19,7 +19,7 @@ import numpy as np
 
 from .audio_io import peak_dbfs
 from .audio_qc import integrated_loudness, true_peak_dbtp
-from .errors import InputError, UsageError
+from .errors import InputError, ModelError, UsageError
 
 POST_DSP_VERSION = 1
 LIMITER_ALGORITHM = "lookahead-min-4x"
@@ -277,10 +277,80 @@ def limit_true_peak(
     return limited, round(reduction, 3), achieved, round(safety, 3)
 
 
+def _plugin_process(plugin, data: np.ndarray, sr: int, params: dict[str, Any]):
+    """Run a post-process plugin and validate its ``(samples, sr)`` result."""
+    handler = getattr(plugin, "process", None)
+    if handler is None:
+        handler = getattr(getattr(plugin, "obj", None), "process", None)
+    if not callable(handler):
+        raise ModelError("post-process plugin has no callable process()")
+    try:
+        result = handler(data, sr, dict(params))
+    except ModelError:
+        raise
+    except Exception as exc:
+        raise ModelError(
+            f"post-process plugin failed: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(result, (tuple, list)) or len(result) != 2:
+        raise InputError("post-process plugin must return (samples, sample_rate)")
+    samples, out_sr = result
+    expected_channels = int(data.shape[1])
+    try:
+        array = np.asarray(samples, dtype=np.float32)
+    except (TypeError, ValueError) as exc:
+        raise InputError(f"post-process plugin returned non-numeric audio: {exc}") from exc
+    if array.ndim == 1:
+        array = array[:, None]
+    if array.ndim != 2:
+        raise InputError("post-process plugin must return 1-D or 2-D audio")
+    if array.shape[1] != expected_channels:
+        raise InputError(
+            "post-process plugin changed the channel count "
+            f"({expected_channels} -> {array.shape[1]})"
+        )
+    if array.shape[0] == 0:
+        raise InputError("post-process plugin returned empty audio")
+    if not np.all(np.isfinite(array)):
+        raise InputError("post-process plugin returned NaN or Inf samples")
+    try:
+        rate = int(out_sr)
+        exact = float(out_sr) == float(rate)
+    except (TypeError, ValueError) as exc:
+        raise InputError(f"post-process plugin returned an invalid sample rate: {out_sr!r}") from exc
+    if not exact or rate <= 0 or rate != int(sr):
+        raise InputError(
+            f"post-process plugin must keep the sample rate at {int(sr)} Hz "
+            f"(got {out_sr!r})"
+        )
+    ratio = float(array.shape[0]) / float(data.shape[0])
+    if not (0.5 <= ratio <= 2.0):
+        raise InputError(
+            "post-process plugin changed duration by "
+            f"{ratio:.2f}x; allowed range is 0.5x..2.0x"
+        )
+    return np.ascontiguousarray(array, dtype=np.float32), rate
+
+
+def _plugin_applied(plugin, params: dict[str, Any]) -> dict[str, Any]:
+    payload = getattr(plugin, "applied_payload", None)
+    if callable(payload):
+        return payload(dict(params))
+    return {
+        "name": str(getattr(plugin, "name", "plugin")),
+        "params": dict(params),
+        "api_version": int(getattr(plugin, "api_version", 1)),
+        "distribution": getattr(plugin, "distribution", None),
+        "version": getattr(plugin, "version", None),
+    }
+
+
 def process(
     samples: np.ndarray,
     sr: int,
     options: dict[str, Any],
+    *,
+    plugin: Any = None,
 ) -> tuple[np.ndarray, int, dict[str, Any], dict[str, Any], dict[str, Any], list[str]]:
     """Apply the fixed processing order and return measurements for reporting."""
     data = _as_2d(samples)
@@ -325,6 +395,13 @@ def process(
         data, resample_info = resample(data, sr, int(target_sr))
         out_sr = int(target_sr)
         applied["resample"] = resample_info
+
+    # Plugin DSP runs after trim/channels/resample and before loudness gain,
+    # so the LUFS/true-peak guarantees are measured on the plugin's output.
+    if plugin is not None:
+        params = dict(options.get("plugin_params") or {})
+        data, out_sr = _plugin_process(plugin, data, out_sr, params)
+        applied["postprocess_plugin"] = _plugin_applied(plugin, params)
 
     lufs_target = options.get("lufs")
     if lufs_target is not None:

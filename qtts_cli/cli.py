@@ -61,6 +61,22 @@ def _add_subtitle_policy(parser: argparse.ArgumentParser) -> None:
                         help="disable subtitle threshold gate (structural repairs still run)")
 
 
+def _add_backend_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--backend",
+        default=None,
+        help=(
+            "TTS backend: transformers (default), dashscope, vllm-omni, or an "
+            "installed plugin name (entry point group qtts.backends)"
+        ),
+    )
+    parser.add_argument(
+        "--backend-model",
+        default=None,
+        help="remote/plugin model id (not valid for transformers or vllm-omni)",
+    )
+
+
 def _add_qc_thresholds(parser: argparse.ArgumentParser) -> None:
     """QC gates are opt-in: every default is None (t10 H-E01)."""
     parser.add_argument("--max-clipping-ratio", type=float, default=None,
@@ -97,6 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     from .commands import check as check_cmd
     from .commands import doctor as doctor_cmd
     from .commands import models as models_cmd
+    from .commands import plugins as plugins_cmd
     from .commands import post as post_cmd
     from .commands import project as project_cmd
     from .commands import qc as qc_cmd
@@ -151,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
     say.add_argument("--asr-model", default=argparse.SUPPRESS,
                      help="ASR model for --select cer (local path or repo id)")
     _add_qc_thresholds(say)
+    _add_backend_flags(say)
     say.add_argument("--dry-run", action="store_true", help="print the plan without loading models")
     say.add_argument("--yes", action="store_true", help="non-interactive confirmation")
     say.set_defaults(func=say_cmd.run, formatter=say_cmd.format_result)
@@ -172,6 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
     script_compile.add_argument("-o", "--out", required=True, help="plan JSON path ('-' for stdout)")
     script_compile.add_argument("--model", help="override the automatically selected model")
     script_compile.add_argument("--lexicon", help="JSON pronunciation lexicon")
+    _add_backend_flags(script_compile)
     script_compile.set_defaults(func=script_cmd.compile, formatter=script_cmd.format_result)
 
     # -- batch -------------------------------------------------------------- #
@@ -184,6 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch_plan.add_argument("--out-dir", required=True)
     batch_plan.add_argument("--model", help="override the automatically selected model")
     batch_plan.add_argument("--lexicon", help="JSON pronunciation lexicon")
+    _add_backend_flags(batch_plan)
     batch_plan.set_defaults(func=batch_cmd.plan, formatter=batch_cmd.format_result)
 
     batch_run = batch_sub.add_parser("run", help="execute a manifest")
@@ -198,6 +218,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch_run.add_argument("--watch", action="store_true", help="progress on stderr")
     batch_run.add_argument("--model", help="override the automatically selected model")
     batch_run.add_argument("--lexicon", help="JSON pronunciation lexicon")
+    _add_backend_flags(batch_run)
     batch_run.set_defaults(func=batch_cmd.run, formatter=batch_cmd.format_result)
 
     # -- voice -------------------------------------------------------------- #
@@ -433,6 +454,17 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["leading", "trailing", "both"],
         default=argparse.SUPPRESS,
     )
+    post.add_argument(
+        "--plugin",
+        help="installed post-process plugin (entry point group qtts.postprocess)",
+    )
+    post.add_argument(
+        "--plugin-param",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="plugin parameter; repeatable, value is JSON when parseable",
+    )
     post.add_argument("--dry-run", action="store_true")
     post.add_argument("--report", help="write a deterministic JSON report")
     post.set_defaults(func=post_cmd.run, formatter=post_cmd.format_result)
@@ -481,6 +513,21 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument("--dry-run", action="store_true", help="plan without loading models")
     bench.add_argument("--report", help="write a deterministic JSON report")
     bench.set_defaults(func=bench_cmd.run, formatter=bench_cmd.format_result)
+
+    # -- plugins ------------------------------------------------------------ #
+    plugins = sub.add_parser("plugins", help="inspect installed TTS/plugin backends")
+    plugins_sub = plugins.add_subparsers(dest="plugins_command", required=True)
+    plugins_list = plugins_sub.add_parser(
+        "list", help="list discovered qtts.backends and qtts.postprocess entry points"
+    )
+    _add_common(plugins_list, suppress=True)
+    plugins_list.add_argument(
+        "--strict", action="store_true",
+        help="exit 3 when any discovered plugin is not usable",
+    )
+    plugins_list.set_defaults(
+        func=plugins_cmd.list_plugins, formatter=plugins_cmd.format_result
+    )
 
     # -- takes -------------------------------------------------------------- #
     takes = sub.add_parser("takes", help="inspect and promote multi-take assets")

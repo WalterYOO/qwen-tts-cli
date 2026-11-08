@@ -60,6 +60,8 @@ class Config:
     quiet: bool = False
     no_cache: bool = False
     log_level: str = "warning"
+    backend: str = "transformers"
+    backend_model: Optional[str] = None
     config_file: Optional[Path] = None
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -139,6 +141,8 @@ def load_config_file(path: str | os.PathLike[str] | None) -> dict[str, Any]:
         "offline",
         "seed",
         "no_cache",
+        "backend",
+        "backend_model",
     }
     return {key: value for key, value in data.items() if key in known}
 
@@ -176,6 +180,8 @@ def build_config(args: Any) -> Config:
         quiet=bool(getattr(args, "quiet", False)),
         no_cache=bool(pick("no_cache", False)),
         log_level=getattr(args, "log_level", None) or "warning",
+        backend=str(pick("backend", "transformers") or "transformers"),
+        backend_model=pick("backend_model"),
         config_file=getattr(args, "config", None),
         extra=file_cfg,
     )

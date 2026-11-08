@@ -25,6 +25,18 @@ from ..audio_io import (
     write_audio_stdout,
 )
 from ..audio_qc import analyze as analyze_audio
+from ..backends.base import (
+    ensure_instance_capabilities,
+    ensure_instance_protocol,
+)
+from ..backends.registry import (
+    BUILTIN_NAMES,
+    preflight_voice_ref,
+    resolve_backend,
+    run_preflight,
+)
+from ..backends.transformers import TransformersBackend
+from ..tts_engine import TtsEngine
 from ..cache import AudioCache
 from ..catalog import language_supported, scan, select_aligner
 from ..errors import CapabilityError, InputError, ModelError, QttsError, UsageError
@@ -32,6 +44,7 @@ from ..lexicon import Lexicon, MapBlock, spoken_items_to_display
 from ..plan import (
     DEFAULT_PAUSE_MS,
     GenerationPlan,
+    SAMPLING_DEFAULTS,
     attach_cache_stats,
     build_plan,
     rekey_plan,
@@ -55,7 +68,6 @@ from ..subtitles import (
     render,
     shift_cues,
 )
-from ..tts_engine import TtsEngine, clear_model_cache
 from ..utils import atomic_write_json, atomic_write_text, emit_json, sha256_text
 from ..voice_store import VoiceStore, utc_now
 from .qc import precheck_speaker_similarity as qc_precheck_speaker_similarity
@@ -107,7 +119,7 @@ def run(
     cfg,
     args,
     *,
-    engine_cache: Optional[dict[str, TtsEngine]] = None,
+    engine_cache: Optional[dict[str, Any]] = None,
     aligner_cache: Optional[dict[str, AlignerEngine]] = None,
 ) -> dict[str, Any]:
     takes_spec = takes_request(args)
@@ -150,13 +162,19 @@ def run(
     )
     pause_ms_arg = DEFAULT_PAUSE_MS if cli_pause_ms is None else cli_pause_ms
 
-    policy = policy_from_args(args)
-    models = scan(cfg.model_dir)
-    if not models:
-        raise ModelError(
-            "no local models found; pass --model-dir DIR or run `qtts models pull`",
-            details={"model_dir": str(cfg.model_dir) if cfg.model_dir else None},
+    # Metadata-only backend resolution; nothing is created or loaded yet.
+    spec = resolve_backend(getattr(args, "backend", None), cfg, args)
+    if takes_spec and spec.name != "transformers":
+        raise UsageError(
+            "--takes/--select require the local transformers backend; "
+            f"{spec.name} cannot provide takes or selection metrics"
         )
+
+    policy = policy_from_args(args)
+    # TTS models come from the backend; local scanning is only for the aligner,
+    # speaker-similarity QC and takes, which always use local runtimes.
+    tts_models = spec.models
+    local_models = scan(cfg.model_dir)
     store = VoiceStore(cfg.data_dir)
     lexicon_arg = getattr(args, "lexicon", None)
     # Batch reuses this entry point and may pass an already-loaded Lexicon.
@@ -181,6 +199,11 @@ def run(
         raise UsageError(
             "--reference-voice requires --qc or --select speaker-sim"
         )
+    if qc_reference_voice and spec.name != "transformers":
+        raise UsageError(
+            "--reference-voice requires the local transformers backend; "
+            f"{spec.name} cannot compute speaker similarity"
+        )
 
     # stdout has exactly one consumer (codex P0-2). Validate before any load.
     consumers: list[str] = []
@@ -201,6 +224,11 @@ def run(
     if out_target == "-" and subtitle_formats and sub_prefix is None:
         raise UsageError("--out - cannot host subtitle files; pass --subtitle-out-prefix")
 
+    if not structured:
+        # Kind validation must win over model selection (exit 4, not 3), but
+        # pure output-parameter errors above keep priority.
+        preflight_voice_ref(args.voice, spec)
+
     if qc_reference_voice:
         # Profile and Base/runtime prechecks run after pure parameter/output
         # validation but before any generation or audio write (t10 P1-4/P2).
@@ -211,18 +239,22 @@ def run(
             and not takes_speaker_sim
         ):
             qc_precheck_speaker_similarity(
-                cfg, models, getattr(args, "model", None)
+                cfg, local_models, getattr(args, "model", None)
             )
 
     if structured:
         plan = compile_script(
             cfg,
             script_path,
-            models=models,
+            models=tts_models,
             store=store,
             lexicon=lexicon,
             model_override=args.model,
             voice_default=getattr(args, "voice", None),
+            backend_spec=spec,
+            backend_identity=spec.identity,
+            require_clone_prompt=spec.require_clone_prompt,
+            speaker_policy=spec.speaker_policy(),
             output=None if out_target == "-" else out_target,
             fmt=args.format,
             subtitle_formats=subtitle_formats,
@@ -255,14 +287,24 @@ def run(
             fmt=fmt,
             subtitle_formats=subtitle_formats,
             granularity=args.granularity,
-            models=models,
+            models=tts_models,
             store=store,
             model_override=args.model,
             lexicon=lexicon,
+            backend_identity=spec.identity,
+            require_clone_prompt=spec.require_clone_prompt,
+            speaker_policy=spec.speaker_policy(),
         )
 
+    # Backend-specific checks (API key, ref audio, offline) run after the plan
+    # exists and before any create/load/aligner/cache preparation.
+    run_preflight(plan, cfg, args, spec)
+    # Only keys the backend actually forwards may reach generate(); an
+    # explicitly requested unsupported knob is a capability error before load.
+    supported_sampling = _validate_sampling_capabilities(plan, spec)
+
     # Subtitle prerequisites are checked here, before TTS weights load (P0-1).
-    aligner_model = _prepare_aligner(models, plan) if subtitle_formats else None
+    aligner_model = _prepare_aligner(local_models, plan) if subtitle_formats else None
 
     cache = AudioCache(cfg.audio_cache_dir, enabled=not cfg.no_cache)
     attach_cache_stats(plan, cache, "wav")
@@ -278,13 +320,28 @@ def run(
             "plan": plan.to_dict(),
             "will_write": _will_write(out_target, recipe_target, sub_prefix, subtitle_formats),
             "aligner": _aligner_dict(aligner_model),
+            "backend": {
+                "name": spec.name,
+                "model": plan.voice.model.model_id,
+                "remote": spec.remote,
+                "identity": spec.identity,
+                "configured": spec.configured() if spec.configured is not None else None,
+            },
             "dependencies": {
-                "tts": _module_available("qwen_tts"),
+                "tts": (
+                    _module_available(spec.runtime_module)
+                    if spec.runtime_module
+                    else None
+                ),
                 "align": _module_available("qwen_asr") if subtitle_formats else None,
             },
-            "device": cfg.device,
-            "dtype": "auto" if cfg.dtype == "auto" else cfg.dtype,
-            "memory_estimate": _estimate_memory(plan, aligner_model is not None),
+            "device": "remote" if spec.remote else cfg.device,
+            "dtype": None if spec.remote else ("auto" if cfg.dtype == "auto" else cfg.dtype),
+            "memory_estimate": (
+                {"remote": True, "estimated_peak_gb": None}
+                if spec.remote
+                else _estimate_memory(plan, aligner_model is not None)
+            ),
             "qc": {
                 "enabled": qc_enabled,
                 "thresholds": qc_thresholds,
@@ -299,7 +356,7 @@ def run(
                 cfg,
                 args,
                 plan=plan,
-                models=models,
+                models=local_models,
                 voice_store=store,
                 takes_count=takes_count,
                 criteria=criteria,
@@ -319,7 +376,7 @@ def run(
             cfg,
             args,
             plan=plan,
-            models=models,
+            models=local_models,
             voice_store=store,
             aligner_model=aligner_model,
             cache=cache,
@@ -342,29 +399,35 @@ def run(
     need_model = cfg.no_cache or any(
         not cache.exists(seg.cache_key, "wav") for seg in plan.segments
     )
-    engine_slot: dict[str, TtsEngine] = (
+    engine_slot: dict[str, Any] = (
         engine_cache if engine_cache is not None else {}
     )
     prompt_cache: dict[tuple[str, str], Any] = {}
-    last_engine: Optional[TtsEngine] = None
+    last_engine: Optional[Any] = None
     load_ms_total = 0.0
+
+    def slot_key(voice) -> str:
+        # Backend identity is part of the slot: a remote client and a local
+        # engine for the same model must never share state.
+        return f"{spec.name}:{voice.model.path}|{cfg.device}"
 
     def acquire(voice):
         """One live TTS model slot; release the previous model before loading."""
         nonlocal last_engine, load_ms_total
-        key = f"{voice.model.path}|{cfg.device}"
+        key = slot_key(voice)
         for old_key, old_engine in list(engine_slot.items()):
             if old_key != key:
-                old_engine.model = None
+                _release_backend(old_engine, spec)
                 engine_slot.pop(old_key, None)
-                clear_model_cache()
                 prompt_cache.clear()
         engine = engine_slot.get(key)
         if engine is None:
-            engine = TtsEngine(cfg, voice.model)
+            engine = _create_backend(spec, cfg, voice.model)
+            ensure_instance_protocol(engine, spec)
+            ensure_instance_capabilities(engine, spec)
             engine_slot[key] = engine
-        if engine.model is None:
-            engine.load()
+        if getattr(engine, "model", None) is None:
+            _invoke_backend(spec, "load()", engine.load)
             load_ms_total += float(engine.load_ms or 0.0)
         # The runtime dtype may differ from the platform guess; rebuild cache
         # keys so a CPU fp32 run never reads bf16 artefacts (P1-5).
@@ -379,8 +442,12 @@ def run(
             return None
         key = (str(voice.model.path), json.dumps(voice.identity, sort_keys=True))
         if key not in prompt_cache:
-            prompt_cache[key] = engine.build_clone_prompt_items(
-                store, voice.voice_name or ""
+            prompt_cache[key] = _invoke_backend(
+                spec,
+                "build_clone_prompt_items()",
+                engine.build_clone_prompt_items,
+                store,
+                voice.voice_name or "",
             )
         return prompt_cache[key]
 
@@ -406,15 +473,20 @@ def run(
         if cached_path is not None:
             audio, sr = read_audio(cached_path)
             gen_info = {"cached": True, "generate_ms": 0.0}
-            last_engine = last_engine or engine_slot.get(
-                f"{voice.model.path}|{cfg.device}"
-            )
+            last_engine = last_engine or engine_slot.get(slot_key(voice))
         else:
             engine = acquire(voice)
-            sampling = dict(plan.sampling)
-            if seg.max_new_tokens is not None:
+            sampling = {
+                key: value
+                for key, value in plan.sampling.items()
+                if key in supported_sampling
+            }
+            if seg.max_new_tokens is not None and "max_new_tokens" in supported_sampling:
                 sampling["max_new_tokens"] = int(seg.max_new_tokens)
-            audio, sr, gen_info = engine.generate(
+            audio, sr, gen_info = _invoke_backend(
+                spec,
+                "generate()",
+                engine.generate,
                 text=seg.text,
                 language=seg.language,
                 mode=voice.mode,
@@ -425,6 +497,8 @@ def run(
                 seed=int(seg.seed if seg.seed is not None else cfg.seed),
             )
             gen_info["cached"] = False
+            # Record the exact keys the backend received (filtered sampling).
+            gen_info["sampling_forwarded"] = dict(sampling)
             if not cfg.no_cache:
                 _cache_segment(cache, seg.cache_key, audio, sr)
         if first_sr is None:
@@ -448,6 +522,7 @@ def run(
                 "duration_ms": int(round(duration_s(audio, sr) * 1000)),
                 "cached": bool(gen_info.get("cached")),
                 "generate_ms": gen_info.get("generate_ms"),
+                "sampling_forwarded": gen_info.get("sampling_forwarded"),
             }
         )
 
@@ -574,19 +649,21 @@ def run(
         if qc_reference_voice:
             qc_store = VoiceStore(cfg.data_dir)
             validate_qc_reference_voice(qc_store, qc_reference_voice)
+            # Only a loaded local transformers Base engine may be reused for
+            # speaker embeddings; remote clients have no such capability.
             reusable = (
                 last_engine
                 if last_engine is not None
-                and last_engine.model is not None
+                and spec.name == "transformers"
+                and getattr(last_engine, "model", None) is not None
                 and last_engine.model_info.kind == "clone"
                 else None
             )
             if reusable is None and last_engine is not None:
-                last_engine.model = None
-                clear_model_cache()
+                _release_backend(last_engine, spec)
             qc_metrics["speaker_similarity"] = qc_speaker_similarity(
                 cfg,
-                models,
+                local_models,
                 qc_store,
                 qc_reference_voice,
                 full,
@@ -605,8 +682,23 @@ def run(
         )
 
     elapsed_ms = (time.perf_counter() - started) * 1000.0
-    runtime_dtype = (last_engine.dtype_name if last_engine else None) or plan.dtype_name
-    runtime_device = last_engine.device if last_engine else cfg.device
+    if spec.remote:
+        # Remote backends have no local dtype/device; never report a platform guess.
+        runtime_dtype = None
+        runtime_device = "remote"
+    else:
+        runtime_dtype = (
+            getattr(last_engine, "dtype_name", None) if last_engine else None
+        ) or plan.dtype_name
+        runtime_device = (
+            getattr(last_engine, "device", None) if last_engine else None
+        ) or cfg.device
+    backend_payload = {
+        "name": spec.name,
+        "model": plan.voice.model.model_id,
+        "remote": spec.remote,
+        "identity": spec.identity,
+    }
     recipe = build_recipe(
         qtts_version=__version__,
         text=plan.normalized_text,
@@ -620,7 +712,11 @@ def run(
             "id": plan.voice.model.model_id,
             "revision": plan.voice.model.revision,
             "fingerprint": plan.voice.model.fingerprint,
-            "dtype": runtime_dtype or resolve_dtype_name(cfg),
+            "dtype": (
+                None
+                if spec.remote
+                else (runtime_dtype or resolve_dtype_name(cfg))
+            ),
             "path": str(plan.voice.model.path),
         },
         sampling=plan.sampling,
@@ -646,6 +742,7 @@ def run(
             "model_load_ms": round(load_ms_total, 1),
             "generate_ms": round(sum(m.get("generate_ms") or 0.0 for m in segment_meta), 1),
         },
+        backend=backend_payload,
     )
     voices = []
     models_used = []
@@ -659,14 +756,7 @@ def run(
             voices.append(voice.to_dict())
         if voice.model.model_id not in seen_models:
             seen_models.add(voice.model.model_id)
-            models_used.append(
-                {
-                    "id": voice.model.model_id,
-                    "revision": voice.model.revision,
-                    "fingerprint": voice.model.fingerprint,
-                    "path": str(voice.model.path),
-                }
-            )
+            models_used.append(voice.model.to_dict())
     recipe["voices"] = voices
     recipe["models"] = models_used
     if plan.script_source:
@@ -699,8 +789,11 @@ def run(
         "segments": segment_meta,
         "sampling": plan.sampling,
         "cache": cache.stats.to_dict(),
+        "backend": backend_payload,
         "device": runtime_device or "cache",
-        "dtype": runtime_dtype or resolve_dtype_name(cfg),
+        "dtype": (
+            None if spec.remote else (runtime_dtype or resolve_dtype_name(cfg))
+        ),
         "timing": recipe["timing"],
         "recipe": recipe_target if recipe_target else None,
         "warnings": warnings,
@@ -722,6 +815,56 @@ def run(
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def _is_plugin_backend(spec) -> bool:
+    return spec.name not in BUILTIN_NAMES
+
+
+def _invoke_backend(spec, operation, callback, *args, **kwargs):
+    """Run one backend call; wrap unexpected plugin exceptions as model errors.
+
+    Built-in backends keep their existing error handling unchanged.
+    """
+    if not _is_plugin_backend(spec):
+        return callback(*args, **kwargs)
+    try:
+        return callback(*args, **kwargs)
+    except QttsError:
+        raise
+    except Exception as exc:
+        raise ModelError(
+            f"backend plugin {spec.name!r} {operation} failed: "
+            f"{type(exc).__name__}: {exc}",
+            details={"backend": spec.name, "operation": operation},
+        ) from exc
+
+
+def _release_backend(engine, spec) -> None:
+    """Release a backend; plugin release failures never break a good run."""
+    if not _is_plugin_backend(spec):
+        engine.release()
+        return
+    try:
+        engine.release()
+    except Exception:
+        return
+
+
+def _create_backend(spec, cfg, model):
+    """Create a backend instance, keeping ``TtsEngine`` patchable in tests."""
+    if spec.name == "transformers":
+        return TransformersBackend(cfg, model, engine=TtsEngine(cfg, model))
+    try:
+        return spec.create(cfg, model)
+    except QttsError:
+        raise
+    except Exception as exc:
+        raise ModelError(
+            f"backend {spec.name} create() failed: "
+            f"{type(exc).__name__}: {exc}",
+            details={"backend": spec.name},
+        ) from exc
+
+
 def _prepare_aligner(models, plan: GenerationPlan):
     """Select and validate the aligner before TTS weights load (codex P0-1)."""
     model = select_aligner(models)
@@ -780,6 +923,43 @@ def _recipe_target(recipe_arg, out_target: str, cfg, plan: GenerationPlan) -> Op
         json.dumps(request, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )[:32]
     return str(Path(cfg.data_dir) / "recipes" / f"{digest}.recipe.json")
+
+
+def _explicit_sampling_keys(plan: GenerationPlan) -> set[str]:
+    """Keys the caller actually asked for rather than plan defaults."""
+    requested: set[str] = set()
+    for key, value in plan.sampling.items():
+        if key == "max_new_tokens":
+            if int(value) != int(DEFAULT_MAX_NEW_TOKENS):
+                requested.add(key)
+        elif key not in SAMPLING_DEFAULTS or value != SAMPLING_DEFAULTS[key]:
+            requested.add(key)
+    for seg in plan.segments:
+        if (
+            seg.max_new_tokens is not None
+            and int(seg.max_new_tokens) != int(DEFAULT_MAX_NEW_TOKENS)
+        ):
+            requested.add("max_new_tokens")
+    return requested
+
+
+def _validate_sampling_capabilities(
+    plan: GenerationPlan, spec
+) -> frozenset[str]:
+    supported = frozenset(spec.capabilities.sampling)
+    unsupported = sorted(_explicit_sampling_keys(plan) - supported)
+    if unsupported:
+        supported_text = ", ".join(sorted(supported)) or "none"
+        raise CapabilityError(
+            f"backend {spec.name} does not support sampling option(s): "
+            f"{', '.join(unsupported)}; supported: {supported_text}",
+            details={
+                "backend": spec.name,
+                "unsupported": unsupported,
+                "supported": sorted(supported),
+            },
+        )
+    return supported
 
 
 def _estimate_memory(plan: GenerationPlan, with_aligner: bool) -> dict[str, Any]:
@@ -914,6 +1094,16 @@ def run_jsonl(cfg, args) -> dict[str, Any]:
     if getattr(args, "file", None) or getattr(args, "script", None):
         raise UsageError("--jsonl reads requests from stdin; --file/--script are not allowed")
 
+    # Resolve the backend once and fail fast on missing remote credentials
+    # before consuming stdin.  No runtime import, create or load happens here.
+    spec = resolve_backend(getattr(args, "backend", None), cfg, args)
+    if spec.configured is not None and not spec.configured():
+        raise ModelError(
+            f"backend {spec.name} is not configured; set its credentials or "
+            "choose another backend",
+            details={"backend": spec.name},
+        )
+
     out_dir_arg = getattr(args, "out_dir", None)
     if out_dir_arg == "-":
         raise UsageError("--out-dir cannot be '-'")
@@ -923,7 +1113,7 @@ def run_jsonl(cfg, args) -> dict[str, Any]:
     except OSError as exc:
         raise InputError(f"cannot create --out-dir {out_dir}: {exc}") from exc
 
-    engine_cache: dict[str, TtsEngine] = {}
+    engine_cache: dict[str, Any] = {}
     aligner_cache: dict[str, AlignerEngine] = {}
     seen_ids: set[str] = set()
     used_stems: dict[str, str] = {}
@@ -1065,6 +1255,8 @@ def run_jsonl(cfg, args) -> dict[str, Any]:
             max_new_tokens=getattr(args, "max_new_tokens", 2048),
             pause_ms=getattr(args, "pause_ms", 300),
             model=getattr(args, "model", None),
+            backend=getattr(args, "backend", None),
+            backend_model=getattr(args, "backend_model", None),
             lexicon=getattr(args, "lexicon", None),
             dry_run=False,
             yes=True,
@@ -1144,10 +1336,13 @@ def format_result(payload: dict[str, Any]) -> str:
             lines.extend(f"warning: {w}" for w in plan["warnings"])
         memory = payload.get("memory_estimate")
         if memory:
-            lines.append(
-                f"memory: ~{memory['estimated_peak_gb']}GB peak ({memory['risk']} risk), "
-                f"models={','.join(memory['models'])}"
-            )
+            if memory.get("remote"):
+                lines.append("memory: remote backend (not estimated locally)")
+            else:
+                lines.append(
+                    f"memory: ~{memory['estimated_peak_gb']}GB peak ({memory['risk']} risk), "
+                    f"models={','.join(memory['models'])}"
+                )
         if payload.get("will_write"):
             lines.append("will write: " + ", ".join(payload["will_write"]))
         lines.append("model loading skipped")

@@ -7,6 +7,7 @@ lives in :mod:`qtts_cli.postprocess`.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -27,6 +28,7 @@ from ..errors import (
     QttsError,
     UsageError,
 )
+from ..plugins import resolve_postprocess_plugin
 from ..postprocess import (
     LIMITER_ALGORITHM,
     POST_DSP_VERSION,
@@ -554,6 +556,7 @@ def _process_one(
     bit_depth: int,
     bitrate: str,
     ffmpeg: Optional[str],
+    plugin=None,
 ) -> dict[str, Any]:
     input_format = _input_format(source) or ""
     entry = _entry_shape(raw, target, input_format, fmt, bit_depth)
@@ -570,7 +573,7 @@ def _process_one(
     )
 
     output, output_sr, applied, before, after_dsp, warnings = process(
-        samples, input_sr, values
+        samples, input_sr, values, plugin=plugin
     )
     predicted_duration = float(output.shape[0]) / float(output_sr)
     entry["before"] = before
@@ -655,7 +658,68 @@ def _request(
     }
 
 
+def _reject_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _plugin_params(args) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    for item in getattr(args, "plugin_param", None) or []:
+        if "=" not in item:
+            raise UsageError(
+                f"invalid --plugin-param {item!r}; expected KEY=VALUE"
+            )
+        key, raw = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise UsageError(f"invalid --plugin-param {item!r}; empty key")
+        if key in params:
+            raise UsageError(f"duplicate --plugin-param key: {key!r}")
+        try:
+            value = json.loads(raw, parse_constant=_reject_constant)
+        except json.JSONDecodeError:
+            # Not JSON: keep the literal string (KEY=PATH etc.).
+            value = raw
+        except ValueError as exc:
+            # NaN/Infinity constants are not valid plugin values.
+            raise UsageError(
+                f"invalid --plugin-param {item!r}: {exc}"
+            ) from exc
+        _reject_non_finite(value, item)
+        params[key] = value
+    return params
+
+
+def _reject_non_finite(value, item) -> None:
+    """Reject NaN/±Inf anywhere in a JSON value (nested containers too)."""
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise UsageError(
+                f"invalid --plugin-param {item!r}: non-finite number"
+            )
+        return
+    if isinstance(value, dict):
+        for nested in value.values():
+            _reject_non_finite(nested, item)
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            _reject_non_finite(nested, item)
+
+
+def _resolve_plugin(args):
+    name = getattr(args, "plugin", None)
+    params = _plugin_params(args)
+    if name is None:
+        if params:
+            raise UsageError("--plugin-param requires --plugin")
+        return None, params
+    return resolve_postprocess_plugin(name), params
+
+
 def run(cfg, args) -> dict[str, Any]:
+    # Plugin parameters are pure arguments: reject them before touching any
+    # input file so a bad value cannot leave partial output behind.
+    plugin, plugin_params = _resolve_plugin(args)
     sources = _validate_inputs(args)
     has_out = args.out is not None
     has_dir = args.out_dir is not None
@@ -680,6 +744,7 @@ def run(cfg, args) -> dict[str, Any]:
     _validate_target_parents(targets)
 
     values = _option_values(args)
+    values["plugin_params"] = plugin_params
     bit_depth, bitrate = _validate_format_options(args, formats)
     ffmpeg = _preflight_ffmpeg(formats)
 
@@ -700,6 +765,7 @@ def run(cfg, args) -> dict[str, Any]:
                     bit_depth,
                     bitrate,
                     ffmpeg,
+                    plugin,
                 )
             )
             codes.append(0)

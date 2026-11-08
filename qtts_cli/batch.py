@@ -211,17 +211,35 @@ def prepare_jobs(
     model_override: Optional[str] = None,
     lexicon: Optional[Lexicon] = None,
     models: Optional[list] = None,
+    tts_models: Optional[list] = None,
     store: Optional[VoiceStore] = None,
+    backend_spec=None,
+    backend_model: Optional[str] = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], list]:
     """Parse, validate and compile every manifest line without loading weights."""
     requests, manifest_sha = read_manifest(manifest)
-    model_list = models if models is not None else scan(cfg.model_dir)
-    if not model_list:
-        raise ModelError(
-            "no local models found; pass --model-dir DIR or run `qtts models pull`",
-            details={"model_dir": str(cfg.model_dir) if cfg.model_dir else None},
-        )
+    # ``models`` keeps the historic local-model list (also used by tests);
+    # TTS planning uses the backend's models, while the aligner always uses
+    # what was scanned from the local model directory.
+    local_models = models if models is not None else scan(cfg.model_dir)
+    if tts_models is not None:
+        model_list = tts_models
+    else:
+        model_list = local_models
+        if not model_list:
+            raise ModelError(
+                "no local models found; pass --model-dir DIR or run `qtts models pull`",
+                details={"model_dir": str(cfg.model_dir) if cfg.model_dir else None},
+            )
     voice_store = store or VoiceStore(cfg.data_dir)
+    backend_identity = (
+        backend_spec.identity if backend_spec is not None else "transformers"
+    )
+    if backend_spec is not None:
+        from .backends.registry import preflight_voice_ref
+
+        for request in requests:
+            preflight_voice_ref(request["voice"], backend_spec)
     out_root = Path(out_dir).expanduser()
     used_paths: dict[str, str] = {}
     jobs: list[dict[str, Any]] = []
@@ -284,7 +302,29 @@ def prepare_jobs(
                 store=voice_store,
                 model_override=model_override,
                 lexicon=lexicon,
+                backend_identity=backend_identity,
+                require_clone_prompt=(
+                    backend_spec.require_clone_prompt
+                    if backend_spec is not None
+                    else True
+                ),
+                speaker_policy=(
+                    backend_spec.speaker_policy()
+                    if backend_spec is not None
+                    else "strict"
+                ),
             )
+            if backend_spec is not None:
+                from .backends.registry import run_preflight
+
+                run_preflight(
+                    plan,
+                    job_cfg,
+                    # Pure planning never needs credentials; the executing
+                    # say.run() re-checks them before create/load.
+                    SimpleNamespace(dry_run=True),
+                    backend_spec,
+                )
         except (InputError, CapabilityError) as exc:
             raise InputError(
                 f"manifest line {request['line']} ({request['id']}): {exc.message}",
@@ -298,7 +338,7 @@ def prepare_jobs(
         if subtitle_formats:
             from .commands.say import _prepare_aligner
 
-            _prepare_aligner(model_list, plan)
+            _prepare_aligner(local_models, plan)
         voice = plan.voice
         request_payload = {
             "id": request["id"],
@@ -324,6 +364,7 @@ def prepare_jobs(
                 },
                 "lexicon_sha256": plan.lexicon_sha256,
                 "output": canonical_out,
+                "backend": backend_identity,
             }
         )
         jobs.append(
@@ -334,6 +375,11 @@ def prepare_jobs(
                 "job_key": job_key,
                 "model": voice.model.model_id,
                 "voice_ref": voice.ref,
+                "backend": (
+                    backend_spec.name if backend_spec is not None else "transformers"
+                ),
+                "backend_model": backend_model,
+                "backend_identity": backend_identity,
                 "source_index": len(jobs),
                 "estimated_duration_s": round(plan.estimated_duration_s, 3),
             }
@@ -342,6 +388,11 @@ def prepare_jobs(
     plan_payload = {
         "schema_version": BATCH_SCHEMA_VERSION,
         "manifest_sha256": manifest_sha,
+        "backend": (
+            backend_spec.name if backend_spec is not None else "transformers"
+        ),
+        "backend_model": backend_model,
+        "backend_identity": backend_identity,
         "jobs": [
             {key: value for key, value in job.items() if key != "source_index"}
             for job in jobs
@@ -430,8 +481,19 @@ def _resume_state(job: dict[str, Any], existing: dict[str, Any]) -> str:
     return "done"
 
 
-def _record_args(job: dict[str, Any], cfg, model_override, lexicon) -> SimpleNamespace:
+def _record_args(
+    job: dict[str, Any],
+    cfg,
+    model_override,
+    lexicon,
+    backend: Optional[str] = None,
+    backend_model: Optional[str] = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
+        backend=backend if backend is not None else job.get("backend"),
+        backend_model=(
+            backend_model if backend_model is not None else job.get("backend_model")
+        ),
         text=job["text"],
         stdin=False,
         file=None,
@@ -479,11 +541,20 @@ def _execute_job(
     lexicon,
     engine_cache: dict,
     aligner_cache: dict,
+    backend: Optional[str] = None,
+    backend_model: Optional[str] = None,
 ) -> dict[str, Any]:
     from .commands.say import run as say_run
 
     _plan, job_cfg, _out_path, _fmt, _subs = plan_bundle
-    args = _record_args(job, cfg, model_override, lexicon)
+    args = _record_args(
+        job,
+        cfg,
+        model_override,
+        lexicon,
+        backend=backend,
+        backend_model=backend_model,
+    )
     attempts = 0
     last_error: Optional[dict[str, Any]] = None
     while attempts <= retry:
@@ -548,12 +619,54 @@ def run_batch(
     watch: bool = False,
     model_override: Optional[str] = None,
     lexicon: Optional[Lexicon] = None,
+    backend: Optional[str] = None,
+    backend_model: Optional[str] = None,
 ) -> dict[str, Any]:
     if jobs_count < 1:
         raise UsageError("--jobs must be >= 1")
     if retry < 0:
         raise UsageError("--retry must be >= 0")
     out_root = Path(out_dir).expanduser()
+    from .backends.registry import resolve_backend
+
+    backend_args = SimpleNamespace(
+        backend=backend,
+        backend_model=backend_model,
+        model=model_override,
+        dry_run=False,
+    )
+    spec = resolve_backend(backend, cfg, backend_args)
+    effective_backend_model = backend_model or getattr(cfg, "backend_model", None)
+    # A resume must not silently mix backends: check the existing plan before
+    # any mkdir/write so a mismatch leaves the directory byte-identical.
+    if out_root.is_dir():
+        previous_plan_path = out_root / "plan.json"
+        if previous_plan_path.is_file():
+            try:
+                previous_plan = read_json(previous_plan_path)
+            except (OSError, ValueError):
+                previous_plan = None
+            if isinstance(previous_plan, dict):
+                previous_identity = (
+                    previous_plan.get("backend_identity") or "transformers"
+                )
+                if previous_identity != spec.identity:
+                    raise UsageError(
+                        f"batch plan at {previous_plan_path} was created for backend "
+                        f"{previous_identity!r}, but this run uses {spec.identity!r}",
+                        details={
+                            "plan_backend": previous_identity,
+                            "backend": spec.identity,
+                        },
+                    )
+    # `batch plan` is metadata-only, but `batch run` must fail before any
+    # scheduling/write when the remote backend has no credentials.
+    if spec.configured is not None and not spec.configured():
+        raise ModelError(
+            f"backend {spec.name} is not configured; set its credentials or "
+            "choose another backend",
+            details={"backend": spec.name},
+        )
     try:
         out_root.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -564,6 +677,9 @@ def run_batch(
         out_dir=out_root,
         model_override=model_override,
         lexicon=lexicon,
+        tts_models=spec.models,
+        backend_spec=spec,
+        backend_model=effective_backend_model,
     )
     plan_path = write_plan(out_root, plan_payload)
     existing = _load_status(out_root) if resume else None
@@ -632,6 +748,8 @@ def run_batch(
                     lexicon=lexicon,
                     engine_cache=engine_cache,
                     aligner_cache=aligner_cache,
+                    backend=spec.name,
+                    backend_model=effective_backend_model,
                 )
                 futures[future] = job
             if not futures:

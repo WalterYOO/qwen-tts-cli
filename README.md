@@ -4,7 +4,7 @@
 
 > **原文是真值。** 字幕内容来自输入原文，ForcedAligner 只负责时间轴，ASR 只用于质检而不是改写内容。
 
-当前状态：**P1 已全部实现并发布 0.2.0；P2 Wave 1a 的音频后处理 `post` 与 Wave 1b 的 `bench` 已提交**。其余 P2 能力（serve、audiobook/dub、插件与后端抽象、微调）尚未实现，见[路线图](#路线图)。
+当前状态：**P1 已全部实现并发布 0.2.0；P2 Wave 1a/1b 的 `post`、`bench` 与 Wave 2 的可插拔后端/插件 SDK 已提交**。其余 P2 能力（serve、audiobook/dub、微调）尚未实现，见[路线图](#路线图)。
 
 ---
 
@@ -17,6 +17,7 @@
 - [快速开始](#快速开始)
 - [命令参考](#命令参考)
 - [音色引用](#音色引用)
+- [后端与插件](#后端与插件)
 - [输出与数据目录](#输出与数据目录)
 - [配置文件](#配置文件)
 - [退出码](#退出码)
@@ -103,6 +104,10 @@ qtts doctor
 pip install -e ".[hf]"          # 使用 Hugging Face 下载模型
 pip install -e ".[modelscope]"  # 使用 ModelScope 下载模型
 pip install -e ".[dev]"         # pytest
+
+# 可选后端（不装也能使用默认 transformers 后端）
+pip install "dashscope>=2.0.1"  # DashScope 实时 TTS
+pip install "vllm-omni"         # vLLM-Omni 离线 batch，仅 Linux + GPU
 ```
 
 如果 `pip check` 报 `qwen-tts requires transformers==4.57.3`，属于上述已知冲突；只要 `doctor` 与集成测试通过即可继续。
@@ -387,6 +392,7 @@ qtts say [TEXT | - | --file FILE | --script FILE | --stdin --jsonl]
   [--max-new-tokens N]
   [--pause-ms N]
   [--model MODEL]
+  [--backend transformers|dashscope|vllm-omni|PLUGIN] [--backend-model ID]
   [--takes N --select cer,speaker-sim,lufs] [--asr-model PATH|ID]
   [--qc] [--reference-voice NAME]
   [--max-clipping-ratio N] [--target-lufs N --lufs-tolerance N]
@@ -417,6 +423,7 @@ qtts say [TEXT | - | --file FILE | --script FILE | --stdin --jsonl]
 ```text
 qtts script lint FILE [--model MODEL] [--lexicon FILE.json]
 qtts script compile FILE -o PLAN.json [--model MODEL] [--lexicon FILE.json]
+  [--backend transformers|dashscope|vllm-omni|PLUGIN] [--backend-model ID]
 ```
 
 - 脚本 schema：`schema_version: 1`；`defaults` 支持 `voice/language/format/seed/max_new_tokens/pause_ms/instruct`；`segments[]` 支持 `id/text/role/voice/language/instruct/pause_after_ms/seed/max_new_tokens`。
@@ -428,9 +435,11 @@ qtts script compile FILE -o PLAN.json [--model MODEL] [--lexicon FILE.json]
 
 ```text
 qtts batch plan MANIFEST.jsonl --out-dir DIR [--model MODEL] [--lexicon FILE.json]
+  [--backend ...] [--backend-model ID]
 qtts batch run MANIFEST.jsonl --out-dir DIR
   [--jobs N] [--resume] [--retry N] [--fail-fast] [--watch]
   [--model MODEL] [--lexicon FILE.json]
+  [--backend ...] [--backend-model ID]
 ```
 
 - manifest 每行字段与 `say --stdin --jsonl` 对齐：`id`（唯一必填）、`text`、`voice`、`language`、`instruct`、`out`、`format`、`subtitle`、`seed`、`max_new_tokens`、`pause_ms`。默认输出为 `<out-dir>/<safe id>.<format>`。
@@ -496,6 +505,7 @@ qtts post INPUT [INPUT ...] (--out FILE | --out-dir DIR)
   [--format wav|flac|mp3|m4a] [--bitrate 192k] [--bit-depth 16|24]
   [--trim-silence] [--trim-threshold-dbfs -50] [--trim-min-silence-s 0.2]
   [--trim-padding-ms 50] [--trim-mode leading|trailing|both]
+  [--plugin NAME] [--plugin-param KEY=VALUE ...]
   [--dry-run] [--report FILE] [--json]
 ```
 
@@ -506,6 +516,16 @@ qtts post INPUT [INPUT ...] (--out FILE | --out-dir DIR)
 - `--lufs` 范围 [-70, 0]，`--true-peak` ≤ 0，`--sample-rate` 范围 [8000, 192000]；`--bit-depth` 只用于 wav/flac，`--bitrate` 只用于 mp3/m4a，trim 细项必须与 `--trim-silence` 同用，违反退出 2。静音且未请求响度/true-peak 时可透传；显式请求的指标不可用、或 trim 后为空时该文件退出 4。
 - 报告 `schema_version` 为 1，顶层含 `request`（含 `true_peak_ceiling_scope: "encoded"`）与 `files[]`；每项含 `input_format/output_format/codec/encoder/dsp_version`、`before/after_dsp/after_encoded`、`applied`（`gain_db/limiter_reduction_db/safety_attenuation_db/limiter_algorithm/encode_retries/encoder_margin_db`）与稳定 `warnings`。`--json` 与 `--report` 逐字节一致；进程 `exit_code` 不写入 canonical 文档。
 - `--dry-run` 仍做路径/碰撞/ffmpeg 预检和内存 DSP，但不创建目录、不编码、不写报告；`output` 为计划路径，`output_sha256` 与 `after_encoded` 为 `null`。`--report` 写失败退出 4，但已成功写出的音频保留，stdout/JSON 仍包含同一 `files[]` 并在顶层给出 `error`。
+- `--plugin NAME` 在重采样之后、响度增益之前运行已安装的 `qtts.postprocess` 插件；`--plugin-param KEY=VALUE` 可重复，值先按 JSON 解析，`NaN/Infinity` 与重复 key 退出 2。插件必须返回 `(samples, sr)` 且保持声道数、采样率与有限样本，时长变化限制在 0.5x–2.0x，否则该文件退出 4 且不写输出；插件抛异常退出 3。应用信息写入 `applied.postprocess_plugin`。
+
+### `qtts plugins`
+
+```text
+qtts plugins list [--strict] [--json]
+```
+
+- 只列出通过 entry point 发现的后端与后处理插件，不调用 `models()/create()/process()`，也不加载任何运行时。
+- 每个条目含 `kind/name/distribution/version/status/reason`；`status` 为 `ok`、`unsupported_api`、`broken`、`invalid` 或 `duplicate_name`。发现阶段的异常只产生 warning，列表仍退出 0；`--strict` 在任何插件不可用时退出 3。
 
 ### `qtts bench`
 
@@ -622,6 +642,72 @@ qtts doctor [--bench] [--json]
 检查 Python/torch/设备、ffmpeg/SoX、磁盘、模型完整性、依赖版本组合与钉版告警、能力矩阵。`--bench` 会真实加载模型并输出 RTF、加载耗时和峰值 RSS。
 
 ---
+
+## 后端与插件
+
+`say`、`script compile`、`batch plan/run` 都接受 `--backend` 与 `--backend-model`。默认后端是本地 `transformers`；后端身份（`backend.identity`）会写入 cache key、`batch` 的 `job_key`、recipe 与 JSON payload，因此同一模型/音色在不同后端之间不会错误复用缓存。
+
+| 后端 | `--backend-model` | 能力 | 运行时 |
+|---|---|---|---|
+| `transformers`（默认） | 不接受 | builtin / clone / design、instruct、全部 sampling | 本地 `qwen-tts` |
+| `dashscope` | 远程 model id，默认 `qwen3-tts-flash-realtime` | 仅 `builtin:`；不转发 instruct；无 sampling | `dashscope>=2.0.1` |
+| `vllm-omni` | 不接受（用 `--model` 选本地模型） | builtin / clone / design；clone 只需 `ref.wav` | Linux + GPU 的 `vllm-omni`，离线 batch |
+| 插件 | 插件自定义 | 由插件 `capabilities()` 声明 | 插件自行管理 |
+
+- `--model` 与 `--backend-model` 互斥；`transformers`/`vllm-omni` 拒绝 `--backend-model`，`dashscope` 与插件拒绝 `--model`，违反退出 2。`Config` 也支持文件级 `backend`/`backend_model`，CLI 显式值优先。
+- `dashscope` 读取 `DASHSCOPE_API_KEY`、可选的 `DASHSCOPE_WORKSPACE` 与 `DASHSCOPE_REGION`（默认 `cn-beijing`）。key 永不出现在 identity/报告；`--dry-run` 不要求 key 并输出 `backend.configured=false`，真实生成缺 key 退出 3，与 `--offline` 同用退出 2。`voice:`/`design:`/`--instruct` 在创建 client 前退出 4。`--takes`、`--qc --reference-voice` 与 `--select speaker-sim` 需要本地 `transformers` 后端，否则退出 2。
+- `vllm-omni` clone 从 `voice.json` 的 `source.ref_audio` 读取参考音频；路径 resolve 后必须仍在音色目录内，缺失/越界退出 4。ICL 模式还要求非空 `ref_text`。模块导入、`--dry-run` 与 `plugins list` 都不会 import `dashscope`/`vllm_omni`/`torch`/`qwen_tts`。
+- 本地 aligner、speaker-similarity QC 与 takes 始终使用 `--model-dir` 扫描到的本地模型，与 TTS 后端无关。远程后端的 payload/recipe 中 `device="remote"`、`dtype=null`。
+- `batch --resume` 会先读取已有 `plan.json`；`backend_identity` 与本次不同（旧 plan 无该字段视为 `transformers`）时在 `mkdir`/写文件前退出 2。
+
+### 插件
+
+插件只通过 Python entry point 发现，安装插件等于允许其代码在 qtts 进程中执行；qtts 自身不会主动安装或导入第三方运行时。API 版本必须为整数 `1`，名称必须是小写 `^[a-z][a-z0-9_-]{0,31}$`。
+
+```toml
+# pyproject.toml
+[project.entry-points."qtts.backends"]
+demo = "demo_qtts.backend:DemoBackend"
+
+[project.entry-points."qtts.postprocess"]
+denoise = "demo_qtts.postprocess:Denoise"
+```
+
+```python
+# demo_qtts/backend.py
+from pathlib import Path
+from qtts_cli.backends.base import BackendCapabilities
+from qtts_cli.catalog import ModelInfo
+
+class DemoBackend:
+    api_version = 1
+    name = "demo"
+    def capabilities(self):
+        return BackendCapabilities(
+            modes=frozenset({"builtin"}), instruct_modes=frozenset(),
+            sampling=frozenset(), remote=True,
+        )
+    def models(self, cfg, backend_model=None):
+        return [ModelInfo(path=Path("<demo:model>"), name="demo-model",
+                          model_type="qwen3_tts", kind="builtin",
+                          speakers=["Vivian"])]
+    def create(self, cfg, model):
+        return DemoBackendInstance(cfg, model)  # load/generate/release
+    # 可选: preflight(plan, cfg, args)
+```
+
+```python
+# demo_qtts/postprocess.py
+import numpy as np
+
+class Denoise:
+    api_version = 1
+    name = "denoise"
+    def process(self, samples, sr, params):
+        return np.asarray(samples, dtype=np.float32), sr
+```
+
+通过 `--backend demo --backend-model custom` 使用后端插件；后处理插件用 `post ... --plugin denoise --plugin-param strength=0.5`。后端插件 `models(cfg, backend_model=None)` 收到 `--backend-model` 原值；后处理插件在固定的 DSP 顺序中运行，返回结果会被严格校验。
 
 ## 音色引用
 
@@ -815,11 +901,11 @@ FR-P1-01 至 FR-P1-11 均已实现并在本地提交；P1 期间版本号保持 
 
 - 音频后处理 `post`（FR-P2-05，已提交：响度归一化、true-peak 限幅、重采样、声道转换、静音修剪与编码）
 - 可复现性能基准 `bench`（FR-P2-06，已提交：smoke/batch/longform、CER、speaker-sim、dry-run 与 canonical 报告）
+- 可插拔后端（FR-P2-02，已提交：transformers / DashScope / vLLM-Omni batch）
+- 插件 SDK（FR-P2-08，已提交：`qtts.backends` / `qtts.postprocess` entry points）
 - `serve` 与 OpenAI 兼容 `/v1/audio/speech`
-- 可插拔后端（DashScope / vLLM-Omni batch）
 - 有声书 / dub
 - 微调工作流包装
-- 插件 SDK
 
 ---
 

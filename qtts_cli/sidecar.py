@@ -35,6 +35,7 @@ def build_recipe(
     metrics: Optional[dict[str, Any]] = None,
     postprocess: Optional[dict[str, Any]] = None,
     timing: Optional[dict[str, Any]] = None,
+    backend: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     recipe: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -70,6 +71,8 @@ def build_recipe(
         "metrics": metrics or {},
         "timing": timing or {},
     }
+    if backend is not None:
+        recipe["backend"] = backend
     if device:
         recipe["device"] = device
     if subtitle is not None:

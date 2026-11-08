@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 try:  # PyYAML is a declared dependency; a broken env must not traceback (exit 3).
     import yaml
@@ -36,6 +36,9 @@ from .plan import (
     resolve_voice,
 )
 from .voice_store import VoiceStore
+
+if TYPE_CHECKING:  # avoids a plan <-> backends import cycle at runtime
+    from .backends.base import BackendSpec
 
 SCRIPT_SCHEMA_VERSION = 1
 MAX_SCRIPT_BYTES = 2_000_000
@@ -375,6 +378,10 @@ def compile_script(
     cli_max_new_tokens: Optional[int] = None,
     cli_pause_ms: Optional[int] = None,
     script_data: Optional[dict[str, Any]] = None,
+    backend_spec: Optional["BackendSpec"] = None,
+    backend_identity: Optional[str] = None,
+    require_clone_prompt: bool = True,
+    speaker_policy: str = "strict",
 ) -> GenerationPlan:
     """Validate a script and compile it without loading model weights."""
     data = script_data if script_data is not None else load_script(script_path)
@@ -413,8 +420,19 @@ def compile_script(
         role = spec["role"]
 
         try:
+            if backend_spec is not None:
+                from .backends.registry import preflight_voice_ref
+
+                preflight_voice_ref(voice_ref, backend_spec)
             parsed = parse_voice_ref(voice_ref)
-            natural = resolve_voice(model_list, store, parsed)
+            natural = resolve_voice(
+                model_list,
+                store,
+                parsed,
+                backend_identity=backend_identity,
+                require_clone_prompt=require_clone_prompt,
+                speaker_policy=speaker_policy,
+            )
             natural_models.add(natural.model.model_id)
             if model_override and len(natural_models) > 1:
                 raise UsageError(
@@ -423,7 +441,15 @@ def compile_script(
                     details={"models": sorted(natural_models)},
                 )
             voice = (
-                resolve_voice(model_list, store, parsed, model_override=model_override)
+                resolve_voice(
+                    model_list,
+                    store,
+                    parsed,
+                    model_override=model_override,
+                    backend_identity=backend_identity,
+                    require_clone_prompt=require_clone_prompt,
+                    speaker_policy=speaker_policy,
+                )
                 if model_override
                 else natural
             )
@@ -454,6 +480,7 @@ def compile_script(
                 },
             ) from exc
 
+        warnings.extend(voice.warnings)
         if default_voice_resolution is None:
             default_voice_resolution = voice
         display_text, pieces, segment_warnings, leading, trailing = prepare_text_pieces(

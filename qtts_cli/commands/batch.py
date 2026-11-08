@@ -13,25 +13,34 @@ from ..batch import (
     write_status,
 )
 from ..batch import format_result as _format_batch
+from ..backends.registry import resolve_backend
 from ..lexicon import Lexicon
 
 
 def plan(cfg, args) -> dict[str, Any]:
     out_dir = Path(args.out_dir).expanduser()
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        from ..errors import InputError
-
-        raise InputError(f"cannot create --out-dir {out_dir}: {exc}") from exc
     lexicon = Lexicon.load(getattr(args, "lexicon", None))
+    spec = resolve_backend(getattr(args, "backend", None), cfg, args)
+    effective_backend_model = (
+        getattr(args, "backend_model", None) or getattr(cfg, "backend_model", None)
+    )
     jobs, payload, _plans = prepare_jobs(
         cfg,
         args.manifest,
         out_dir=out_dir,
         model_override=getattr(args, "model", None),
         lexicon=lexicon,
+        tts_models=spec.models,
+        backend_spec=spec,
+        backend_model=effective_backend_model,
     )
+    # Only a fully valid plan creates its --out-dir (no side effects on errors).
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        from ..errors import InputError
+
+        raise InputError(f"cannot create --out-dir {out_dir}: {exc}") from exc
     plan_path = write_plan(out_dir, payload)
     state = {job["id"]: _status_record(job) for job in jobs}
     status_path = write_status(out_dir, jobs, state)
@@ -42,6 +51,11 @@ def plan(cfg, args) -> dict[str, Any]:
         "status": str(status_path),
         "models": sorted({job["model"] for job in jobs}),
         "voices": sorted({job["voice_ref"] for job in jobs}),
+        "backend": {
+            "name": spec.name,
+            "remote": spec.remote,
+            "identity": spec.identity,
+        },
     }
 
 
@@ -58,6 +72,11 @@ def run(cfg, args) -> dict[str, Any]:
         watch=args.watch,
         model_override=getattr(args, "model", None),
         lexicon=lexicon,
+        backend=getattr(args, "backend", None),
+        backend_model=(
+            getattr(args, "backend_model", None)
+            or getattr(cfg, "backend_model", None)
+        ),
     )
 
 
