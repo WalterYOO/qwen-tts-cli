@@ -358,6 +358,26 @@ takes/<job_id>/take-01.recipe.json
 
 `job_id` 由规范化请求哈希得到（`tk_` + 16 位十六进制）。请求完全一致时直接复用已完成的 job；仅评分失败时只重试评分，不重新生成音频。`job.json` 损坏或缺文件时旧目录被隔离为 `.damaged-*` 后重建；重建期间生成失败会把隔离目录恢复回原位。`takes list/compare` 在输出前校验每个 take 的音频 sha256 与 recipe 身份/哈希，任何损坏退出 4 且不输出成功 payload。`takes list/compare/promote` 都不加载模型；`promote` 只复制所选 take 的原始字节，不转码，因此目标后缀必须与 job 格式一致。`promote` 也是 `scoring_failed` job 的人工转正路径：先校验音频与 recipe，再把状态改为 `complete` 并写入 selected，最后才落盘；任一步失败不会留下半写的目标文件。`--out`、`--recipe-out` 与字幕前缀不得覆盖 `job.json`、任一 take 音频或 recipe。`--takes` 与 `--stdin --jsonl`、`--jsonl` 和 batch 清单互斥（退出 2）。
 
+### 14. 有声书
+
+```bash
+# 从项目文件构建整本有声书（默认输出 build/<project>.wav）
+qtts audiobook build book.yaml
+
+# M4B（AAC + 章节元数据）、逐章响度归一化、背景音乐
+qtts audiobook build book.yaml --out-dir build --m4b --lufs -18 \
+  --bgm music.ogg --ducking-db -12
+
+# 只校验与打印计划：不加载模型、不创建目录、不写文件
+qtts audiobook build book.yaml --dry-run --json
+```
+
+项目文件接受 YAML/JSON，严格拒绝未知字段、重复键、alias/anchor 与多文档；`chapters[]` 每章必须且只能有一个 `source`（项目相对或绝对 UTF-8 文件）或 `text`。段落按空行切分，Markdown 不解释。`--title/--author/--album/--voice/--bgm`、暂停、采样率与响度均可覆盖项目值。
+
+每个段落独立合成并写入 `<out-dir>/segments/<chapter>-<paragraph>.wav` 与原子 sidecar；指纹只覆盖合成输入（文本、音色身份与 clone 参考音频哈希、模型文件、后端身份、有效 device/dtype、语言、instruct、采样参数、seed、归一化版本），因此改采样率、暂停、BGM 或输出格式不会重新合成。`--force`/`--no-cache` 绕过复用；损坏的缓存 WAV/sidecar 视为 miss 并自动重生成（不是错误）。
+
+BGM 以书本第 0 个采样为相位锚点循环，20 ms 帧、-35 dB 阈值、0.05/0.30 s attack/release 的单极点包络进行 ducking，仅在书本首尾淡入淡出。启用响度时逐章归一化并在编码前校验 true peak；m4a/m4b/mp3 编码后再解码测一次并写入 manifest。发布采用 journal（`prepared` → `published`），旧 final/manifest 独立备份与回滚；下一次构建会自动恢复被中断的事务。SIGINT/SIGTERM 在提交点之前回滚并以 130 退出，提交点之后保留完整新文件并打印 `interrupted after publish`。
+
 ---
 
 ## HTTP 服务
@@ -532,6 +552,27 @@ qtts batch run MANIFEST.jsonl --out-dir DIR
 - `run` 复用单条 `say` 执行器与错误结构；默认 `--jobs 1`。任务按模型/音色/语言/估算时长分桶排序，调度可并发，但模型推理由全局锁串行（MPS 同样只保留一个模型槽）。状态为 `pending/running/done/failed/skipped`，由单线程调度器原子重写；`job_key` 包含 `lexicon_sha256`。
 - `--resume` 要求 `status=done`、`job_key` 相同、输出存在且 sha256 匹配、recipe 存在且其 `job_key` 匹配；`running` 恢复为 `pending`，`skipped` 下次重新调度。`--retry N` 只重试执行期 transient 失败（ModelError/OSError/RuntimeError），普通异常立即失败；status 记录 `attempts`、`last_error` 与 `transient`，`--resume --retry` 只重新调度 `transient=true` 的失败；`--fail-fast` 只停止调度新任务，未启动项标 `skipped`。
 - 进度与 `--watch` 只写 stderr；stdout 只有最终 summary（`--json` 为单个对象）。任一任务失败退出 6。
+
+### `qtts audiobook`
+
+```text
+qtts audiobook build PROJECT.yaml|PROJECT.json
+  [--out FILE | --out-dir DIR]
+  [--format wav|flac|m4a|m4b|mp3] [--m4b] [--bitrate KBPS]
+  [--title TEXT] [--author TEXT] [--album TEXT]
+  [--voice REF] [--model ID]
+  [--bgm FILE] [--bgm-volume-db DB] [--ducking-db DB] [--bgm-fade-ms MS]
+  [--lufs DB | --no-loudness] [--true-peak DB]
+  [--paragraph-pause-ms MS] [--chapter-pause-ms MS]
+  [--sample-rate HZ] [--keep-stems] [--force]
+  [--dry-run] [--json] [--quiet]
+```
+
+- `--out` 的扩展名决定格式；无扩展名时按 `--format`（默认 wav）补齐。`--out` 与 `--out-dir` 互斥；`--out -` 退出 2。
+- `--bitrate` 仅用于 m4a/m4b/mp3（32–320；AAC 默认 128，MP3 默认 192）。m4a/m4b/mp3 需要 ffmpeg 与对应编码器，缺失退出 3。
+- 响度默认对 m4a/m4b/mp3 与含 BGM 的项目启用，wav/flac 默认关闭；`--lufs` 开启、`--no-loudness` 关闭，二者互斥。`--true-peak` 需要响度归一化。
+- manifest 写到 `<out-dir>/<project-stem>.json`；输出已存在时需 `--force`。`--keep-stems` 保留 `segments/`、`chapters/` 与 `recipes/` 以便下次复用。
+- 用法与参数冲突退出 2；项目/输入/BGM/路径/锁错误退出 4；模型、后端、ffmpeg 或编码失败退出 3；取消退出 130。
 
 ### `qtts takes`
 

@@ -109,6 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     # -- say ---------------------------------------------------------------- #
     from .commands import align as align_cmd
     from .commands import batch as batch_cmd
+    from .commands import audiobook as audiobook_cmd
     from .commands import bench as bench_cmd
     from .commands import check as check_cmd
     from .commands import doctor as doctor_cmd
@@ -537,6 +538,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(serve, suppress=True)
     _add_backend_flags(serve)
     serve_cmd.add_arguments(serve)
+
+    # -- audiobook ---------------------------------------------------------- #
+    audiobook = sub.add_parser("audiobook", help="build audiobooks from projects")
+    audiobook_sub = audiobook.add_subparsers(dest="audiobook_command", required=True)
+    audiobook_build = audiobook_sub.add_parser("build", help="build one audiobook")
+    _add_common(audiobook_build, suppress=True)
+    _add_backend_flags(audiobook_build)
+    audiobook_cmd.add_arguments(audiobook_build)
 
     # -- takes -------------------------------------------------------------- #
     takes = sub.add_parser("takes", help="inspect and promote multi-take assets")
