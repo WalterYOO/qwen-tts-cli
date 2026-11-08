@@ -113,6 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     from .commands import bench as bench_cmd
     from .commands import check as check_cmd
     from .commands import doctor as doctor_cmd
+    from .commands import dub as dub_cmd
     from .commands import models as models_cmd
     from .commands import plugins as plugins_cmd
     from .commands import post as post_cmd
@@ -546,6 +547,14 @@ def build_parser() -> argparse.ArgumentParser:
     _add_common(audiobook_build, suppress=True)
     _add_backend_flags(audiobook_build)
     audiobook_cmd.add_arguments(audiobook_build)
+
+    # -- dub ---------------------------------------------------------------- #
+    dub = sub.add_parser("dub", help="dub video from SRT/EDL timelines")
+    dub_sub = dub.add_subparsers(dest="dub_command", required=True)
+    dub_build = dub_sub.add_parser("build", help="build one dub")
+    _add_common(dub_build, suppress=True)
+    _add_backend_flags(dub_build)
+    dub_cmd.add_arguments(dub_build)
 
     # -- takes -------------------------------------------------------------- #
     takes = sub.add_parser("takes", help="inspect and promote multi-take assets")

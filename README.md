@@ -4,7 +4,7 @@
 
 > **原文是真值。** 字幕内容来自输入原文，ForcedAligner 只负责时间轴，ASR 只用于质检而不是改写内容。
 
-当前状态：**P1 已全部实现并发布 0.2.0；P2 Wave 1a/1b 的 `post`、`bench` 与 Wave 2 的可插拔后端/插件 SDK 已提交**。其余 P2 能力（serve、audiobook/dub、微调）尚未实现，见[路线图](#路线图)。
+当前状态：**P1 已全部实现并发布 0.2.0；P2 的 `post`、`bench`、可插拔后端/插件 SDK、`serve`、`audiobook` 与 `dub` 已实现**。微调工作流尚未实现，见[路线图](#路线图)。
 
 ---
 
@@ -49,6 +49,7 @@
 | **ASR 质检** | `check AUDIO` 用 Qwen3-ASR 转写，按语言自动选 CER/WER，输出编辑距离、错误片段与可选阈值门禁 |
 | **音频 QC** | `qc AUDIO` 测量响度（BS.1770 LUFS）、true peak、削波、DC、静音与语速；阈值全部可选，`say --qc` 复用同一实现 |
 | **音频后处理** | `post` 完成静音修剪、声道转换、重采样、响度归一化、`lookahead-min-4x` true-peak 限幅与 wav/flac/mp3/m4a 编码，最终 true peak 以发布文件解码测量为准 |
+| **视频配音** | `dub build` 解析 SRT/CMX3600 子集 EDL，逐句合成、按帧放置、静音补齐与 `atempo` 时长适配；支持逐角色音色/stems、视频背景 bed、mux、响度与 true-peak |
 | **自动参考文本** | `voice add --kind clone --auto-ref-text` 用 ASR 转写参考音频，作为 ICL 的 `ref_text` 并记录来源与模型 |
 | **音色归档** | `voice export/import` 单文件 `.qttsvoice`，白名单成员、流式校验、原子替换 |
 | **项目锁文件** | `project init/lock` 固定模型全量 sha256、音色、采样参数、字幕策略与运行时版本 |
@@ -378,6 +379,33 @@ qtts audiobook build book.yaml --dry-run --json
 
 BGM 以书本第 0 个采样为相位锚点循环，20 ms 帧、-35 dB 阈值、0.05/0.30 s attack/release 的单极点包络进行 ducking，仅在书本首尾淡入淡出。启用响度时逐章归一化并在编码前校验 true peak；m4a/m4b/mp3 编码后再解码测一次并写入 manifest。发布采用 journal（`prepared` → `published`），旧 final/manifest 独立备份与回滚；下一次构建会自动恢复被中断的事务。SIGINT/SIGTERM 在提交点之前回滚并以 130 退出，提交点之后保留完整新文件并打印 `interrupted after publish`。
 
+### 15. 视频配音（dub）
+
+```bash
+# 用 SRT/EDL 时间轴把每句台词合成到对应位置（输出 dub.wav + dub.dub.json）
+qtts dub build subtitles.srt --voice builtin:Vivian --out dub.wav
+
+# 项目文件定义默认音色、语言、响度与逐角色音色；EDL 指定 25 fps
+qtts dub build timeline.edl --project dub.yaml --fps 25 --out out.flac
+
+# 以视频音轨作为背景 bed（可选），并按视频时长裁剪；同时导出每个角色的 stem
+qtts dub build subs.srt --project dub.yaml --video movie.mp4 --bed-db -12 \
+  --stems-out stems --out dub.wav
+
+# 只校验输入、音色与时间轴：不加载模型、不建目录、不写文件
+qtts dub build subs.srt --project dub.yaml --dry-run --json
+```
+
+时间轴支持严格的 SRT 与 CMX3600 子集 EDL（`NNN REEL TRACK TYPE ...`，仅 `C` 事件、轨道含 `V`，`* SPEAKER`/`* TEXT` 注释；非 drop-frame；`--fps` 默认 25）。SRT 以空行或只含空白的行分隔 cue，每个 block 必须恰好是索引行、时间行和非空文本；缺时间行、空文本、文本中出现另一条时间行、文本行只有一个正整数（通常是漏了分隔符的下一索引）或末尾悬空索引都退出 4。SRT/EDL 的 cue 按半开区间 `[start, end)` 放置；cue 文本可写 `speaker: text`，音色优先级为 `--speaker-voice` → 项目 `speakers` → `--voice` → 项目 `voice`，未映射的说话人必须有默认音色，否则退出 4。`--language` 作用于每个 cue，优先级为 CLI → 项目 `language` → `auto`；`--instruct` 是全局默认值（CLI → 项目顶层 `instruct`），但项目 `speakers.<name>.instruct` 仍优先于该说话人的 CLI 全局 instruct。三者的生效值都进入 fingerprint、dry-run payload、`voices` 与 manifest/`timeline.json`。`__anonymous__` 是无 speaker cue 的保留键，出现在时间轴 speaker 名中一律退出 4，无论是否请求 stems。
+
+每句独立合成并缓存到 `<out-stem>.dub-work/cues/`。指纹只覆盖合成输入（文本、音色身份与 clone 参考音频哈希、模型文件、后端身份、有效 device/dtype、语言、instruct、采样参数、seed、归一化版本），改采样率、拉伸上下限或输出格式不会重新合成；损坏的缓存 WAV/sidecar 视为 miss。`--force` 同时覆盖输出并刷新缓存；`--no-cache` 跳过缓存读取、强制重新合成但仍写入新的 cue WAV/sidecar；`--keep-work` 保留中间文件。
+
+时长适配先按 `目标帧 / 渲染帧` 求速度比，再夹到 `--min-speed`（默认 0.85）与 `--max-speed`（默认 1.25）；仅在速度与 1 的差超过 0.005 时调用一次 `ffmpeg atempo`，随后精确重采样到目标帧并在尾部补静音。渲染仍超出目标帧时按 `--overflow warn|fail` 处理：`warn`（默认）保留音频并给出 warning，`fail` 在发布任何输出前以退出码 5 失败。提供 `--video` 时混音长度等于视频时长，超出视频尾部的 cue 走同一 overflow 策略（warn 截断）。
+
+`--bed-db` 是显式 opt-in，必须同时给 `--video`；视频音轨以指定增益混入，缺失音轨退出 4。默认启用响度归一化（`--lufs -18 --true-peak -1.5`），`--no-loudness` 关闭限幅但仍测量实际 true peak 并记录 warning。输出为 wav/flac（soundfile）或 m4a/mp3（ffmpeg），`--mux` 额外写出 `<out-stem>.mp4`。manifest 写到 `<out-stem>.dub.json`；`--stems-out` 还写 `timeline.json` 与每个说话人的 WAV。stems 按 speaker 排序逐个物化并立即写盘释放，峰值内存保持 master + 一个 stem（+ 当前读回的 cue），不随说话人数量线性增长。已存在的空 stems 目录无需 `--force` 即可使用，但目录中已存在的 stem 文件或 `timeline.json` 仍会退出 4（除非 `--force`）。输出写入、read-back 哈希或 manifest/timeline.json 写入失败均按模型/IO 失败退出 3。
+
+发布采用固定顺序：最终音频 → stems 与 `timeline.json` → mux 的 mp4 → manifest 最后。每个文件都先写 UUID 临时文件再原子替换，但**没有跨文件 journal**：这是逐文件原子性，不是整组事务。SIGINT/SIGTERM 在第一次替换前会清理临时文件并让命令以 130 退出；第一次替换成功后信号被推迟到整组发布完成，然后打印 `interrupted after publish` 并以 130 退出。若进程被 SIGKILL 或机器掉电中断在多次替换之间，磁盘上可能留下新旧混合的一组文件；重跑同一命令（必要时 `--force`）即可重建。用法错误退出 2，输入/路径/时间轴/锁错误退出 4，模型/后端/ffmpeg/DSP 失败退出 3，overflow fail 退出 5。
+
 ---
 
 ## HTTP 服务
@@ -573,6 +601,32 @@ qtts audiobook build PROJECT.yaml|PROJECT.json
 - 响度默认对 m4a/m4b/mp3 与含 BGM 的项目启用，wav/flac 默认关闭；`--lufs` 开启、`--no-loudness` 关闭，二者互斥。`--true-peak` 需要响度归一化。
 - manifest 写到 `<out-dir>/<project-stem>.json`；输出已存在时需 `--force`。`--keep-stems` 保留 `segments/`、`chapters/` 与 `recipes/` 以便下次复用。
 - 用法与参数冲突退出 2；项目/输入/BGM/路径/锁错误退出 4；模型、后端、ffmpeg 或编码失败退出 3；取消退出 130。
+
+### `qtts dub`
+
+```text
+qtts dub build TIMELINE.srt|TIMELINE.edl
+  --out FILE [--format wav|flac|m4a|mp3]
+  [--voice REF] [--speaker-voice SPEAKER=REF ...] [--project FILE]
+  [--language LANG] [--instruct TEXT]
+  [--video FILE] [--bed-db DB] [--mux]
+  [--stems-out DIR]
+  [--fps N] [--sample-rate HZ]
+  [--min-speed N] [--max-speed N] [--overflow warn|fail]
+  [--lufs DB | --no-loudness] [--true-peak DB]
+  [--model ID] [--keep-work] [--force] [--dry-run] [--json] [--quiet]
+```
+
+- `--out` 省略时为 `dub.wav`；无后缀按 `--format` 补齐；后缀与 `--format` 一致，`--out -` 退出 2。manifest 为 `<out-stem>.dub.json`。
+- 时间轴必须是 `.srt` 或 `.edl`；EDL 用 `--fps`（1–120，默认 25）。对象、路径、时间轴与锁错误退出 4；参数冲突/超范围退出 2。
+- 音色优先级：`--speaker-voice`（malformed 退出 2）→ 项目 `speakers` → `--voice` → 项目 `voice`；引用本身无效退出 4。未映射且无默认音色的说话人退出 4。
+- `--language` 覆盖项目 `language`（默认 `auto`），作用于所有 cue；`--instruct` 覆盖项目顶层 `instruct`，但项目逐 speaker 的 `instruct` 仍优先。两者都参与合成与缓存指纹。
+- `__anonymous__` 是保留 speaker 名，出现在时间轴中退出 4。已存在的 stems 目录可直接复用；已存在的 stem 文件或 `timeline.json` 需要 `--force` 才能覆盖。
+- `--bed-db`（-40..0）必须与 `--video` 同时使用；`--mux` 也要求 `--video` 且视频含视频流。
+- 采样率 12000–48000；`--min-speed` 与 `--max-speed` 均在 0.5–2.0 且必须 min < max；`--lufs` -40..-5、`--true-peak` -9..0。
+- 默认响度开启；`--lufs`/`--no-loudness` 互斥。wav/flac 用 soundfile，m4a/mp3 需要 ffmpeg；任意 atempo 拉伸、mux 或 bed 也需要 ffmpeg，缺失退出 3。
+- `--dry-run` 不加载模型、不建目录、不取锁，返回计划、cue 与解析后的音色/fingerprint（device 为 auto 时 fingerprint 为 null）。`--force` 覆盖已有输出并刷新缓存；`--keep-work` 保留 `<out-stem>.dub-work/`。
+- 输出存在且未给 `--force` 退出 4；发布顺序、逐文件原子性与 SIGKILL 说明见[视频配音](#15-视频配音dub)。输出写入/回读哈希/manifest 写入失败退出 3，时间轴 block 结构非法退出 4。
 
 ### `qtts takes`
 
@@ -1045,8 +1099,8 @@ FR-P1-01 至 FR-P1-11 均已实现并在本地提交；P1 期间版本号保持 
 - 可复现性能基准 `bench`（FR-P2-06，已提交：smoke/batch/longform、CER、speaker-sim、dry-run 与 canonical 报告）
 - 可插拔后端（FR-P2-02，已提交：transformers / DashScope / vLLM-Omni batch）
 - 插件 SDK（FR-P2-08，已提交：`qtts.backends` / `qtts.postprocess` entry points）
-- `serve` 与 OpenAI 兼容 `/v1/audio/speech`
-- 有声书 / dub
+- `serve` 与 OpenAI 兼容 `/v1/audio/speech`（已提交）
+- 有声书（已提交）与视频配音 `dub`（已实现）
 - 微调工作流包装
 
 ---
