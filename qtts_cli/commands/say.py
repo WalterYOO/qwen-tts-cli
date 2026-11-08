@@ -39,7 +39,14 @@ from ..backends.transformers import TransformersBackend
 from ..tts_engine import TtsEngine
 from ..cache import AudioCache
 from ..catalog import language_supported, scan, select_aligner
-from ..errors import CapabilityError, InputError, ModelError, QttsError, UsageError
+from ..errors import (
+    CancelledError,
+    CapabilityError,
+    InputError,
+    ModelError,
+    QttsError,
+    UsageError,
+)
 from ..lexicon import Lexicon, MapBlock, spoken_items_to_display
 from ..plan import (
     DEFAULT_PAUSE_MS,
@@ -115,12 +122,18 @@ def read_input(args) -> tuple[str, str]:
 # --------------------------------------------------------------------------- #
 # Run
 # --------------------------------------------------------------------------- #
+def _check_cancel(cancel_check) -> None:
+    if cancel_check is not None and cancel_check():
+        raise CancelledError("cancelled")
+
+
 def run(
     cfg,
     args,
     *,
     engine_cache: Optional[dict[str, Any]] = None,
     aligner_cache: Optional[dict[str, AlignerEngine]] = None,
+    cancel_check=None,
 ) -> dict[str, Any]:
     takes_spec = takes_request(args)
     if takes_spec and getattr(args, "jsonl", False):
@@ -302,6 +315,7 @@ def run(
     # Only keys the backend actually forwards may reach generate(); an
     # explicitly requested unsupported knob is a capability error before load.
     supported_sampling = _validate_sampling_capabilities(plan, spec)
+    _check_cancel(cancel_check)
 
     # Subtitle prerequisites are checked here, before TTS weights load (P0-1).
     aligner_model = _prepare_aligner(local_models, plan) if subtitle_formats else None
@@ -399,6 +413,7 @@ def run(
     need_model = cfg.no_cache or any(
         not cache.exists(seg.cache_key, "wav") for seg in plan.segments
     )
+    _check_cancel(cancel_check)
     engine_slot: dict[str, Any] = (
         engine_cache if engine_cache is not None else {}
     )
@@ -468,6 +483,7 @@ def run(
     first_sr: Optional[int] = None
 
     for seg in plan.segments:
+        _check_cancel(cancel_check)
         voice = seg.voice or plan.voice
         cached_path = None if cfg.no_cache else cache.lookup(seg.cache_key, "wav")
         if cached_path is not None:
@@ -625,12 +641,14 @@ def run(
                 f"subtitle QC warning: {violation.message} (cue {violation.cue})"
             )
         if qc_report.ok:
+            _check_cancel(cancel_check)
             subtitle_files = _write_subtitles(cues, subtitle_formats, sub_prefix, plan, out_target)
         else:
             # t10 contract: never write failing subtitles. Audio and recipe are
             # kept as an audit trail; the command still exits 5.
             qc_failure = qc_report
 
+    _check_cancel(cancel_check)
     if out_target == "-":
         write_audio_stdout(full, sample_rate, fmt)
     else:
@@ -767,6 +785,7 @@ def run(
         recipe["subtitle_qc"] = qc_report.to_dict()
     if qc_result is not None:
         recipe["qc"] = qc_result
+    _check_cancel(cancel_check)
     if recipe_target == "-":
         emit_json(recipe)
     elif recipe_target is not None:

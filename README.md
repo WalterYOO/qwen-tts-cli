@@ -15,6 +15,7 @@
 - [安装](#安装)
 - [模型准备](#模型准备)
 - [快速开始](#快速开始)
+- [HTTP 服务](#http-服务)
 - [命令参考](#命令参考)
 - [音色引用](#音色引用)
 - [后端与插件](#后端与插件)
@@ -359,6 +360,90 @@ takes/<job_id>/take-01.recipe.json
 
 ---
 
+## HTTP 服务
+
+`qtts serve` 启动一个只用 Python 标准库实现的本地 TTS 服务，同时提供原生 JSON API 和 OpenAI 兼容端点。导入 `qtts_cli.serve` 不会加载 torch/qwen_tts/dashscope/vllm，启动阶段也只解析后端元数据，不加载权重。
+
+### 启动
+
+```bash
+# 只监听回环地址，端口由系统分配；stdout 恰好输出一行 compact JSON
+qtts serve --port 0 --json
+
+# 固定端口，同时启用两套 API（默认 both）
+qtts serve --host 127.0.0.1 --port 8000
+
+# 只解析后端与模型，不绑定端口、不加载模型
+qtts serve --dry-run --json
+```
+
+非 `--json` 启动行形如：
+
+```text
+qtts serve listening on http://127.0.0.1:8000 (api=both, backend=transformers)
+```
+
+`--port 0` 时启动行给出实际端口。`--json` 启动对象包含 `host/port/api/backend/allowed_hosts/max_concurrency/effective_max_concurrency/queue_size/max_connections`。本地 backend 的 `effective_max_concurrency` 恒为 1，即使传入更大的 `--max-concurrency`；远程 backend 使用该值作为 worker 数。
+
+### 原生 API
+
+```bash
+# 提交作业（默认格式 wav，可请求 srt/vtt/ass/json 字幕）
+curl -sS http://127.0.0.1:8000/v1/jobs \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"你好，世界。","voice":"builtin:Vivian","subtitle":["srt"]}'
+
+# 轮询状态，再下载音频与字幕
+curl -sS http://127.0.0.1:8000/v1/jobs/job_…
+curl -sS -o hello.wav http://127.0.0.1:8000/v1/jobs/job_…/audio
+curl -sS http://127.0.0.1:8000/v1/jobs/job_…/subtitles/srt
+
+# 列表、过滤与取消
+curl -sS 'http://127.0.0.1:8000/v1/jobs?status=queued,running&limit=20'
+curl -sS -X DELETE http://127.0.0.1:8000/v1/jobs/job_…
+```
+
+状态为 `queued/running/cancel_requested/done/failed/cancelled`；内部等锁状态对 API 显示为 `queued`，`/health` 的 `queued` 计数包含它，`running` 不包含。`DELETE` 对排队作业立即返回 200 并置 `cancelled`，对运行中作业返回 202 并置 `cancel_requested`，终态返回 409。音频/字幕下载对未完成作业返回 409，对失败/取消/已清理作业返回 404。
+
+请求校验在创建作业前完成：未知字段、错误类型/范围、非法 JSON、重复 key、`NaN`/`Infinity`、错误的 `Content-Length`/`Transfer-Encoding`/`Content-Type` 都会返回 4xx。`text` 上限 200000 字符，`instruct` 上限 20000，`metadata` 规范化后上限 4096 字节且顶层最多 64 键，请求体上限由 `--max-body-bytes` 控制（默认 1 MiB）。`queue_size > 0` 时队列满返回 429 + `Retry-After: 1`；`queue_size == 0` 时只有空闲 worker 才直接接收，否则同样 429。
+
+### OpenAI 兼容 API
+
+```bash
+curl -sS http://127.0.0.1:8000/v1/audio/speech \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"tts-1","input":"Hello world","voice":"alloy","response_format":"wav"}' \
+  -o speech.wav
+
+curl -sS http://127.0.0.1:8000/v1/models
+```
+
+`/v1/audio/speech` 同步等待作业结束并一次性返回完整音频，支持 `wav`/`flac`。OpenAI voice 别名（`alloy/echo/fable/onyx/nova/shimmer/ash/sage/coral/ballad/verse/marin`）映射到内置音色；带 `builtin:`/`voice:`/`design:` 前缀的值原样使用，其他值按 `builtin:NAME` 解释。`speed` 只接受缺省或 `1/1.0`，`stream_format` 只接受缺省或 `"audio"`；`mp3/opus/aac/pcm`、`speed != 1`、`sse` 和未知字段返回 400。`/v1/models` 对本地 backend 返回全部模型，对远程 backend 返回当前 `--backend-model`（或默认模型）。
+
+### Token 与网络安全
+
+- 默认只绑定 `127.0.0.1`。绑定非 loopback 地址（含 `0.0.0.0`/`::`）时必须提供 token，否则退出 2；token 可用 `--token` 或 `QTTS_SERVE_TOKEN`，空字符串视为非法。
+- 配置 token 后，除“loopback 绑定下的 `/health`”外的所有请求都需要 `Authorization: Bearer <token>`；非 loopback 绑定下 `/health` 同样鉴权。校验使用常量时间比较，token 不会出现在日志、响应或作业记录中。
+- 所有请求都校验 `Host`。允许集合为 loopback、显式绑定地址（通配地址除外）与全部 `--allowed-host`；通配绑定必须至少给一个 `--allowed-host`。`--allowed-host` 不能带端口或 scheme。
+- `--max-connections` 限制并发 HTTP 连接，超限的新连接立即收到 503；`--keep-jobs` 控制每个终态 `done/failed/cancelled` 作业目录的保留数量，`0` 表示不清理。
+- 服务端生成的错误、指标、警告、日志与 traceback 都经过统一脱敏（绝对路径、token），不会回传 traceback；客户端提交的 `text/voice/metadata` 原样回显。
+
+### 取消与关闭
+
+`say.run(cancel_check=...)` 在预检后、模型加载前、每个分段开始时、写字幕前、写音频前与写 recipe 前检查取消。请求取消后，运行中作业在下一个检查点抛出内部 `CancelledError` 并置 `cancelled`；如果作业恰好先完成，则按 `done` 结束。等待本地模型锁的作业可以在拿到锁前后被原子取消，绝不会短暂进入 `running`。
+
+收到 SIGINT/SIGTERM 后，服务停止接受新连接，取消全部排队与等锁作业，等待运行中作业最多 `--shutdown-timeout` 秒。超时仍未返回的作业会以 `cancelled` 强制发布（只含 `request.json`、`result.json` 与脱敏 `run.log`，不含音频/字幕），worker 线程是 daemon，因此进程可以立即退出；第二次 SIGINT 立即以 130 退出。作业产物位于：
+
+```text
+<data-dir>/serve/staging/<job_id>/      # 生成期间
+<data-dir>/serve/jobs/<job_id>/         # 终态：request.json、result.json、
+                                        # audio.<fmt>、字幕、run.log（仅失败/取消）
+```
+
+每次启动都会清空残留的 `staging/` 并按 mtime 清理超出保留数量的孤儿终态目录；清理在后台线程执行，不阻塞监听。
+
+---
+
 ## 命令参考
 
 全局参数适用于所有子命令：
@@ -547,6 +632,22 @@ qtts bench --suite smoke|batch|longform
 - 指标：`load_ms`、`cold_first_segment_ms`、`warm_first_segment_ms`、`wall_s`、`generate_s`、`audio_s`、`rtf`、`wall_rtf`、`segments_per_run/total`、`segments_per_s`、`process_peak_rss_bytes`、`peak_rss_delta_bytes`、可选 `device_memory_mb/device_memory_kind`、`cer/cer_distance/cer_units`、`speaker_similarity/speaker_segments_scored/speaker_segments_total`。`cases[]` 含所有 run 的 id、文本 sha256、语言、instruct、seed、max_new_tokens 与计时。
 - `--dry-run` 不加载模型、不 import torch/qwen_tts/qwen_asr、不写文件；`metrics` 全 `null`、`runs=[]`、`cases[].run=null`，并给出 `requirements`。`--report -` 与 `--dry-run --report` 退出 2。
 - 门禁失败不抛异常：完整 payload 照常输出/写报告，`ok=false`、`gate_failures[]`、退出 5；指标为 `null` 且显式给门禁同样退出 5。报告写失败退出 4，已算出的 payload 仍输出。`--json` 与 `--report` 逐字节一致，canonical 不含 `exit_code`。
+
+### `qtts serve`
+
+```text
+qtts serve [--backend transformers|dashscope|vllm-omni|PLUGIN]
+  [--backend-model ID] [--model NAME]
+  [--api native|openai|both]
+  [--host 127.0.0.1] [--port 8000] [--allowed-host HOST ...]
+  [--max-concurrency 1] [--queue-size 32] [--max-connections 32]
+  [--keep-jobs 100] [--max-body-bytes 1048576]
+  [--token TOKEN] [--shutdown-timeout 10.0] [--dry-run]
+```
+
+- 数值越界、空 token、非 loopback/通配绑定缺少 token 或缺少 `--allowed-host`、`--allowed-host` 带端口/scheme、`--offline` 配远程 backend 均在绑定前退出 2；后端未配置退出 3；绑定失败退出 4。
+- 启动只解析后端元数据；`--dry-run` 不 bind、不加载模型、不写数据目录，只输出解析结果并退出 0。成功启动向 stdout 写恰好一行；服务结束后 `cli.main` 不再追加 summary。
+- 运行期单作业失败不会终止服务。请求日志逐行写入 stderr 的 JSON，包含时间、方法、无 query 的路径、状态、`job_id` 与耗时。
 
 ### `qtts voice`
 

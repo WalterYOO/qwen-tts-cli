@@ -14,6 +14,15 @@ EXIT_BATCH = 6
 EXIT_INTERRUPT = 130
 
 
+class CancelledError(Exception):
+    """Cooperative cancellation raised by ``say.run(cancel_check=...)``.
+
+    Deliberately not a :class:`QttsError`: cancellation is neither a CLI exit
+    code nor a user-visible failure.  Callers that do not pass ``cancel_check``
+    can never see it.
+    """
+
+
 class QttsError(Exception):
     """An error that maps onto a stable process exit code.
 

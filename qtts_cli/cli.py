@@ -119,6 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
     from .commands import qc as qc_cmd
     from .commands import say as say_cmd
     from .commands import script as script_cmd
+    from .commands import serve as serve_cmd
     from .commands import takes as takes_cmd
     from .commands import voice as voice_cmd
 
@@ -528,6 +529,14 @@ def build_parser() -> argparse.ArgumentParser:
     plugins_list.set_defaults(
         func=plugins_cmd.list_plugins, formatter=plugins_cmd.format_result
     )
+
+    # -- serve -------------------------------------------------------------- #
+    serve = sub.add_parser(
+        "serve", help="run a local TTS HTTP service (native + OpenAI APIs)"
+    )
+    _add_common(serve, suppress=True)
+    _add_backend_flags(serve)
+    serve_cmd.add_arguments(serve)
 
     # -- takes -------------------------------------------------------------- #
     takes = sub.add_parser("takes", help="inspect and promote multi-take assets")
