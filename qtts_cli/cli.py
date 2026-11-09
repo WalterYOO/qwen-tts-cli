@@ -293,6 +293,56 @@ def build_parser() -> argparse.ArgumentParser:
     voice_import.add_argument("--force", action="store_true", help="replace an existing voice")
     voice_import.set_defaults(func=voice_cmd.import_, formatter=voice_cmd.format_result)
 
+    voice_import_btts = voice_sub.add_parser(
+        "import-btts", help="import voices from a btts voice export bundle"
+    )
+    _add_common(voice_import_btts, suppress=True)
+    voice_import_btts.add_argument(
+        "bundle", help="btts export directory or .zip bundle"
+    )
+    voice_import_btts.add_argument(
+        "--voice",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="import only this bundle voice (repeatable)",
+    )
+    voice_import_btts.add_argument(
+        "--all", action="store_true", help="import every voice in the bundle"
+    )
+    voice_import_btts.add_argument(
+        "--name", help="install a single selected voice under a different name"
+    )
+    voice_import_btts.add_argument(
+        "--i-have-rights",
+        action="store_true",
+        help="confirm you have the rights to clone these voices",
+    )
+    voice_import_btts.add_argument(
+        "--auto-ref-text",
+        action="store_true",
+        help="transcribe design previews with Qwen3-ASR for ICL",
+    )
+    voice_import_btts.add_argument(
+        "--ref-text",
+        help="reference transcript for one design voice (ICL)",
+    )
+    voice_import_btts.add_argument(
+        "--asr-model", help="ASR model path or id for --auto-ref-text"
+    )
+    voice_import_btts.add_argument(
+        "--mode", choices=["icl", "xvec"], default="icl"
+    )
+    voice_import_btts.add_argument(
+        "--model", help="override the automatically selected clone model"
+    )
+    voice_import_btts.add_argument(
+        "--force", action="store_true", help="replace existing voices"
+    )
+    voice_import_btts.set_defaults(
+        func=voice_cmd.import_btts, formatter=voice_cmd.format_result
+    )
+
     # -- align -------------------------------------------------------------- #
     align = sub.add_parser("align", help="align known text to audio")
     _add_common(align, suppress=True)

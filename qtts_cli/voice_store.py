@@ -53,6 +53,22 @@ class VoiceStore:
     def exists(self, name: str) -> bool:
         return (self.dir_for(name) / "voice.json").is_file()
 
+    def existing_names(self) -> dict[str, str]:
+        """Map casefolded names to on-disk directory names.
+
+        Import conflict checks use this instead of ``Path.exists`` so they do
+        not depend on whether the filesystem is case-sensitive. Hidden staging
+        and backup directories are ignored.
+        """
+        if not self.root.is_dir():
+            return {}
+        found: dict[str, str] = {}
+        for child in sorted(self.root.iterdir()):
+            if child.name.startswith(".") or not child.is_dir():
+                continue
+            found.setdefault(child.name.casefold(), child.name)
+        return found
+
     def require(self, name: str) -> dict[str, Any]:
         meta = self.get(name)
         if meta is None:
@@ -128,9 +144,10 @@ class VoiceStore:
         consent: Optional[dict[str, Any]] = None,
         qtts_version: str = "0.1.0",
         staging: Optional[Path] = None,
+        allow_existing: bool = False,
     ) -> dict[str, Any]:
         name = validate_name(name)
-        if self.exists(name):
+        if self.exists(name) and not allow_existing:
             raise InputError(
                 f"voice already exists: {name}; remove it first or choose another name",
                 details={"voice": name},

@@ -236,6 +236,22 @@ Qwen3-TTS 官方仓库提供了 Python API 和示例脚本，但直接使用存�
 | FR-P2-06 | benchmark | RTF、首段延迟、显存、批量吞吐、CER、speaker similarity | M |
 | FR-P2-07 | 微调工作流 | 数据准备、12Hz Base 单说话人训练、评估、注册为 voice profile | L |
 | FR-P2-08 | 插件 SDK | 后端/后处理插件协议与版本兼容层 | L |
+| FR-P2-09 | btts 音色导入 | `voice import-btts` 消费 `btts voice export --mode full` 目录/zip；校验 manifest 哈希与路径安全；clone 复用参考音频+文本，design 必须显式 `--auto-ref-text`/`--ref-text`/`--mode xvec`；要求 `--i-have-rights`，保留 btts provenance | M |
+
+#### FR-P2-09 btts 音色导入
+
+- 命令形态：
+  `qtts voice import-btts BUNDLE (--voice NAME ... | --all) [--name NEW] [--i-have-rights] [--auto-ref-text | --ref-text TEXT] [--mode icl|xvec] [--asr-model PATH|ID] [--model NAME] [--force]`。
+  `BUNDLE` 是 `btts voice export --mode full` 产出的目录或 `.zip`（zip 可含单一顶层目录）；`--mode wav` 导出明确拒绝。
+- bundle 校验：`manifest.json` 存在时必须逐文件校验 SHA-256 与大小，并校验 manifest 与 profile 的 voice 列表/kind/language/profile 哈希一致；拒绝绝对路径、盘符、反斜杠、`..`、符号链接、特殊文件、大小写冲突、未知文件、超限成员与异常压缩比；`profile.json` 必须 `schema_version=1`，`name`/`kind`/`language` 合法且与目录、manifest 一致；clone 的 `reference.audio`/`reference.transcript` 及其 profile 哈希必须匹配实际文件。目录 bundle 缺少 manifest 时允许导入，但结果必须显式报告 `manifest.present=false`，不能静默当作已验证。
+- clone 音色：默认 ICL，使用 `reference.audio` + `reference.transcript`，复用 `voice add --kind clone` 的 prompt 生成与 staging 逻辑（不 shell out）；`--mode xvec` 允许无文本。参考音频仍通过准入检查。
+- design 音色：btts 只有 `design.yaml` + `preview.wav`，没有参考文本。默认报错，要求显式选择：`--auto-ref-text`（Qwen3-ASR 转写 `preview.wav`）、`--ref-text TEXT`（仅单音色）、或 `--mode xvec`。禁止把 `preview.wav` 当 ICL 参考却编造文本。design 导入后是 qtts clone profile；btts 的 design 指令只进入 provenance，不写 `default_instruct`。
+- `--name` 只用于单音色重命名；`--all` 或多于一个 `--voice` 时退出 2。
+- 同意与授权：必须显式 `--i-have-rights`；btts profile 的 `consent` 只作为 provenance 记录，不能替代 qtts 的同意记录。qtts `consent.license` 记录 `btts:<model license>`。
+- provenance：`voice.json.source.origin="btts"`，`source.btts` 保留 btts name、voice_id、kind、language、license、model id/digest、profile sha256、manifest 摘要、reference/design 元数据与各文件 sha256。qtts `model` 始终写实际生成本地 prompt 的 Qwen Base 模型，不伪造 btts 模型。
+- 原子性：所有选中音色先完成校验、staging 与 prompt 生成，再统一发布；`--force` 采用备份-替换-回滚，任一失败回滚已发布音色，不留下半成品 profile。
+- 退出码：用法/组合错误 2；bundle/路径/哈希/授权/重名/准入失败 4；模型或 ASR 不可用 3；中断 130。
+- 非目标：不解析 `design.yaml` 重建设计流程，不导入 btts 模型权重/检查点，不绕过授权确认，不把 `--mode wav` 导出当作 profile 导入。
 
 ### 5.4 明确不做
 
@@ -386,6 +402,8 @@ qtts dub build timeline.srt --video input.mp4 --stems-out stems/
 qtts post INPUT.wav --lufs -16 --true-peak -1 --format m4a|mp3|flac
 qtts bench --suite smoke|batch|longform --json
 qtts finetune prepare|train|eval --project project.yaml
+qtts voice import-btts BUNDLE --all --i-have-rights
+qtts voice import-btts BUNDLE --voice alice --auto-ref-text --i-have-rights
 ```
 
 ### 7.5 退出码
@@ -433,6 +451,8 @@ qtts finetune prepare|train|eval --project project.yaml
   "qtts_version": "0.1.0"
 }
 ```
+
+`source` 可包含 `origin` 与 `btts` 子树（FR-P2-09）。从 btts 导入的 profile 记录 `origin="btts"`，并在 `source.btts` 保留 btts name、voice_id、kind、language、license、model id/digest、profile sha256、manifest 摘要、reference/design 元数据与各文件 sha256；`model` 字段始终是 qtts 实际用于生成 prompt 的本地 Qwen Base 模型。`consent` 是 qtts 自己的同意记录（`--i-have-rights`），btts 的 consent 只作为 provenance。
 
 ### 8.2 GenerationPlan IR
 
@@ -639,6 +659,9 @@ qtts align
 - **take**：同一段文本的一次生成结果。
 - **recipe**：可复现一次生成所需的全部参数与哈希。
 - **plan**：编译后的生成计划（`GenerationPlan`），是所有执行器的唯一输入。
+- **btts**：本机 `breeze-tts` CLI（`btts`），用 `breeze-tts-2` 模型设计/克隆音色。
+- **btts bundle**：`btts voice export --mode full` 产出的目录或 zip，含 `manifest.json`、根许可证文件和每音色的 `profile.json`/`preview.wav`（clone 另有 `ref.wav`/`ref.txt`，design 另有 `design.yaml`）。
+- **btts provenance**：qtts `voice.json.source.btts` 中保留的 btts 原始身份、许可证、模型与文件哈希，不代表 qtts 模型或同意记录。
 
 ### 13.4 P1 Wave 1 实现注记
 
@@ -817,3 +840,34 @@ qtts align
 - `takes list`、`takes compare [--ids]` 在输出前校验全部 take 的音频哈希与 recipe，损坏退出 4 且不输出成功 payload。`takes promote --id N --out FILE|- [--format]` 不加载模型，只复制原始字节、不转码；目标后缀必须与 job 格式一致；不得覆盖 job.json、任一 take 音频或 recipe（已选中且目标即源文件是唯一的幂等 no-op）。promote 是 `scoring_failed` job 的人工转正路径：先校验音频/recipe 并验证更新后的 job，再把状态改为 `complete`、写入 selected，最后才落盘；job 写入失败不产生目标文件，替换失败会尽力回滚 job。
 - `_downstream()` 在任何 QC/字幕/输出副作用之前构建 job 资产保护集合；`--out`、`--recipe-out`、字幕前缀命中 `job.json`、任一 take 音频或 recipe 时退出 2。选中 take 的 recipe 在复用与写出前统一校验，损坏时退出 4 且 stdout 不产生音频字节。
 - `JOB_ID` 限制为 `[A-Za-z0-9._-]{1,64}` 并只在 `<data-dir>/takes/` 下解析；绝对路径、穿越、符号链接退出 2，job/take 缺失、损坏、哈希或音频结构异常退出 4，评分/模型失败退出 3。
+
+### 13.9 P2 btts 导入实现注记
+
+本节记录 FR-P2-09 的实现选择，不改变上面的需求定义。
+
+**bundle 解析与安全**
+
+- 新增 `qtts_cli/voice_btts.py`，只做读取/校验，不加载模型、不写音色库。目录 bundle 用 `iterdir`+`lstat` 逐项检查；zip bundle 支持 btts 的单一顶层目录（如 `export/...`）和扁平布局，拒绝混合布局、嵌套音色目录、目录成员以外的特殊成员。
+- 所有文件先按上限扫描，再流式计算 sha256：最多 512 个成员（约 100 个 btts 音色）、单文件 64 MiB、总大小 512 MiB、压缩比 500:1；`manifest.json` 与 `profile.json` 同样限制 1 MiB。`manifest.json` 存在时，`root_files` 与 `voices[].files` 的并集必须与实际文件完全一致（manifest 自身除外），每个 `sha256`/`bytes` 必须匹配；manifest 的 `schema_version=1`、`kind="btts-voice-export"`、`mode="full"` 必须成立。真实 `btts voice export --mode wav` 产物没有 profile 目录，根目录包含预览 `*.wav` 以及 `manifest.json`/`LICENSE.txt`/`README.txt`；导入时会依据 manifest 的 `mode` 得到“请用 `--mode full` 重新导出”的定向错误，而不是泛化的未知根文件错误。
+- 路径检查拒绝绝对路径、盘符、反斜杠、NUL、`.`/`..`、首尾空白、大小写冲突和符号链接；目录读取用 `O_NOFOLLOW`，zip 成员用 `ZipFile.open` 流式读取，从不 `extractall`。
+- 畸形 zip 的解析异常（损坏 central directory/local header、`extract_version` 超限、UTF-8 标志配非法文件名字节、`LargeZipFile`、`struct.error` 等）统一包装成携带 `bundle`/`file` details 的 `InputError`，退出 4；`zipfile` 的 `UserWarning`（如重叠成员 `Overlapped entries`）在读取时被提升为异常并同样包装，保证默认环境和 `PYTHONWARNINGS=error` 下都不会 traceback，`--json` 的 stderr 始终只有一个错误对象。
+- `profile.json` 限制 1 MiB，必须是 UTF-8 JSON 对象且 `schema_version=1`；`name` 必须等于目录名，`kind` 为 `clone|design`，`language` 通过 btts 代码（`zh`/`en` 等）或 qtts 显示名映射到 qtts 语言。clone 的 `reference.audio`/`reference.transcript` 必须是安全 basename，其 sha256 与 profile 一致；transcript 按 btts 规则做 CRLF 归一化并去掉尾部换行，再与 `transcript_sha256` 比对。design 不要求 `design.yaml`（btts 本身只警告），缺失时结果带 warning。
+- 目录 bundle 缺少 `manifest.json` 时允许继续，但 `manifest.present=false`/`verified=false` 会写入 JSON 和 provenance，并在 `warnings` 中说明；zip 缺少 manifest 直接拒绝。这是唯一允许的“降级”，且完全显式。
+
+**clone 与 design 的处理**
+
+- 把 `_add_clone` 的 prompt 生成/元数据/原子 staging 抽成 `_freeze_clone_prompt`，`voice add` 与 `voice import-btts` 共用；导入不 shell out，也不复制 prompt 生成逻辑。`_freeze_clone_prompt` 新增 `allow_existing`，仅在 `--force` 预检通过后跳过 `VoiceStore.create` 的“已存在”检查，实际替换仍由统一的提交事务完成。
+- clone 默认 ICL：staging 内先写入 bundle 的 `ref.wav`，再跑准入检查与 `create_clone_prompt_items`；`--mode xvec` 不传 `ref_text`，但仍要求 bundle 有完整 transcript（bundle 完整性校验，不静默跳过）。
+- design 统一转换为 qtts clone profile：`preview.wav` 作为参考音频，`--auto-ref-text` 用 ASR 转写同一份 staging 字节，`--ref-text` 仅允许单个 design 音色，`--mode xvec` 是显式免文本路径。默认（ICL 且无文本）退出 4 并在错误中列出三个选项。选择 clone 转换而不是 qtts `kind=design`，是因为 btts 与 qwen3-tts 是不同的模型：用 btts 的设计描述重新跑 qwen3 的 VoiceDesign 不会得到等价音色；而 preview 的音频 + 真实转写可以在 qtts 中冻结出等价说话人。btts 的 design 指令只进 provenance，不写 `default_instruct`，避免悄悄改变生成行为。
+- 混合选择（`--all`）时，`--auto-ref-text` 只作用于 design 音色；clone 音色始终使用 bundle 的确认转写。只选中 clone 时给出 `--auto-ref-text` 退出 2，避免无意义的静默 no-op。
+
+**同意、provenance 与原子性**
+
+- `--i-have-rights` 是硬性要求，不弹 TTY 确认；btts profile 的 `consent` 只复制到 `source.btts.consent` 供审计，不能替代 qtts `consent.rights_confirmed`。qtts `consent.license` 记为 `btts:<model license>`，note 说明来源。
+- `source.origin="btts"`；`source.btts` 保存 bundle 路径/格式、manifest 摘要、btts name/voice_id/kind/language、license、model id/digest、profile sha256、reference/design 元数据、tags 与每个导入文件的 sha256。值经过类型与长度裁剪（字符串 256/4096 字符，consent 最多 4 KiB），避免 `voice.json` 被异常 profile 撑大。
+- 所有选中音色先完成 bundle 校验、staging、ASR（如有）和 prompt 生成，再进入统一提交：逐个 `os.replace`，已存在目标先移到 `.name.backup.<random>`；任一提交失败按逆序删除新目标并恢复备份，全部成功后删除备份。ASR 缓存会在加载 Base 前清空；staging 目录在 `finally` 中删除，失败不会留下半成品 profile。该回滚覆盖 Python 异常路径；进程在备份与替换之间被 SIGKILL/掉电时可能只留下隐藏备份目录，需要人工恢复，不承诺崩溃安全。
+- `--name` 只在恰好一个选中音色时可用；`--all` 或多 `--voice` 直接退出 2。重名检查枚举现有 store 目录并按 `casefold` 比较，不依赖文件系统大小写语义，先于模型加载报出；`--force` 遇到仅大小写不同的已有目录时替换该目录，而不是在大小写敏感文件系统上创建第二个 profile。
+
+**测试**
+
+- `tests/test_voice_import_btts.py` 与 `tests/test_review_voice_import_btts.py` 使用合成目录/zip bundle、sine 参考音频、fake TTS/ASR 与 fake `save_prompt_tensors`，不联网、不加载权重、不依赖 torch。覆盖 clone 目录/zip、design 三路径、manifest 哈希/模式与元数据不一致、真实 `--mode wav` 布局、路径穿越/盘符/反斜杠、符号链接、压缩比 bomb、大小写冲突、超大 manifest、重名/`--force` 与提交回滚、`--name`、`--all`、ASR 成功/空转写/抛错与 staging 清理，以及畸形 zip（unsupported `extract_version`、UTF-8 标志配非法文件名、损坏 local header、重叠成员 `UserWarning`）统一退出 4 且不 traceback；另覆盖模拟大小写敏感文件系统下 existing store 的 `casefold` 重名检测与 `--force` 替换。

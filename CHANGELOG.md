@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-09
+
+### Added
+
+- **btts 音色导入（FR-P2-09）**：新增 `qtts voice import-btts BUNDLE (--voice NAME ... | --all)`，直接消费 `btts voice export --mode full` 的目录或 `.zip`。有 `manifest.json` 时逐文件校验 SHA-256/大小并校验 manifest 与 profile 的 voice/kind/language/profile 哈希一致；拒绝绝对路径、盘符、反斜杠、`..`、符号链接、特殊文件、大小写冲突、未知文件、目录穿越与超限成员；zip 必须带 manifest，目录缺 manifest 时显式报告 `manifest.present=false`。clone 音色默认用 `reference.audio` + `reference.transcript` 走 ICL，复用 `voice add --kind clone` 抽出的 `_freeze_clone_prompt`（不 shell out），`--mode xvec` 可免文本；design 音色没有参考文本，默认退出 4，必须显式 `--auto-ref-text`（Qwen3-ASR 转写 `preview.wav`）、`--ref-text TEXT`（单音色）或 `--mode xvec`，导入后为 qtts clone profile 且不把 btts design 指令写成 `default_instruct`。必须显式 `--i-have-rights`，btts profile 的 consent 仅作 provenance；`voice.json.source.origin="btts"` 并保留 btts name/voice_id/kind/language/license/model/profile sha256/manifest 摘要/文件哈希，`model` 仍记录实际生成本地 prompt 的 Qwen Base。`--name` 仅允许单音色；所有选中音色先 staging 后统一发布，`--force` 备份-替换-回滚，失败不留半成品。新增 `qtts_cli/voice_btts.py` 与 `tests/test_voice_import_btts.py`。畸形 zip 的 central directory/local header 解析异常（unsupported `extract_version`、非法 UTF-8 文件名、`OSError`、`LargeZipFile`、`struct.error` 等）统一包装为带 `bundle`/`file` details 的退出 4，不会 traceback 或误报为 usage；重叠 zip 成员的 `UserWarning` 同样被提升为输入错误，默认环境与 `PYTHONWARNINGS=error` 下都保持 stderr 单 JSON 对象。真实 `btts voice export --mode wav` 布局会提示用 `--mode full` 重新导出；`manifest.json` 与 `profile.json` 同样限制 1 MiB，bundle 成员上限为 512。已有音色的重名检查改为枚举 store 目录并按 `casefold` 比较，不依赖文件系统大小写语义；`--force` 会替换仅大小写不同的已有目录。
+
 ### Changed
 
 - **Shell 补全安装布局**：`qtts completion --install` 不再把完整补全脚本写进 `~/.zshrc`/`~/.bashrc`。zsh 优先复用一个已在 `fpath` 中的目录（含 Oh My Zsh `custom/completions`），否则写 `~/.zfunc/_qtts` 并只追加 `fpath` + `compinit` 三行 block；bash 优先使用 bash-completion drop-in，否则写 `~/.local/share/qtts/completion.bash` 并追加一行 `source` block；fish 写 `fish/completions/qtts.fish` 且不碰 rc。新增 `--dir` 只写补全文件（忽略全局 `QTTS_COMPLETION_RC`）；marker 版本升到 v2，`--install`/`--uninstall` 会清理旧布局文件与 block，包括 `.zshenv`/`.bash_profile` 等备用 rc 中的旧 block，`--status` 会把这些残留报告为 `stale`。

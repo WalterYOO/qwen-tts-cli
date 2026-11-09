@@ -53,6 +53,7 @@
 | **模型微调** | `finetune prepare/train/eval` 调用官方脚本准备 JSONL、训练与评测；校验/选择 checkpoint，注册为 `voice:` profile，并以 CER/说话人相似度门禁评测 |
 | **自动参考文本** | `voice add --kind clone --auto-ref-text` 用 ASR 转写参考音频，作为 ICL 的 `ref_text` 并记录来源与模型 |
 | **音色归档** | `voice export/import` 单文件 `.qttsvoice`，白名单成员、流式校验、原子替换 |
+| **btts 导入** | `voice import-btts` 直接消费 `btts voice export --mode full` 目录/zip，校验 manifest 与路径安全；clone 复用参考音频+文本，design 需 ASR/显式文本/xvec，保留 btts provenance |
 | **项目锁文件** | `project init/lock` 固定模型全量 sha256、音色、采样参数、字幕策略与运行时版本 |
 | **计划与诊断** | `--dry-run` 不加载模型即可输出分段与预算；`doctor --bench` 产出本机性能基线 |
 | **机器可读** | 所有命令支持 `--json`；稳定退出码；错误走 stderr |
@@ -808,9 +809,45 @@ qtts voice preview NAME [--text TEXT] [--out FILE] [--format wav|flac]
 qtts voice rm NAME [--yes]
 qtts voice export NAME -o FILE.qttsvoice [--force]
 qtts voice import FILE.qttsvoice [--name NAME] [--force]
+qtts voice import-btts BUNDLE (--voice NAME ... | --all) [--name NAME]
+  [--i-have-rights] [--auto-ref-text | --ref-text TEXT] [--asr-model PATH|ID]
+  [--mode icl|xvec] [--model NAME] [--force]
 ```
 
 `.qttsvoice` 是 zip 容器，只允许 `manifest.json`、`voice.json`、`prompt.safetensors`、`ref.wav`、`preview.wav`；导入逐项校验路径、大小、压缩比、sha256 与 safetensors 结构，不使用 `extractall`，替换已有音色失败时回滚。
+
+#### 与 btts 互操作：`voice import-btts`
+
+`qtts` 可以直接消费 `btts voice export --mode full` 的目录或 `.zip`：
+
+```bash
+# 先在本机用 btts 导出（目录或 --zip 均可）
+btts voice export alice narrator -o ./btts-bundle
+# 或：btts voice export --all --zip -o ./btts-bundle.zip
+
+# clone 音色：默认使用 bundle 里的 ref.wav + ref.txt（ICL）
+qtts voice import-btts ./btts-bundle --voice alice \
+  --i-have-rights --model-dir "$QTTS_MODEL_DIR"
+
+# design 音色：必须显式选择一种参考文本来源
+qtts voice import-btts ./btts-bundle --voice narrator \
+  --i-have-rights --auto-ref-text --model-dir "$QTTS_MODEL_DIR"
+# 或：--ref-text "preview.wav 对应的文字"（仅单音色）
+# 或：--mode xvec（不使用参考文本，质量可能略降）
+
+# 全量导入并允许替换已有同名音色
+qtts voice import-btts ./btts-bundle.zip --all --i-have-rights --force
+```
+
+btts bundle 的布局是根目录 `manifest.json` + `LICENSE.txt` + `README.txt` + 每音色的 `profile.json`/`preview.wav`；clone 音色另有 `ref.wav`/`ref.txt`，design 音色另有 `design.yaml`。`--zip` 包可含单一顶层目录。
+
+- **安全校验**：有 `manifest.json` 时逐文件校验 SHA-256 和大小；拒绝绝对路径、盘符、反斜杠、`..`、符号链接、特殊文件、大小写冲突、未知文件、重叠 zip 成员与超限成员。zip 读取期间的 `UserWarning` 会被提升为输入错误（退出 4），不会破坏 `--json` 的单错误对象契约。zip 必须带 manifest；目录 bundle 缺 manifest 时允许导入，但 JSON 与 `voice.json` 会显式记录 `manifest.present=false`/`verified=false` 并给出 warning。
+- **clone**：默认 ICL，使用 `reference.audio` + `reference.transcript`，走与 `voice add --kind clone` 相同的 prompt 生成与原子 staging；`--mode xvec` 可跳过参考文本。参考音频仍要通过准入检查。
+- **design**：btts 只有 `design.yaml` + `preview.wav`，没有参考文本。默认报错并要求三选一：`--auto-ref-text`（Qwen3-ASR 转写 preview）、`--ref-text TEXT`（仅单音色）或 `--mode xvec`。不会拿 preview 当 ICL 参考却编造文本。导入后是 qtts clone profile；btts 的 design 指令只写入 provenance，不写 `default_instruct`。
+- **同意**：必须显式 `--i-have-rights`。btts profile 的 `consent` 只作为 provenance 保留，不能替代 qtts 的同意记录；`voice.json` 的 `consent.license` 记为 `btts:<model license>`。
+- **provenance**：`source.origin="btts"`，`source.btts` 保留 btts name、voice_id、kind、language、license、model id/digest、profile sha256、manifest 摘要、reference/design 元数据与文件哈希；`model` 字段仍是 qtts 实际使用的本地 Qwen Base 模型。
+- **原子性**：所有选中音色先校验、staging 和生成 prompt，再统一发布；`--force` 是备份-替换-回滚，任一异常失败回滚整组，不留下半成品。该保证只覆盖异常路径，SIGKILL/掉电不在范围内。`--name` 只能用于单音色；`--all` 或多于一个 `--voice` 时使用 `--name` 退出 2。
+- **限制**：只支持 `btts voice export --mode full`；`--mode wav` 导出没有 profile，会明确提示用 `--mode full` 重新导出。单个 bundle 最多 512 个成员（约 100 个音色），单文件上限 64 MiB、总大小 512 MiB、压缩比上限 500:1；`manifest.json` 与其他 `profile.json` 一样限制 1 MiB。不导入 btts 模型权重/检查点，也不重放 `design.yaml` 的设计流程；btts 语言代码（`zh`/`en` 等）会映射为 qtts 显示名。全程不需要联网。
 
 `add` 的 clone 选项：
 
@@ -1114,6 +1151,7 @@ qtts_cli/
 ├── subtitle_qc.py         # CPS/行宽/时长/结构门禁与 QC 报告
 ├── sidecar.py             # recipe 读写
 ├── voice_archive.py       # .qttsvoice 导出/导入与安全校验
+├── voice_btts.py          # btts voice export bundle 解析与安全校验（FR-P2-09）
 ├── project.py             # project init/lock
 ├── postprocess.py         # 响度/true-peak/重采样/静音修剪纯 DSP
 ├── benchmark.py           # bench 语料、计时聚合、CER/speaker 评分
@@ -1133,6 +1171,7 @@ tests/
 ├── test_p1_lexicon.py     # P1 Wave 2 词典/导演标记
 ├── test_p1_batch.py       # P1 Wave 2 批量清单
 ├── test_p1_voice_archive.py
+├── test_voice_import_btts.py  # btts 导入、安全校验与原子性
 ├── test_p1_project.py
 ├── test_review_p0.py      # 审查回归
 ├── test_review_p1.py      # 审查回归
@@ -1192,6 +1231,7 @@ FR-P1-01 至 FR-P1-11 均已实现并在本地提交；P1 期间版本号保持 
 - `serve` 与 OpenAI 兼容 `/v1/audio/speech`（已提交）
 - 有声书（已提交）与视频配音 `dub`（已实现）
 - 微调工作流 `finetune prepare|train|eval`（已提交）
+- btts 音色导入 `voice import-btts`（FR-P2-09，已提交：0.3.2）
 
 ---
 
