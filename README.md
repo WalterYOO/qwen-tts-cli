@@ -4,7 +4,7 @@
 
 > **原文是真值。** 字幕内容来自输入原文，ForcedAligner 只负责时间轴，ASR 只用于质检而不是改写内容。
 
-当前状态：**P1 已全部实现并发布 0.2.0；P2 的 `post`、`bench`、可插拔后端/插件 SDK、`serve`、`audiobook` 与 `dub` 已实现**。微调工作流尚未实现，见[路线图](#路线图)。
+当前状态：**P2 已全部实现并发布 0.3.0**，包括音频后处理、性能基准、可插拔后端与插件 SDK、HTTP 服务、有声书、视频配音和微调工作流。见[路线图](#路线图)。
 
 ---
 
@@ -1155,7 +1155,7 @@ FR-P1-01 至 FR-P1-11 均已实现并在本地提交；P1 期间版本号保持 
 - 插件 SDK（FR-P2-08，已提交：`qtts.backends` / `qtts.postprocess` entry points）
 - `serve` 与 OpenAI 兼容 `/v1/audio/speech`（已提交）
 - 有声书（已提交）与视频配音 `dub`（已实现）
-- 微调工作流包装
+- 微调工作流 `finetune prepare|train|eval`（已提交）
 
 ---
 

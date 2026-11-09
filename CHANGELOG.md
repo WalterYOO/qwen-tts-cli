@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-09
+
 ### Added
 
 - **模型微调（FR-P2-07）**：新增 `qtts finetune prepare|train|eval`，以严格项目 schema（未知/重复键、alias、多文档、NUL、路径包含与 pairwise distinct 检查全部退出 4）驱动官方 `prepare_data.py` 与 `sft_12hz.py`。`prepare` 校验 24 kHz 单声道 WAV、0.5–30 s 条目与 2–30 s 参考音频，写确定性 raw JSONL，校验 16 列 `audio_codes` 后原子发布；`train` 以固定 argv/cwd/env 启动子进程并实时转发输出，校验 `checkpoint-epoch-<N>`（config、非空权重、speech tokenizer、`custom_voice` builtin 与 speaker），以 `.partial`/`.old` 与延迟信号处理器原子发布，失败保留 partial、提交点后中断保留新目录，并可注册为 `voice:` profile（权重/config/数据集哈希与 consent，不复制 checkpoint）；`eval` 生成保留文本音频，按需计算 CER 与说话人相似度，阈值失败输出完整 payload 并退出 5。项目锁与 artifact 锁按固定顺序非阻塞获取（冲突退出 4），`--dry-run` 不 import torch/qwen/dashscope/vllm、不取锁、不建目录、不写文件；`--json` 错误恰好一个对象写 stderr，中断 130 且 stdout 为空。`voice list/inspect/preview/rm` 支持 finetune profile，`voice export` 与导入 manifest 明确拒绝机器本地 profile。
