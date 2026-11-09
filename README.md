@@ -895,10 +895,11 @@ qtts doctor [--bench] [--json]
 
 ```text
 qtts completion [auto|bash|zsh|fish] [--install|--uninstall|--status]
-                [--rc-file PATH] [--follow-symlinks] [--dry-run] [--json] [--quiet]
+                [--dir DIRECTORY] [--rc-file PATH] [--follow-symlinks]
+                [--dry-run] [--json] [--quiet]
 ```
 
-为 bash、zsh、fish 生成自适应补全脚本；不带动作时把脚本写到 stdout，可直接 `eval` 或重定向。`--install` 用固定 marker block 幂等写入 rc 文件（重复执行字节级不变），`--uninstall` 只删除该 block，`--status` 报告 `current`/`stale`/`not_installed`/`malformed`/`unsupported_version`/`symlink_refused`（非 `current` 退出 4）。
+为 bash、zsh、fish 生成自适应补全脚本；不带动作时把脚本写到 stdout，可直接 `eval` 或重定向。`--install` 幂等写入独立补全文件，只有 shell 不能自动加载该目录时才在 rc 文件里加一个很小的 marker block；`--uninstall` 删除补全文件和该 block，`--status` 报告 `current`/`stale`/`not_installed`/`malformed`/`unsupported_version`/`symlink_refused`（非 `current` 退出 4）。
 
 ```bash
 # 当前 shell 临时启用
@@ -907,9 +908,10 @@ eval "$(qtts completion bash)"
 # 永久安装（默认检测 $SHELL / 父进程 / 平台）
 qtts completion --install
 
-# 指定 shell / 自定义 rc / 先预览
+# 指定 shell / 自定义 rc / 只写补全文件 / 先预览
 qtts completion zsh --install
 qtts completion bash --install --rc-file ~/.bashrc
+qtts completion zsh --install --dir ~/.zfunc
 qtts completion bash --install --dry-run --rc-file /tmp/qtts.bashrc
 
 # 查询与卸载
@@ -918,8 +920,11 @@ qtts completion --uninstall
 ```
 
 - 自动检测顺序：显式 SHELL 参数 > `QTTS_COMPLETION_SHELL` > `$SHELL` > 父进程链 > 平台回退（macOS zsh、Linux bash）。无法确定时退出 2，不会猜成 bash。
-- 默认写入 `~/.bashrc`、`~/.zshrc`、`${XDG_CONFIG_HOME:-~/.config}/fish/conf.d/qtts.fish`。macOS 的 Terminal 可能以 login shell 读取 `~/.bash_profile`；若它不 source `~/.bashrc`，请用 `--rc-file ~/.bash_profile`。
-- 默认拒绝符号链接；dotfiles 管理场景显式加 `--follow-symlinks` 写入其 target。marker 不完整/重复时退出 4 且零写入。
+- **zsh**：优先写入 Oh My Zsh 的 `custom/completions/_qtts`，或 `.zshrc`/`.zshenv`/`.zprofile`/`.zlogin` 中已有且可写的 `fpath` 目录；都没有时才写 `~/.zfunc/_qtts`，并在 rc 里追加三行 `fpath` + `compinit` block，而不是把整个补全脚本塞进 rc。
+- **bash**：优先写入 `BASH_COMPLETION_USER_DIR/completions/qtts` 或 `~/.local/share/bash-completion/completions/qtts`；未安装 bash-completion 时写 `~/.local/share/qtts/completion.bash` 并在 rc 里追加一行 `source` block。macOS 的 Terminal 可能以 login shell 读取 `~/.bash_profile`；若它不 source `~/.bashrc`，请用 `--rc-file ~/.bash_profile`。
+- **fish**：写入 `${XDG_CONFIG_HOME:-~/.config}/fish/completions/qtts.fish`，fish 会自动加载，不修改 rc。
+- `--dir` 只写补全文件、不碰 shell 配置，适合 dotfiles 管理。
+- 默认拒绝符号链接；dotfiles 管理场景显式加 `--follow-symlinks` 写入其 target。marker 不完整/重复时退出 4 且零写入。重复 `--install` 不改动任何字节；升级时会替换旧 marker block 并清理旧布局文件。
 - 补全由隐藏命令 `qtts __complete` 驱动，始终读取实时 argparse 树；TAB 时只读扫描本地音色/模型元数据，不加载模型、不访问网络、不写缓存。已知限制：PowerShell 尚未实现；`--opt=value` 形式的文件路径不作原生补全（改用 `--opt value`）。
 
 ---

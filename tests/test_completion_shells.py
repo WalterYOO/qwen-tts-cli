@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
-from qtts_cli.completion import shells
+from qtts_cli.completion import install, shells
 from qtts_cli.completion.install import render_block
 from qtts_cli.errors import UsageError
 
@@ -19,7 +21,7 @@ def test_script_is_deterministic_and_newline_terminated(shell: str):
     assert first == second
     assert first.endswith("\n")
     assert not first.endswith("\n\n")
-    assert "eval" not in first
+    assert re.search(r"\beval\b", first) is None
     assert "__complete" in first
 
 
@@ -81,10 +83,26 @@ def test_unknown_shell_is_rejected():
 
 @pytest.mark.parametrize("shell", ["bash", "zsh", "fish"])
 def test_render_block_has_exact_markers(shell: str):
-    script = shells.generate_script(shell)
-    block = render_block(shell, script)
-    begin = f"# >>> qtts completion: {shell} v1 >>>\n".encode()
-    end = f"# <<< qtts completion: {shell} v1 <<<\n".encode()
+    body = install.block_body(shell, Path("/tmp") / install._script_name(shell))
+    block = render_block(shell, body)
+    begin = f"# >>> qtts completion: {shell} v2 >>>\n".encode()
+    end = f"# <<< qtts completion: {shell} v2 <<<\n".encode()
     assert block.startswith(begin)
     assert block.endswith(end)
-    assert script.encode() in block
+    assert body.encode() in block
+
+
+def test_zsh_script_supports_fpath_autoload():
+    script = shells.generate_script("zsh")
+    assert script.startswith("#compdef qtts\n")
+    assert "zsh_eval_context[-1] == loadautofunc" in script
+    assert '_qtts "$@"' in script
+    assert "compdef _qtts qtts" in script
+
+
+@pytest.mark.parametrize("shell", ["bash", "zsh", "fish"])
+def test_script_payload_carries_ownership_marker(shell: str):
+    payload = install.script_payload(shell)
+    assert payload.startswith(shells.generate_script(shell).encode())
+    assert install._SCRIPT_MARKER in payload
+    assert payload.endswith(b"\n")

@@ -109,7 +109,8 @@ def test_file_and_directory_kinds(capsys):
         "qtts completion --rc-file ",
     ):
         assert _line(capsys, line)[0].endswith("kind=file"), line
-    assert _line(capsys, "qtts project init ")[0].endswith("kind=dir")
+    for line in ("qtts project init ", "qtts completion --dir "):
+        assert _line(capsys, line)[0].endswith("kind=dir"), line
 
 
 def test_shared_asr_model_dest_is_only_a_file_in_finetune_eval(capsys):

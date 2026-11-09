@@ -36,8 +36,9 @@ complete -o filenames -o bashdefault -o default -F _qtts_completion qtts
 """
 
 _ZSH = """\
+#compdef qtts
 # qtts completion for zsh
-_qtts_completion() {
+_qtts() {
     local -a out candidates argv
     local kind
     argv=("${words[@]}")
@@ -53,11 +54,17 @@ _qtts_completion() {
         *) (( ${#candidates} )) && compadd -- "${candidates[@]}" ;;
     esac
 }
-if (( $+functions[compdef] )); then
-    compdef _qtts_completion qtts
+if [[ $zsh_eval_context[-1] == loadautofunc ]]; then
+    # autoloaded from fpath: run the completion function directly
+    _qtts "$@"
 else
-    autoload -Uz compinit && compinit
-    compdef _qtts_completion qtts
+    # sourced from an rc file: register the function for later
+    if (( $+functions[compdef] )); then
+        compdef _qtts qtts
+    else
+        autoload -Uz compinit && compinit
+        compdef _qtts qtts
+    fi
 fi
 """
 

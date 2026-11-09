@@ -50,6 +50,11 @@ def run(cfg: Any, args: Any) -> dict[str, Any]:
 
     rc_file, rc_explicit = _rc_file(args)
     flag_rc = getattr(args, "rc_file", None) is not None
+    script_dir = getattr(args, "dir", None)
+    if script_dir is not None and not flag_rc:
+        # --dir explicitly asks for a file-only install, so a globally exported
+        # QTTS_COMPLETION_RC must not turn it into a conflicting rc install.
+        rc_file, rc_explicit = None, False
     follow = bool(getattr(args, "follow_symlinks", False))
     dry_run = bool(getattr(args, "dry_run", False))
     quiet = bool(getattr(args, "quiet", False))
@@ -59,6 +64,8 @@ def run(cfg: Any, args: Any) -> dict[str, Any]:
         # usable in shells that set it globally.
         if flag_rc:
             raise UsageError("--rc-file is only valid with --install, --uninstall or --status")
+        if script_dir is not None:
+            raise UsageError("--dir is only valid with --install or --uninstall")
         if dry_run:
             raise UsageError("--dry-run is only valid with --install or --uninstall")
         if follow:
@@ -90,11 +97,17 @@ def run(cfg: Any, args: Any) -> dict[str, Any]:
 
     if action == "status" and dry_run:
         raise UsageError("--dry-run is only valid with --install or --uninstall")
+    if action == "status" and script_dir is not None:
+        raise UsageError("--dir is only valid with --install or --uninstall")
 
     shell = detect_shell(shell_arg)
     if action == "install":
         payload = install_mod.install(
-            shell, rc_file, dry_run=dry_run, follow_symlinks=follow
+            shell,
+            rc_file,
+            dry_run=dry_run,
+            follow_symlinks=follow,
+            script_dir=script_dir,
         )
     elif action == "uninstall":
         payload = install_mod.uninstall(
@@ -103,6 +116,7 @@ def run(cfg: Any, args: Any) -> dict[str, Any]:
             dry_run=dry_run,
             follow_symlinks=follow,
             explicit_rc=rc_explicit,
+            script_dir=script_dir,
         )
     else:
         payload = install_mod.status(shell, rc_file, follow_symlinks=follow)
@@ -117,28 +131,36 @@ def format_result(payload: dict[str, Any]) -> str:
         return ""
     action = payload.get("action")
     shell = payload.get("shell", "?")
-    rc_file = payload.get("rc_file", "?")
+    script_file = payload.get("script_file") or "?"
+    rc_file = payload.get("rc_file")
     dry_run = bool(payload.get("dry_run"))
     if action == "install":
         if not payload.get("changed"):
-            return f"installed {shell} completion in {rc_file} (already up to date)"
+            return f"{shell} completion is already up to date in {script_file}"
         prefix = "would install" if dry_run else "installed"
-        reason = "created" if payload.get("created") else "updated"
-        text = f"{prefix} {shell} completion in {rc_file} ({reason})"
+        text = f"{prefix} {shell} completion in {script_file}"
+        if rc_file:
+            text += f" (configured {rc_file})"
+        if payload.get("directory_only"):
+            text += "\nadd this directory to your shell's completion path manually"
         warnings = payload.get("warnings") or []
         if warnings:
             text += "\n" + "\n".join(f"warning: {item}" for item in warnings)
         return text
     if action == "uninstall":
-        if not payload.get("block_found"):
-            return f"no {shell} completion block in {rc_file}; nothing to do"
+        if not payload.get("changed"):
+            return f"no {shell} completion installation found; nothing to do"
         prefix = "would remove" if dry_run else "removed"
-        text = f"{prefix} {shell} completion from {rc_file}"
-        if payload.get("deleted_file"):
-            text += " (deleted empty drop-in)"
+        text = f"{prefix} {shell} completion"
+        if payload.get("script_removed"):
+            text += f" from {script_file}"
+        if payload.get("rc_removed"):
+            text += " (cleaned rc block)"
         return text
     if action == "status":
-        text = f"{shell} completion: {payload.get('state')} ({rc_file})"
+        text = f"{shell} completion: {payload.get('state')}\nscript: {script_file}"
+        if rc_file:
+            text += f"\nrc: {rc_file} ({payload.get('rc_state')})"
         message = payload.get("message")
         if message:
             text += f"\n{message}"

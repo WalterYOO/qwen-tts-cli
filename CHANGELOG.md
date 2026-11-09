@@ -7,6 +7,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Shell 补全安装布局**：`qtts completion --install` 不再把完整补全脚本写进 `~/.zshrc`/`~/.bashrc`。zsh 优先复用一个已在 `fpath` 中的目录（含 Oh My Zsh `custom/completions`），否则写 `~/.zfunc/_qtts` 并只追加 `fpath` + `compinit` 三行 block；bash 优先使用 bash-completion drop-in，否则写 `~/.local/share/qtts/completion.bash` 并追加一行 `source` block；fish 写 `fish/completions/qtts.fish` 且不碰 rc。新增 `--dir` 只写补全文件（忽略全局 `QTTS_COMPLETION_RC`）；marker 版本升到 v2，`--install`/`--uninstall` 会清理旧布局文件与 block，包括 `.zshenv`/`.bash_profile` 等备用 rc 中的旧 block，`--status` 会把这些残留报告为 `stale`。
+
 ## [0.3.1] - 2026-11-09
 
 ### Added

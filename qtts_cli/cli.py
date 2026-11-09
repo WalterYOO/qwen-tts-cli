@@ -395,19 +395,23 @@ def build_parser() -> argparse.ArgumentParser:
     completion_action = completion.add_mutually_exclusive_group()
     completion_action.add_argument(
         "--install", action="store_true", default=argparse.SUPPRESS,
-        help="idempotently add a completion block to the shell rc file",
+        help="idempotently install a completion file and configure the shell",
     )
     completion_action.add_argument(
         "--uninstall", action="store_true", default=argparse.SUPPRESS,
-        help="remove the qtts completion block",
+        help="remove the qtts completion file and any rc block",
     )
     completion_action.add_argument(
         "--status", action="store_true", default=argparse.SUPPRESS,
-        help="report whether the completion block is installed and current",
+        help="report whether completion is installed and current",
     )
     completion.add_argument(
         "--rc-file", default=argparse.SUPPRESS,
-        help="override the shell rc file (install/uninstall/status)",
+        help="override the shell rc file used for the small setup block",
+    )
+    completion.add_argument(
+        "--dir", default=argparse.SUPPRESS,
+        help="only write the completion file here; do not touch shell config",
     )
     completion.add_argument(
         "--follow-symlinks", action="store_true", default=argparse.SUPPRESS,

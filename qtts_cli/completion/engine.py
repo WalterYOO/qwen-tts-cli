@@ -84,7 +84,7 @@ _FILE_DESTS = {
     "tokenizer_model_path",
     "video",
 }
-_DIR_DESTS = {"audio_dir", "cache_dir", "data_dir", "directory", "model_dir", "out_dir"}
+_DIR_DESTS = {"audio_dir", "cache_dir", "data_dir", "dir", "directory", "model_dir", "out_dir"}
 _VOICE_DESTS = {"voice", "reference_voice"}
 _MODEL_DESTS = {"model", "model_id"}
 _SHELL_VALUES = ["auto", "bash", "zsh", "fish"]
