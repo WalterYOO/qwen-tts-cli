@@ -112,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     from .commands import audiobook as audiobook_cmd
     from .commands import bench as bench_cmd
     from .commands import check as check_cmd
+    from .commands import completion as completion_cmd
     from .commands import doctor as doctor_cmd
     from .commands import dub as dub_cmd
     from .commands import finetune as finetune_cmd
@@ -383,6 +384,53 @@ def build_parser() -> argparse.ArgumentParser:
     models_prune.add_argument("--dry-run", action="store_true")
     models_prune.set_defaults(func=models_cmd.run, formatter=models_cmd.format_result)
 
+    # -- completion --------------------------------------------------------- #
+    completion = sub.add_parser(
+        "completion", help="print or install shell completion (bash, zsh, fish)"
+    )
+    completion.add_argument(
+        "shell", nargs="?", default="auto",
+        help="auto (default), bash, zsh, or fish",
+    )
+    completion_action = completion.add_mutually_exclusive_group()
+    completion_action.add_argument(
+        "--install", action="store_true", default=argparse.SUPPRESS,
+        help="idempotently add a completion block to the shell rc file",
+    )
+    completion_action.add_argument(
+        "--uninstall", action="store_true", default=argparse.SUPPRESS,
+        help="remove the qtts completion block",
+    )
+    completion_action.add_argument(
+        "--status", action="store_true", default=argparse.SUPPRESS,
+        help="report whether the completion block is installed and current",
+    )
+    completion.add_argument(
+        "--rc-file", default=argparse.SUPPRESS,
+        help="override the shell rc file (install/uninstall/status)",
+    )
+    completion.add_argument(
+        "--follow-symlinks", action="store_true", default=argparse.SUPPRESS,
+        help="write through a symlinked rc file (default: refuse)",
+    )
+    completion.add_argument(
+        "--dry-run", action="store_true", default=argparse.SUPPRESS,
+        help="show what install/uninstall would change without writing",
+    )
+    completion.add_argument(
+        "--json", action="store_true", default=argparse.SUPPRESS,
+        help="emit machine-readable JSON on stdout",
+    )
+    completion.add_argument(
+        "--quiet", action="store_true", default=argparse.SUPPRESS,
+        help="suppress the human summary",
+    )
+    completion.set_defaults(
+        func=completion_cmd.run,
+        formatter=completion_cmd.format_result,
+        needs_config=False,
+    )
+
     # -- doctor ------------------------------------------------------------- #
     doctor = sub.add_parser("doctor", help="diagnose the environment and models")
     _add_common(doctor, suppress=True)
@@ -592,13 +640,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[list[str]] = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
+    # Completion requests must not pay for config resolution, argparse help,
+    # or any command import beyond the completion package.
+    if raw_argv and raw_argv[0] == "__complete":
+        from .commands import completion as completion_cmd
+
+        return completion_cmd.complete_main(raw_argv[1:])
     # Detect --json before parsing: parse failures never produce `args`.
     want_json = "--json" in raw_argv
     parser = build_parser()
     try:
         args = parser.parse_args(raw_argv)
         want_json = want_json or bool(getattr(args, "json", False))
-        cfg = build_config(args)
+        needs_config = getattr(args, "needs_config", True)
+        cfg = build_config(args) if needs_config else None
         if getattr(args, "jsonl", False):
             # JSONL owns stdout: per-record lines are emitted by the command.
             from .commands import say as say_cmd
@@ -614,7 +669,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             payload.pop("exit_code", None)
         if payload.get("raw_stdout"):
             return int(exit_code or 0)
-        if cfg.json:
+        json_mode = bool(getattr(cfg, "json", False)) if cfg is not None else bool(
+            getattr(args, "json", False)
+        )
+        if json_mode:
             if canonical:
                 sys.stdout.write(canonical_report_text(payload))
                 sys.stdout.flush()

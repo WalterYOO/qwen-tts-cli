@@ -7,6 +7,12 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-11-09
+
+### Added
+
+- **Shell 补全**：新增 `qtts completion [auto|bash|zsh|fish]`，打印补全脚本；`--install` 以固定 marker block 幂等写入 `~/.bashrc`、`~/.zshrc` 或 fish `conf.d`，重复执行字节级不变，`--uninstall` 只删除该 block，`--status` 区分 `current`/`stale`/`not_installed`/`malformed`/`unsupported_version`/`symlink_refused`。支持 `--rc-file`/`QTTS_COMPLETION_RC`、`--follow-symlinks`、`--dry-run`、`--json`/`--quiet`；默认拒绝符号链接与损坏 marker 且零写入。补全引擎为隐藏命令 `qtts __complete`，实时遍历 argparse 树，覆盖子命令、选项、枚举、`--voice`（builtin/voice/design）、本地模型名与文件/目录类型提示；TAB 时不加载模型、不访问网络、不写缓存、不 import torch/qwen。PowerShell 本次未实现；`--opt=value` 文件路径暂不作原生补全。
+
 ## [0.3.0] - 2026-11-09
 
 ### Added

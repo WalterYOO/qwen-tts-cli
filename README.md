@@ -891,6 +891,37 @@ qtts doctor [--bench] [--json]
 
 检查 Python/torch/设备、ffmpeg/SoX、磁盘、模型完整性、依赖版本组合与钉版告警、能力矩阵。`--bench` 会真实加载模型并输出 RTF、加载耗时和峰值 RSS。
 
+### `qtts completion`
+
+```text
+qtts completion [auto|bash|zsh|fish] [--install|--uninstall|--status]
+                [--rc-file PATH] [--follow-symlinks] [--dry-run] [--json] [--quiet]
+```
+
+为 bash、zsh、fish 生成自适应补全脚本；不带动作时把脚本写到 stdout，可直接 `eval` 或重定向。`--install` 用固定 marker block 幂等写入 rc 文件（重复执行字节级不变），`--uninstall` 只删除该 block，`--status` 报告 `current`/`stale`/`not_installed`/`malformed`/`unsupported_version`/`symlink_refused`（非 `current` 退出 4）。
+
+```bash
+# 当前 shell 临时启用
+eval "$(qtts completion bash)"
+
+# 永久安装（默认检测 $SHELL / 父进程 / 平台）
+qtts completion --install
+
+# 指定 shell / 自定义 rc / 先预览
+qtts completion zsh --install
+qtts completion bash --install --rc-file ~/.bashrc
+qtts completion bash --install --dry-run --rc-file /tmp/qtts.bashrc
+
+# 查询与卸载
+qtts completion --status --json
+qtts completion --uninstall
+```
+
+- 自动检测顺序：显式 SHELL 参数 > `QTTS_COMPLETION_SHELL` > `$SHELL` > 父进程链 > 平台回退（macOS zsh、Linux bash）。无法确定时退出 2，不会猜成 bash。
+- 默认写入 `~/.bashrc`、`~/.zshrc`、`${XDG_CONFIG_HOME:-~/.config}/fish/conf.d/qtts.fish`。macOS 的 Terminal 可能以 login shell 读取 `~/.bash_profile`；若它不 source `~/.bashrc`，请用 `--rc-file ~/.bash_profile`。
+- 默认拒绝符号链接；dotfiles 管理场景显式加 `--follow-symlinks` 写入其 target。marker 不完整/重复时退出 4 且零写入。
+- 补全由隐藏命令 `qtts __complete` 驱动，始终读取实时 argparse 树；TAB 时只读扫描本地音色/模型元数据，不加载模型、不访问网络、不写缓存。已知限制：PowerShell 尚未实现；`--opt=value` 形式的文件路径不作原生补全（改用 `--opt value`）。
+
 ---
 
 ## 后端与插件
