@@ -544,6 +544,35 @@ def test_success_schema_and_json_equals_report(tmp_path, monkeypatch, capsys):
     assert "/nonexistent" not in out
 
 
+def test_qc_metrics_is_opt_in_and_nested(tmp_path, monkeypatch, capsys):
+    engine = FakeEngine(durations=[0.5] * 8)
+    _install_fake_runtime(monkeypatch, engine=engine)
+    code, _out, err, payload = _run(
+        tmp_path, capsys, ["--suite", "smoke", "--qc-metrics", "basic"]
+    )
+    assert code == 0
+    assert err == ""
+    assert payload["qc"]["metrics_mode"] == "basic"
+    assert len(payload["qc"]["cases"]) == 2
+    for case in payload["qc"]["cases"]:
+        assert case["case_id"]
+        assert case["metrics"]["duration_s"] > 0
+        assert "unavailable" in case
+        assert case["completion"] is not None
+    # Existing gates are unchanged by the additive QC block.
+    assert payload["gate_failures"] == []
+
+    code, _out, _err, payload = _run(tmp_path, capsys, ["--suite", "smoke"])
+    assert code == 0
+    assert "qc" not in payload
+
+    code, _out, err, _payload = _run(
+        tmp_path, capsys, ["--suite", "smoke", "--dry-run", "--qc-metrics", "basic"]
+    )
+    assert code == 2
+    assert "--qc-metrics" in err
+
+
 def test_batch_count_cycles_and_language_filter(tmp_path, monkeypatch, capsys):
     engine = FakeEngine(durations=[0.2] * 32)
     _install_fake_runtime(monkeypatch, engine=engine)

@@ -178,6 +178,9 @@ def _validate_args(args) -> tuple[int, int, bool]:
     if not 1 <= runs <= 10:
         raise UsageError("--runs must be within [1, 10]")
 
+    if getattr(args, "qc_metrics", None) and args.dry_run:
+        raise UsageError("--qc-metrics cannot be used with --dry-run")
+
     if getattr(args, "voice", None) is not None:
         _parse_voice(args.voice)
 
@@ -854,6 +857,36 @@ def run(cfg, args) -> dict[str, Any]:
     for record in execution.cases:
         _sanitize_numbers(record)
 
+    qc_payload: Optional[dict[str, Any]] = None
+    qc_metrics_mode = getattr(args, "qc_metrics", None)
+    if qc_metrics_mode:
+        from ..audio_qc import analyze
+
+        qc_cases: list[dict[str, Any]] = []
+        for case, audio, sample_rate in execution.last_run_audio:
+            measured = analyze(
+                audio,
+                sample_rate,
+                text=case.text,
+                language=case.language,
+                metrics=qc_metrics_mode,
+            )
+            qc_cases.append(
+                {
+                    "case_id": case.id,
+                    "language": case.language,
+                    "metrics": {
+                        key: value
+                        for key, value in measured.items()
+                        if key not in ("unavailable", "completion", "analysis")
+                    },
+                    "unavailable": measured.get("unavailable") or {},
+                    "completion": measured.get("completion"),
+                    "analysis": measured.get("analysis"),
+                }
+            )
+        qc_payload = {"metrics_mode": qc_metrics_mode, "cases": qc_cases}
+
     gate_failures: list[dict[str, Any]] = []
     if args.max_cer is not None:
         value = execution.metrics["cer"]
@@ -919,6 +952,8 @@ def run(cfg, args) -> dict[str, Any]:
         reference_embedding_source=reference_source,
         gate_failures=gate_failures,
     )
+    if qc_payload is not None:
+        payload["qc"] = qc_payload
     exit_code = 5 if gate_failures else 0
     if getattr(args, "report", None) is not None:
         try:

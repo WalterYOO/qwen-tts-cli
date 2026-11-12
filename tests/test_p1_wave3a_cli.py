@@ -197,6 +197,64 @@ def test_check_is_canonical_deterministic_and_has_no_absolute_paths(
     assert fake_asr.calls == [expected_call, expected_call]
 
 
+def test_check_qc_metrics_is_opt_in(
+    fake_asr, capsys, tmp_path: Path, model_dir: Path
+):
+    _add_asr_model(model_dir)
+    audio = _write_wav(tmp_path / "tone.wav")
+
+    rc = _run(
+        tmp_path, model_dir, "check", str(audio), "--text", "你好，世界！", "--json"
+    )
+    assert rc == 0
+    assert "qc" not in json.loads(capsys.readouterr().out)
+
+    rc = _run(
+        tmp_path, model_dir, "check", str(audio), "--text", "你好，世界！",
+        "--qc-metrics", "full", "--json",
+    )
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["qc"]["metrics_mode"] == "full"
+    assert payload["qc"]["metrics"]["duration_s"] == pytest.approx(1.0, abs=0.01)
+    assert payload["qc"]["metrics"]["sample_rate"] == 24000
+    assert "unavailable" in payload["qc"]
+    assert payload["qc"]["completion"] is not None
+    # QC is reporting-only: the CER verdict still owns the exit code.
+    assert payload["ok"] is True
+
+
+def test_check_qc_recipe_is_forwarded(
+    fake_asr, capsys, tmp_path: Path, model_dir: Path, monkeypatch
+):
+    _add_asr_model(model_dir)
+    audio = _write_wav(tmp_path / "tone.wav")
+    recipe_path = tmp_path / "tone.recipe.json"
+    recipe = {"sampling": {"max_new_tokens": 64, "codec_rate": 12.5}}
+    recipe_path.write_text(json.dumps(recipe), encoding="utf-8")
+    captured: dict = {}
+    original = check_cmd.analyze
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(check_cmd, "analyze", spy)
+    assert _run(
+        tmp_path, model_dir, "check", str(audio), "--text", "你好，世界！",
+        "--qc-metrics", "basic", "--qc-recipe", str(recipe_path), "--json",
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert captured["recipe"] == recipe
+    assert payload["qc"]["recipe"] == "tone.recipe.json"
+
+    assert _run(
+        tmp_path, model_dir, "check", str(audio), "--text", "你好，世界！",
+        "--qc-recipe", str(recipe_path),
+    ) == 2
+    assert "--qc-recipe requires --qc-metrics" in capsys.readouterr().err
+
+
 def test_check_threshold_boundary_is_inclusive(
     fake_asr, capsys, tmp_path: Path, model_dir: Path
 ):

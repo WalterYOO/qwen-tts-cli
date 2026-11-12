@@ -7,6 +7,17 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-12
+
+### Added
+
+- **多音色归档**：`voice export --all --out-dir DIR` 与 `voice import-bundle DIR [--force] [--dry-run]`。bundle 目录以 `bundle.json`（`format="qtts-voice-bundle"`、`bundle_schema_version=2`）索引若干单音色 `.qttsvoice`（archive schema 1 不变），逐个记录 `name/kind/archive/sha256/size`。导出/导入都先 staging 全部归档再统一发布，失败整体回滚；导出写 `.bundle-export.json`、导入写 `.bundle-import.json`，崩溃后自动恢复（发布中回滚、已提交保留）。拒绝大小写冲突、symlink、非托管文件、大小/哈希不符；导入 `--dry-run` 只校验不落盘。
+- **`design prune RUN_DIR --keep N`**：按 report 排序保留前 N 个候选，其余进入一等 `pruned` 状态（`run.json` 记录 `pruned/pruned_sha256`，`wav/recipe=null`）。默认 dry-run，`--yes` 才执行；两阶段 `.prune/<uuid>` 移动 + 原子重写 manifest，异常恢复，启动时按 journal 修复中断状态；拒绝 symlink 目录/候选。report/CSV 将 pruned 候选排在最后且不参与 best/missing_full 统计。
+- **check/bench 声学指标（opt-in）**：`check --qc-metrics basic|full`（另支持 `--qc-recipe`、`--hnr-backend`）与 `bench --qc-metrics basic|full`。结果写入嵌套 `qc`（check 为单个 `metrics`，bench 为 `qc.cases[]`），只报告，不改变 CER/WER 门禁与退出码；`--qc-recipe` 未配 `--qc-metrics` → 2，bench 与 `--dry-run` 同用 → 2。
+- **多语言设计模板**：`design init --language ja|ko|de|fr|ru|pt|es|it` 与对应 `qtts/<lang>-podcast-host/v1` 模板；非中文模板用英文 renderer 编译，lint 接受 10 种语言并按模板语言校验。
+- **Windows run 锁**：`design explore` 的 `.lock` 在 Windows 使用 `msvcrt.locking(LK_NBLCK)`，POSIX 继续用 `fcntl.flock`，拿不到统一退出 2。
+- **design report CSV 补全**：新增 F0 mean/std/p10/p90 与 LTAS slope 列；report 目录为 symlink/非目录时拒绝写入。
+
 ## [0.4.0] - 2026-11-12
 
 ### Added

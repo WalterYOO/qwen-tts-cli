@@ -38,9 +38,14 @@ CSV_COLUMNS = [
     "clipping_ratio",
     "silence_ratio",
     "f0_" + "median" + "_hz",
+    "f0_" + "mean" + "_hz",
+    "f0_" + "std" + "_hz",
+    "f0_" + "p10" + "_hz",
+    "f0_" + "p90" + "_hz",
     "voiced_ratio",
     "hnr_db",
     "spectral_centroid_hz",
+    "ltas_slope_db_per_octave",
     "hf_lf_db",
     "failure_count",
 ]
@@ -145,6 +150,30 @@ def _candidate_payload(
         payload["degraded"] = True
         return payload
 
+    if record.get("pruned"):
+        payload.update(
+            {
+                "status": "pruned",
+                "generation_status": record.get("status"),
+                "audio": {
+                    "path": None,
+                    "sha256": None,
+                    "duration_s": record.get("duration_s"),
+                    "sample_rate": None,
+                    "channels": None,
+                },
+                "metrics": {},
+                "completion": {"status": "pruned", "reasons": ["pruned"]},
+                "reasons": ["pruned"],
+                "unavailable": {},
+                "failure_count": 0,
+                "degraded": False,
+                "rank": None,
+                "recommended": False,
+            }
+        )
+        return payload
+
     if str(record.get("status") or "").lower() == "failed":
         return fail(record.get("error") or "generation_failed")
     if wav_path is None or rel_path is None:
@@ -224,9 +253,14 @@ def _write_csv(path: Path, candidates: list[dict[str, Any]]) -> None:
             _metric(metrics, "clipping_ratio"),
             _metric(metrics, "silence_ratio"),
             _metric(metrics, "f0_" + "median" + "_hz"),
+            _metric(metrics, "f0_" + "mean" + "_hz"),
+            _metric(metrics, "f0_" + "std" + "_hz"),
+            _metric(metrics, "f0_" + "p10" + "_hz"),
+            _metric(metrics, "f0_" + "p90" + "_hz"),
             _metric(metrics, "voiced_ratio"),
             _metric(metrics, "hnr_db"),
             _metric(metrics, "spectral_centroid_hz"),
+            _metric(metrics, "ltas_slope_db_per_octave"),
             _metric(metrics, "hf_lf_db"),
             candidate.get("failure_count", 0),
         ]
@@ -250,8 +284,9 @@ def _write_markdown(path: Path, report: dict[str, Any]) -> None:
         "| --- | --- | --- | --- | --- | --- |",
     ]
     for candidate in report.get("candidates") or []:
+        rank = "" if candidate.get("rank") is None else candidate.get("rank")
         lines.append(
-            f"| {candidate.get('rank')} | `{candidate.get('take_id')}` | "
+            f"| {rank} | `{candidate.get('take_id')}` | "
             f"{candidate.get('status')} | {(candidate.get('completion') or {}).get('status')} | "
             f"{candidate.get('failure_count')} | "
             f"{'yes' if candidate.get('recommended') else ''} |"
@@ -275,7 +310,7 @@ def _write_html(path: Path, report: dict[str, Any], run_dir: Path) -> None:
             "<td><audio controls preload=\"none\" src=\"{src}\"></audio></td></tr>".format(
                 rec="1" if candidate.get("recommended") else "0",
                 take=html.escape(str(candidate.get("take_id"))),
-                rank=candidate.get("rank"),
+                rank="" if candidate.get("rank") is None else candidate.get("rank"),
                 status=html.escape(str(candidate.get("status"))),
                 completion=html.escape(str((candidate.get("completion") or {}).get("status"))),
                 failures=candidate.get("failure_count"),
@@ -354,6 +389,31 @@ def _write_reel(path: Path, run_dir: Path, candidates: list[dict[str, Any]], gap
     return warnings
 
 
+def analyze_run(
+    run_dir: str | Path,
+    *,
+    metrics: str = "basic",
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Measure and rank a run without writing anything under ``report/``."""
+    root = Path(run_dir).expanduser()
+    manifest_path = root / "run.json"
+    if not manifest_path.is_file():
+        raise InputError(f"not a design run directory: {root}", details={"path": str(root)})
+    manifest = read_json(manifest_path)
+    candidates = [
+        _candidate_payload(root, record, metrics_mode=metrics)
+        for record in (manifest.get("candidates") or [])
+    ]
+    analyzable = [item for item in candidates if item.get("status") != "pruned"]
+    pruned = [item for item in candidates if item.get("status") == "pruned"]
+    analyzable.sort(key=_rank_key)
+    for rank, candidate in enumerate(analyzable, start=1):
+        candidate["rank"] = rank
+        candidate["recommended"] = False
+    pruned.sort(key=lambda item: str(item.get("take_id") or ""))
+    return manifest, analyzable + pruned
+
+
 def build_report(
     run_dir: str | Path,
     *,
@@ -366,22 +426,13 @@ def build_report(
     fail_on_degraded: bool = False,
 ) -> dict[str, Any]:
     root = Path(run_dir).expanduser()
-    manifest_path = root / "run.json"
-    if not manifest_path.is_file():
-        raise InputError(f"not a design run directory: {root}", details={"path": str(root)})
     if not 0.0 <= float(gap) <= 30.0:
         raise InputError("--gap must be between 0 and 30 seconds")
-    manifest = read_json(manifest_path)
-    candidates = [
-        _candidate_payload(root, record, metrics_mode=metrics)
-        for record in (manifest.get("candidates") or [])
-    ]
-    candidates.sort(key=_rank_key)
-    for rank, candidate in enumerate(candidates, start=1):
-        candidate["rank"] = rank
-        candidate["recommended"] = False
+    manifest, candidates = analyze_run(root, metrics=metrics)
+    pruned = [item for item in candidates if item.get("status") == "pruned"]
+    analyzed = [item for item in candidates if item.get("status") != "pruned"]
 
-    complete = [item for item in candidates if (item.get("completion") or {}).get("status") == "complete"]
+    complete = [item for item in analyzed if (item.get("completion") or {}).get("status") == "complete"]
     if complete:
         complete[0]["recommended"] = True
     degraded = not complete
@@ -403,14 +454,16 @@ def build_report(
     )
     missing_full = any(
         candidate["metrics"].get(key) is None
-        for candidate in candidates
+        for candidate in analyzed
         for key in mandatory
     )
     if metrics == "full" and missing_full:
         warnings.append("some full metrics are unavailable")
+    if pruned:
+        warnings.append(f"{len(pruned)} candidate(s) pruned")
 
     measured = next(
-        (item["metrics"].get("analysis") for item in candidates if item["metrics"].get("analysis")),
+        (item["metrics"].get("analysis") for item in analyzed if item["metrics"].get("analysis")),
         {},
     )
     report = {
@@ -431,6 +484,8 @@ def build_report(
         "candidates": candidates,
         "summary": {
             "count": len(candidates),
+            "analyzed_count": len(analyzed),
+            "pruned": len(pruned),
             "complete": len(complete),
             "degraded": degraded,
             "best_take_id": complete[0]["take_id"] if complete else None,
@@ -440,6 +495,13 @@ def build_report(
     }
 
     report_dir = root / "report"
+    if report_dir.is_symlink():
+        raise InputError(
+            f"report directory is a symlink; refusing to write: {report_dir}",
+            details={"path": str(report_dir)},
+        )
+    if report_dir.exists() and not report_dir.is_dir():
+        raise InputError(f"report path is not a directory: {report_dir}")
     report_dir.mkdir(parents=True, exist_ok=True)
     if write_reel:
         try:
@@ -471,8 +533,9 @@ def format_result(payload: dict[str, Any]) -> str:
         f"complete={summary.get('complete', 0)} best={summary.get('best_take_id')}"
     ]
     for candidate in payload.get("candidates") or []:
+        rank = "-" if candidate.get("rank") is None else candidate.get("rank")
         lines.append(
-            f"  #{candidate.get('rank')} {candidate.get('take_id')} "
+            f"  #{rank} {candidate.get('take_id')} "
             f"completion={(candidate.get('completion') or {}).get('status')} "
             f"failures={candidate.get('failure_count')}"
             f"{' recommended' if candidate.get('recommended') else ''}"

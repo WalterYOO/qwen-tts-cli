@@ -36,7 +36,7 @@
 |---|---|
 | **统一生成入口** | `qtts say` 通过 `builtin:` / `voice:` / `design:` 三种引用自动路由到 CustomVoice、Base 克隆或 VoiceDesign |
 | **音色资产库** | 克隆音色、设计音色、设计后固化为克隆 profile；支持列出、检查、试听、删除 |
-| **结构化音色设计** | `design init/lint/explore/report/freeze` 用 YAML 描述音色身份与交付基线，离线编译/评分，候选矩阵生成、指标排序、盲听听审与 recipe 固化 |
+| **结构化音色设计** | `design init/lint/explore/report/freeze/prune` 用 YAML 描述音色身份与交付基线，离线编译/评分，候选矩阵生成、指标排序、盲听听审、recipe 固化与候选清理；模板覆盖 zh/en/ja/ko/de/fr/ru/pt/es/it |
 | **参考音频准入** | 时长、采样率、削波、静音比例、有效语音占比等检查；保存 consent/license 元数据 |
 | **文本流水线** | 数字/日期/金额/URL/emoji 规范化，语义分段，token/时长预算，逐段语言标记 |
 | **字幕与对齐** | `align` 和 `say --subtitle` 输出 SRT / VTT / ASS / JSON；内容逐字来自规范化原文 |
@@ -53,7 +53,7 @@
 | **视频配音** | `dub build` 解析 SRT/CMX3600 子集 EDL，逐句合成、按帧放置、静音补齐与 `atempo` 时长适配；支持逐角色音色/stems、视频背景 bed、mux、响度与 true-peak |
 | **模型微调** | `finetune prepare/train/eval` 调用官方脚本准备 JSONL、训练与评测；校验/选择 checkpoint，注册为 `voice:` profile，并以 CER/说话人相似度门禁评测 |
 | **自动参考文本** | `voice add --kind clone --auto-ref-text` 用 ASR 转写参考音频，作为 ICL 的 `ref_text` 并记录来源与模型 |
-| **音色归档** | `voice export/import` 单文件 `.qttsvoice`，白名单成员、流式校验、原子替换 |
+| **音色归档** | `voice export/import` 单文件 `.qttsvoice`，白名单成员、流式校验、原子替换；`voice export --all` / `import-bundle` 多音色目录（bundle schema 2，崩溃可恢复） |
 | **btts 导入** | `voice import-btts` 直接消费 `btts voice export --mode full` 目录/zip，校验 manifest 与路径安全；clone 复用参考音频+文本，design 需 ASR/显式文本/xvec，保留 btts provenance |
 | **项目锁文件** | `project init/lock` 固定模型全量 sha256、音色、采样参数、字幕策略与运行时版本 |
 | **计划与诊断** | `--dry-run` 不加载模型即可输出分段与预算；`doctor --bench` 产出本机性能基线 |
@@ -294,7 +294,7 @@ qtts say "你好。" --voice "builtin:Vivian" --qc \
   --max-clipping-ratio 0.001 --target-lufs -16 --lufs-tolerance 1.0 --out hello.wav
 ```
 
-`check` 的参考文本与 ASR 文本走同一归一化管道（标点/符号移除、空白折叠、大小写折叠）；`ratio = distance / max(1, 参考单元数)`，`ratio <= threshold` 通过（默认 0.03），否则退出 5。归一化、编辑距离与错误片段均可复现；Wave 3a 冻结时间戳，`errors[].start/end` 固定为 `null`。`check` 单次音频上限 300 秒，超过在加载模型前退出 4。
+`check` 的参考文本与 ASR 文本走同一归一化管道（标点/符号移除、空白折叠、大小写折叠）；`ratio = distance / max(1, 参考单元数)`，`ratio <= threshold` 通过（默认 0.03），否则退出 5。归一化、编辑距离与错误片段均可复现；Wave 3a 冻结时间戳，`errors[].start/end` 固定为 `null`。`check` 单次音频上限 300 秒，超过在加载模型前退出 4。`check --qc-metrics basic|full` 可附带声学指标（`--qc-recipe` 必须与 `--qc-metrics` 同用），结果只写入嵌套 `qc`，不参与 CER/WER 门禁。
 
 `qc` 的阈值全部可选，未显式给出的指标只测量不判定。`lufs_integrated` 用 BS.1770-4（K-weighting、400ms 块、绝对 -70 LUFS 与相对 -10 LU 门限），`true_peak_dbtp` 至少 4x 过采样；数字静音、音频过短或 scipy 不可用时返回 `null`，并在 `unavailable` 中以稳定枚举说明原因，绝不编造数值。`--reference-voice` 额外计算说话人余弦相似度，需要 Base 模型。`--json` 与 `--report` 生成逐字节相同的排序 JSON，不含绝对路径、时间戳或耗时。
 
@@ -329,9 +329,12 @@ qtts bench --suite longform --text-file script.txt \
 
 # 只解析模型/音色与计划，不加载模型、不写文件
 qtts bench --suite smoke --dry-run
+
+# 每个 case 附带声学指标（只报告，不影响 CER/相似度门禁）
+qtts bench --suite smoke --qc-metrics basic --json
 ```
 
-`bench` 的计时使用外部 `time.perf_counter()` 未舍入值聚合：`runs[].wall_s` 不含加载，`metrics.wall_s` 含加载但不含评分/报告，`rtf` 取每 run 中位数，`wall_rtf = 全场 wall_s / 全场 audio_s`。默认 `--suite smoke` 跑内置中英各一句；`batch` 从 16 条短句按语言过滤后循环取 `--count`；`longform` 用 `--text` > `--text-file` > 内置长文，经 `plan.build_plan()` 分段后逐段生成。`--dry-run` 只做目录/元数据/文件存在性与计划，不 import torch/qwen、不加载权重、不创建文件。真实运行时严格按 TTS → 释放 → ASR（可选）→ 释放 → Base（可选）单驻留顺序，`finally` 释放所有已加载模型。CER 按字符编辑距离、逐 case 语言转写；speaker-sim 优先使用 clone profile 的 `ref_spk_embedding`，否则用同一 Base 从 `ref.wav` 提取，并在报告中记录 `reference_embedding_source`。`--json` 与 `--report` 逐字节一致；门禁失败输出完整 payload、`ok=false`、`gate_failures[]` 并退出 5；报告写失败退出 4。
+`bench` 的计时使用外部 `time.perf_counter()` 未舍入值聚合：`runs[].wall_s` 不含加载，`metrics.wall_s` 含加载但不含评分/报告，`rtf` 取每 run 中位数，`wall_rtf = 全场 wall_s / 全场 audio_s`。默认 `--suite smoke` 跑内置中英各一句；`batch` 从 16 条短句按语言过滤后循环取 `--count`；`longform` 用 `--text` > `--text-file` > 内置长文，经 `plan.build_plan()` 分段后逐段生成。`--dry-run` 只做目录/元数据/文件存在性与计划，不 import torch/qwen、不加载权重、不创建文件。真实运行时严格按 TTS → 释放 → ASR（可选）→ 释放 → Base（可选）单驻留顺序，`finally` 释放所有已加载模型。CER 按字符编辑距离、逐 case 语言转写；speaker-sim 优先使用 clone profile 的 `ref_spk_embedding`，否则用同一 Base 从 `ref.wav` 提取，并在报告中记录 `reference_embedding_source`。`--json` 与 `--report` 逐字节一致；门禁失败输出完整 payload、`ok=false`、`gate_failures[]` 并退出 5；报告写失败退出 4。`--qc-metrics basic|full` 为每个 case 生成 `qc` 指标，仅报告、不改变退出码；与 `--dry-run` 互斥。
 
 ### 13. 多 take 资产库
 
@@ -585,7 +588,8 @@ qtts say [TEXT | - | --file FILE | --script FILE | --stdin --jsonl]
 ### `qtts design`
 
 ```text
-qtts design init FILE [--template T] [--name NAME] [--language zh|en] [--force]
+qtts design init FILE [--template T] [--name NAME]
+  [--language zh|en|ja|ko|de|fr|ru|pt|es|it] [--force]
 qtts design lint FILE [--show-rendered] [--strict] [--json]
 qtts design explore FILE --out RUN_DIR [--resume] [--wide]
   [--seeds 19,97] [--sampling default|stable|expressive]...
@@ -596,13 +600,15 @@ qtts design report RUN_DIR [--metrics basic|full]
 qtts design freeze RUN_DIR --take TAKE --name NAME --as clone|design
   [--confirm-transcript] [--ref-text TEXT] [--allow-long-ref]
   [--allow-incomplete] [--force] [--tag TAG]... [--i-have-rights]
+qtts design prune RUN_DIR --keep N [--dry-run | --yes] [--json]
 ```
 
 - 设计 YAML 是 btts 风格的结构化字段（`identity`/`delivery_baseline`/`scene`/`avoid`/`covers`）加 qtts 模板；`description` 与 `instruction_override` 是逃生口，优先级 `instruction_override > description > compiler`。YAML 拒绝 anchor/alias、重复 key、超过 256 KiB 与非 UTF-8。
 - `lint` 离线确定性运行；解析错误退出 4，block 退出 1，`--strict` 下 warning 也退出 1。输出五维评分与 `green/yellow/red`；有 block 时强制 red。
-- `explore` 默认 2 个 seed × 2 个采样 profile × 1 条 cover；`--wide` 叠加第二条 cover，候选上限 16（显式更大矩阵需 `--yes`）。每次候选写 WAV 与 recipe，`run.json` 是唯一索引；`--dry-run` 不加载模型、不写盘。
+- `explore` 默认 2 个 seed × 2 个采样 profile × 1 条 cover；`--wide` 叠加第二条 cover，候选上限 16（显式更大矩阵需 `--yes`）。每次候选写 WAV 与 recipe，`run.json` 是唯一索引；`--dry-run` 不加载模型、不写盘。run 锁在 POSIX 用 `fcntl.flock`、Windows 用 `msvcrt.locking`，冲突退出 2。
 - `report` 只读 run 目录，按 `failure_count → completion 严重度 → clipping → silence → hnr → voiced_ratio → take_id` 排序，生成 `report.json`、`metrics.csv`、`report.md`、`audition.html`（盲听模式）与 `all_candidates.wav`。缺失指标为 `null` 且不计 failure；`--require-full-metrics` 或 `--fail-on-degraded` 失败退出 5。
 - `freeze --as design` 保存可重生成的配方（YAML + rendered instruction + 哈希），`source.description` 直接可用；`--as clone` 以选中 take 为参考构建 ICL prompt，要求 `--confirm-transcript`，拒绝失败/疑似截断的候选，克隆还需 `--i-have-rights`。
+- `prune` 按 report 排序保留前 `--keep` 个候选，其余标记为 `pruned`（`wav/recipe=null`，记录 sha256）；默认 dry-run，`--yes` 执行。两阶段移动 + 原子 manifest，崩溃后按 journal 恢复；pruned 候选在 report/CSV 中排最后且不参与 best 统计。`--yes` 与 explore 共用 run 锁；RUN_DIR 视为单写者目录，不应由其他用户/进程并发写入。symlink 防护是 best-effort（会校验 resolve 后的目标仍在 RUN_DIR 内），不宣称已消除跨进程 TOCTOU。
 - 退出码：lint block 1、usage 2、模型 3、输入/解析 4、质量门禁 5、中断 130。
 
 ### `qtts script`
@@ -832,14 +838,18 @@ qtts voice list
 qtts voice inspect NAME
 qtts voice preview NAME [--text TEXT] [--out FILE] [--format wav|flac]
 qtts voice rm NAME [--yes]
-qtts voice export NAME -o FILE.qttsvoice [--force]
+qtts voice export NAME -o FILE.qttsvoice [--force] [--dry-run]
+qtts voice export --all --out-dir DIR [--force] [--dry-run]
 qtts voice import FILE.qttsvoice [--name NAME] [--force]
+qtts voice import-bundle DIR [--force] [--dry-run]
 qtts voice import-btts BUNDLE (--voice NAME ... | --all) [--name NAME]
   [--i-have-rights] [--auto-ref-text | --ref-text TEXT] [--asr-model PATH|ID]
   [--mode icl|xvec] [--model NAME] [--force]
 ```
 
 `.qttsvoice` 是 zip 容器，只允许 `manifest.json`、`voice.json`、`prompt.safetensors`、`ref.wav`、`preview.wav`；导入逐项校验路径、大小、压缩比、sha256 与 safetensors 结构，不使用 `extractall`，替换已有音色失败时回滚。
+
+`voice export --all --out-dir DIR` 输出目录包：`bundle.json`（`format="qtts-voice-bundle"`、`bundle_schema_version=2`）列出每个单音色 `.qttsvoice`（archive schema 1）的 `name/kind/archive/sha256/size`；`voice import-bundle DIR` 校验全部归档后一次性发布，`--force` 替换、`--dry-run` 只校验。导出拒绝大小写冲突、非托管文件与 symlink 输出；导入拒绝 symlink、大小/哈希不符与大小写冲突。两侧都写 journal（`.bundle-export.json` / `.bundle-import.json`），崩溃后下一次运行自动回滚未提交事务或保留已提交结果。
 
 #### 与 btts 互操作：`voice import-btts`
 
@@ -1257,6 +1267,11 @@ FR-P1-01 至 FR-P1-11 均已实现并在本地提交；P1 期间版本号保持 
 - 有声书（已提交）与视频配音 `dub`（已实现）
 - 微调工作流 `finetune prepare|train|eval`（已提交）
 - btts 音色导入 `voice import-btts`（FR-P2-09，已提交：0.3.2）
+
+### 0.4.x 与 Phase 5（已完成）
+
+- 结构化音色设计 `design init/lint/explore/report/freeze`，full 指标与 completion 判定，voice 管理面与单音色归档
+- Phase 5：`design prune`、多语言模板、Windows run 锁、`check/bench --qc-metrics`、`voice export --all` / `voice import-bundle`（bundle schema 2）
 
 ---
 

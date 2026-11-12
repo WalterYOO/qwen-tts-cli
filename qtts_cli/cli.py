@@ -259,7 +259,9 @@ def build_parser() -> argparse.ArgumentParser:
     design_init.add_argument("file")
     design_init.add_argument("--template", help="template id (see docs)")
     design_init.add_argument("--name", help="voice name (default: file stem)")
-    design_init.add_argument("--language", choices=["zh", "en"],
+    design_init.add_argument("--language",
+                             choices=["zh", "en", "ja", "ko", "de", "fr",
+                                      "ru", "pt", "es", "it"],
                              help="design language (default: inferred from --template, else zh)")
     design_init.add_argument("--force", action="store_true")
     design_init.set_defaults(func=design_cmd.init, formatter=design_cmd.format_result)
@@ -317,6 +319,21 @@ def build_parser() -> argparse.ArgumentParser:
                                help="exit 5 when no candidate is complete")
     design_report.set_defaults(func=design_cmd.report,
                                formatter=design_cmd.format_result)
+
+    design_prune = design_sub.add_parser(
+        "prune", help="delete candidates outside the top N (default: preview)"
+    )
+    _add_common(design_prune, suppress=True)
+    design_prune.add_argument("run_dir")
+    design_prune.add_argument("--keep", type=int, required=True,
+                              help="number of best candidates to keep")
+    prune_mode = design_prune.add_mutually_exclusive_group()
+    prune_mode.add_argument("--dry-run", action="store_true",
+                            help="print the plan without deleting (default)")
+    prune_mode.add_argument("--yes", action="store_true",
+                            help="actually delete candidate files")
+    design_prune.set_defaults(func=design_cmd.prune,
+                              formatter=design_cmd.format_result)
 
     design_freeze = design_sub.add_parser(
         "freeze", help="freeze an audition take into a voice profile"
@@ -454,11 +471,17 @@ def build_parser() -> argparse.ArgumentParser:
     voice_rm.add_argument("--yes", action="store_true")
     voice_rm.set_defaults(func=voice_cmd.rm, formatter=voice_cmd.format_result)
 
-    voice_export = voice_sub.add_parser("export", help="export a voice as .qttsvoice")
+    voice_export = voice_sub.add_parser(
+        "export", help="export one voice or all voices as .qttsvoice"
+    )
     _add_common(voice_export, suppress=True)
-    voice_export.add_argument("name")
-    voice_export.add_argument("-o", "--out", required=True, help="archive path (.qttsvoice)")
-    voice_export.add_argument("--force", action="store_true", help="overwrite an existing archive")
+    voice_export.add_argument("name", nargs="?")
+    voice_export.add_argument("-o", "--out", help="archive path (.qttsvoice)")
+    voice_export.add_argument("--all", action="store_true",
+                              help="export every user voice into --out-dir")
+    voice_export.add_argument("--out-dir",
+                              help="bundle directory used with --all")
+    voice_export.add_argument("--force", action="store_true", help="overwrite existing archives")
     voice_export.add_argument("--dry-run", action="store_true",
                               help="validate and list members without writing")
     voice_export.set_defaults(func=voice_cmd.export, formatter=voice_cmd.format_result)
@@ -469,6 +492,19 @@ def build_parser() -> argparse.ArgumentParser:
     voice_import.add_argument("--name", help="install under a different name")
     voice_import.add_argument("--force", action="store_true", help="replace an existing voice")
     voice_import.set_defaults(func=voice_cmd.import_, formatter=voice_cmd.format_result)
+
+    voice_import_bundle = voice_sub.add_parser(
+        "import-bundle", help="import a directory bundle created by `voice export --all`"
+    )
+    _add_common(voice_import_bundle, suppress=True)
+    voice_import_bundle.add_argument("bundle_dir")
+    voice_import_bundle.add_argument("--force", action="store_true",
+                                     help="replace existing voices")
+    voice_import_bundle.add_argument("--dry-run", action="store_true",
+                                     help="validate the bundle without installing")
+    voice_import_bundle.set_defaults(
+        func=voice_cmd.import_bundle, formatter=voice_cmd.format_result
+    )
 
     voice_import_btts = voice_sub.add_parser(
         "import-btts", help="import voices from a btts voice export bundle"
@@ -680,6 +716,12 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--metric", choices=["auto", "cer", "wer"], default="auto")
     check.add_argument("--threshold", type=float, default=0.03,
                        help="maximum error ratio (default: 0.03)")
+    check.add_argument("--qc-metrics", choices=["basic", "full"],
+                       help="also measure audio QC metrics (opt-in)")
+    check.add_argument("--hnr-backend", choices=["praat"], default="praat",
+                       help="HNR backend used by --qc-metrics full")
+    check.add_argument("--qc-recipe",
+                       help="recipe JSON used by --qc-metrics for budget/tail checks")
     check.add_argument("--report", help="write a deterministic JSON report")
     check.set_defaults(func=check_cmd.run, formatter=check_cmd.format_result)
 
@@ -798,6 +840,8 @@ def build_parser() -> argparse.ArgumentParser:
     bench.add_argument(
         "--reference-voice", help="clone profile used as the similarity reference"
     )
+    bench.add_argument("--qc-metrics", choices=["basic", "full"],
+                       help="also measure per-case audio QC metrics (opt-in)")
     bench.add_argument("--max-cer", type=float, help="fail when CER exceeds this")
     bench.add_argument(
         "--min-speaker-similarity",

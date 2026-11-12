@@ -110,7 +110,7 @@ instruction_override: null
 - 候选 ID：`s<seed>-c<cover>-<profile>`，只含 `[a-z0-9_-]`。
 - `--dry-run` 不加载模型，打印与真实 run 相同的矩阵。
 - 一次模型加载；候选原子写 WAV/recipe 并 fsync；最后原子写 `run.json`。
-- `.lock` 用 `fcntl.flock(LOCK_EX|LOCK_NB)`；拿不到 → 2；Windows 本期明确报不支持，不静默无锁。
+- `.lock` 用 `fcntl.flock(LOCK_EX|LOCK_NB)`（POSIX）/ `msvcrt.locking(LK_NBLCK)`（Windows）；拿不到 → 2。
 - 第一次 Ctrl-C 当前 take 完成后停止，exit 130；第二次立即中断。
 - `--resume`：矩阵/采样/模板/instruction/model fingerprint 任一变化 → 2；校验 WAV sha256；`failed` 默认不重跑，`--retry-failed` 才重跑。
 
@@ -122,6 +122,7 @@ RUN_DIR/
   design.yaml              # 输入副本
   design.compiled.json     # compiled 快照
   .lock
+  .prune/<uuid>/           # prune 两阶段移动的暂存区
   candidates/<take_id>.wav
   candidates/<take_id>.recipe.json
   report/report.json
@@ -130,6 +131,8 @@ RUN_DIR/
   report/all_candidates.wav
   report/audition.html
 ```
+
+`run.json` 的候选记录新增 `pruned: true` / `pruned_sha256`；pruned 候选保留索引与指标历史，但 `wav`/`recipe` 为 `null`。
 
 `run.json` 至少：`schema_version/kind/run_id/created_at/updated_at/qtts_version/source{path,sha256}/design{name,language,template,template_sha256,schema_version,structured,rendered_instruction,rendered_sha256,compiler_version}/model{id,revision,fingerprint,path,dtype,backend}/matrix{seeds,covers,sampling_profiles,sampling_order,wide,max_new_tokens}/candidates[{take_id,seed,cover_index,sampling,status,wav,recipe,sha256,duration_s,completion_status,error}]`。
 
@@ -173,6 +176,16 @@ RUN_DIR/
 - 解析/编译 YAML；block → 2。
 - recipe 记录 `design_yaml_sha256`、`rendered_instruction_sha256`、`compiler_version`、seed/sampling。
 - `--voice design:DESC` 逐字节保持不变，并加回归测试。
+
+### 1.10 design prune
+
+- `design prune RUN_DIR --keep N`：按 report 的完整排序保留前 N 个候选，其余进入 `pruned` 状态。
+- 默认 dry-run；必须显式 `--yes` 才移动文件，两者互斥。
+- 两阶段：先把 WAV/recipe 移到 `.prune/<uuid>/`，再原子重写 `run.json`（`pruned/sha256/wav=null/recipe=null`），最后清理暂存区；任何异常在写 manifest 前恢复文件。
+- 启动时按 journal 恢复中断的 prune：manifest 未标记 pruned 的文件移回 `candidates/`；已标记的不复活。
+- 拒绝 symlink 的 `candidates`/`.prune` 目录与候选文件；`report/` 可能过期，prune 输出中提示重新生成。
+- `--yes` 与 explore 共用 `RUN_DIR/.lock`；RUN_DIR 是单写者目录，不应由其他用户/进程并发写入。symlink 检查是 best-effort（校验 `resolve()` 后仍在 RUN_DIR 内），不宣称消除跨进程 TOCTOU。
+- report/CSV 把 pruned 候选排在最后（按 take_id），`rank=null`、`recommended=false`、指标为空、completion 状态 `pruned`。
 
 ## 2. 指标层
 
@@ -226,7 +239,7 @@ qtts_cli/design_report.py     # 候选指标、排序、CSV/HTML/MD/reel
 
 `qc` 新增：`--metrics basic|full`、`--recipe FILE`、`--fail-on-incomplete`、`--require-full-metrics`、`--hnr-backend praat`，以及 opt-in 阈值：duration、voiced_ratio、hnr、f0 min/max/std、spectral centroid min/max、ltas slope min/max、hf_lf min/max。
 
-`check` 本期**不接** acoustic metrics；`--qc-metrics` 后置。`bench` 本期不接。
+`check` / `bench` 的 acoustic metrics 为 opt-in：`--qc-metrics basic|full`，`check` 另支持 `--qc-recipe FILE`（必须同时给 `--qc-metrics`）与 `--hnr-backend`。结果写入嵌套 `qc` 对象（`check`: 单个 `metrics`；`bench`: `qc.cases[]`），**只报告、不参与 CER/WER 门禁与退出码**。
 
 报告 schema 保持 1，新增 `metrics_version: 1` 与 additive 字段。
 
@@ -311,7 +324,10 @@ qtts voice import-btts ...
 - 单音色 `.qttsvoice`，archive schema 1 不变；`-o` 始终是文件。
 - `--force` 语义不变；`--dry-run` 新增。
 - **design provenance 自包含**：design profile 的 `voice.json.source.design` 内嵌 YAML（≤256 KiB）与 rendered instruction/hash/template/compiler_version；`design.yaml` 只是 profile 目录里的人类可读副本，不进入 archive。
-- 多音色 `--all` 本期不做；后续另设 `voice export --all --out-dir DIR` + `voice import-bundle DIR` + staging 原子发布。
+- 多音色：`voice export --all --out-dir DIR` 输出带 `bundle.json` 的目录，`voice import-bundle DIR [--force] [--dry-run]` 导入。
+- **schema 决策**：单音色 `.qttsvoice` 仍为 archive schema 1（兼容既有归档）；多音色容器使用独立的 bundle schema，字段名为 `bundle_schema_version: 2`，`format: "qtts-voice-bundle"`，不与 archive schema 混用。
+- bundle 逐个记录 archive 的 `name/kind/archive/sha256/size`；导出/导入均先 staging 全部 archive，再统一发布或回滚；导出拒绝大小写冲突、非托管文件与 symlink 输出目录，导入拒绝 symlink、大小/哈希不符与大小写冲突。
+- 导出写 `.bundle-export.json`、导入写 `.bundle-import.json` journal，崩溃后下一次运行自动恢复（发布中的归档回滚、已提交的保留）。
 
 ### 3.9 profile schema
 
@@ -326,9 +342,9 @@ qtts voice import-btts ...
 - **Phase 2 voice CLI 管理面**：list/filter、show、rename、tag、delete/rm、preview 约束、单音色 export dry-run、CLI 测试。
 - **Phase 3 design 离线层**：design_yaml/compile/lint、init/lint、design_run（矩阵/resume/lock）、design_report（CSV/MD/JSON/HTML/reel）、fixture 测试。
 - **Phase 4 design 模型路径**：explore、report 接真实候选、freeze design/clone、say --design、voice add --kind design 适配、模型集成测试。
-- **Phase 5 后置**：多音色 export/import-bundle、archive schema 2、check/bench metrics、Windows 锁、多语言模板、design prune。
+- **Phase 5**：多音色 export/import-bundle（bundle schema 2）、check/bench metrics、Windows 锁、多语言模板、design prune。
 
-> 实施状态（2026-11-12）：Phase 0–4 已实现，design 测试 55 passed，全量测试仅剩两项既有的缺失 `qwen-asr` 失败；Phase 5 按计划后置。
+> 实施状态（2026-11-12）：Phase 0–5 已实现；全量测试在带 `qwen-asr` 的工具环境下全绿（裸 `uv run` 仅剩两项既有的缺失 `qwen-asr` 失败）。Phase 5 的 archive 多音色容器使用 `bundle_schema_version: 2`，单音色 archive 仍为 schema 1。
 
 ## 5. 测试策略（P0）
 

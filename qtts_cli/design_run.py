@@ -107,35 +107,62 @@ def build_matrix(
     }
 
 
+def _lock_handle(handle, path: Path) -> None:
+    """Take a non-blocking exclusive lock on ``handle`` for this platform."""
+    if sys.platform.startswith("win"):
+        import msvcrt
+
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            raise UsageError(f"design run is locked: {path.parent}") from exc
+    else:
+        import fcntl
+
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise UsageError(f"design run is locked: {path.parent}") from exc
+
+
+def _unlock_handle(handle) -> None:
+    if sys.platform.startswith("win"):
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 class RunLock:
-    """Advisory lock on ``RUN_DIR/.lock``; non-POSIX platforms are refused."""
+    """Advisory lock on ``RUN_DIR/.lock`` (fcntl on POSIX, msvcrt on Windows)."""
 
     def __init__(self, run_dir: str | Path) -> None:
         self.path = Path(run_dir).expanduser() / ".lock"
         self.handle = None
 
     def __enter__(self):
-        if sys.platform.startswith("win"):
-            raise UsageError("design runs require POSIX file locking; Windows is not supported yet")
-        import fcntl
-
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.handle = open(self.path, "a+")
         try:
-            fcntl.flock(self.handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
+            _lock_handle(self.handle, self.path)
+        except BaseException:
             self.handle.close()
             self.handle = None
-            raise UsageError(f"design run is locked: {self.path.parent}") from exc
+            raise
         return self
 
     def __exit__(self, *exc_info) -> None:
         if self.handle is not None:
-            import fcntl
-
-            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
-            self.handle.close()
-            self.handle = None
+            try:
+                _unlock_handle(self.handle)
+            finally:
+                self.handle.close()
+                self.handle = None
 
 
 def matrix_signature(matrix: dict[str, Any]) -> str:

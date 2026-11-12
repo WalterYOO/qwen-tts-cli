@@ -10,6 +10,7 @@ import numpy as np
 
 from ..asr_engine import AsrEngine, canonical_asr_language
 from ..audio_io import read_audio
+from ..audio_qc import analyze
 from ..catalog import scan, select_asr
 from ..errors import InputError, UsageError
 from ..qc import (
@@ -24,7 +25,7 @@ from ..qc import (
 from ..quality import write_report
 from ..subtitles import parse_srt
 from ..textnorm import NORMALIZATION_VERSION
-from ..utils import sha256_file
+from ..utils import read_json, sha256_file
 
 MAX_CHECK_SECONDS = 300.0
 
@@ -161,6 +162,45 @@ def run(cfg, args) -> dict[str, Any]:
     qc_lang = qc_language(args.language, reference_text)
     metric = resolve_metric(args.language, reference_text, args.metric)
 
+    qc_payload = None
+    qc_metrics_mode = getattr(args, "qc_metrics", None)
+    qc_recipe = None
+    recipe_path = getattr(args, "qc_recipe", None)
+    if recipe_path and not qc_metrics_mode:
+        raise UsageError("--qc-recipe requires --qc-metrics")
+    if recipe_path:
+        try:
+            qc_recipe = read_json(Path(recipe_path).expanduser())
+        except (OSError, ValueError) as exc:
+            raise InputError(
+                f"cannot read --qc-recipe {recipe_path}: {exc}",
+                details={"path": str(recipe_path)},
+            ) from exc
+        if not isinstance(qc_recipe, dict):
+            raise InputError("--qc-recipe must contain a JSON object")
+    if qc_metrics_mode:
+        measured = analyze(
+            samples,
+            sr,
+            text=reference_text,
+            language=qc_lang,
+            metrics=qc_metrics_mode,
+            recipe=qc_recipe,
+            hnr_backend=getattr(args, "hnr_backend", "praat"),
+        )
+        qc_payload = {
+            "metrics_mode": qc_metrics_mode,
+            "metrics": {
+                key: value
+                for key, value in measured.items()
+                if key not in ("unavailable", "completion", "analysis")
+            },
+            "unavailable": measured.get("unavailable") or {},
+            "completion": measured.get("completion"),
+            "analysis": measured.get("analysis"),
+            "recipe": Path(recipe_path).expanduser().name if recipe_path else None,
+        }
+
     engine = AsrEngine(cfg, model)
     transcription = engine.transcribe(
         args.audio, language=asr_language, timestamps=False
@@ -190,6 +230,8 @@ def run(cfg, args) -> dict[str, Any]:
         sample_rate=sr,
         channels=int(samples.shape[1]),
     )
+    if qc_payload is not None:
+        payload["qc"] = qc_payload
     if getattr(args, "report", None):
         write_report(args.report, payload)
     payload["_canonical"] = True

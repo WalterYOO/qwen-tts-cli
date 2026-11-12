@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 from .design_compile import CompiledDesign
-from .design_yaml import TEMPLATES
+from .design_yaml import SUPPORTED_LANGUAGES, TEMPLATES
 from .errors import InputError
 from .voice_store import validate_name
 
@@ -80,7 +80,7 @@ def lint_design(document: dict[str, Any], compiled: CompiledDesign) -> dict[str,
                    "instruction looks like dialogue; keep spoken lines in covers")
         )
 
-    if language not in ("zh", "en"):
+    if language not in SUPPORTED_LANGUAGES:
         level = "warn" if (override or description) else "block"
         issues.append(
             _issue(level, "unsupported-language",

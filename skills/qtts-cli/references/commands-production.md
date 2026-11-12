@@ -68,6 +68,7 @@ qtts check AUDIO (--text TEXT | --text-file FILE | --srt FILE)
   [--language auto|Chinese|English|...]
   [--asr-model PATH|ID] [--metric auto|cer|wer]
   [--threshold 0.03] [--report FILE] [--json]
+  [--qc-metrics basic|full] [--qc-recipe FILE] [--hnr-backend praat]
 ```
 
 - 参考输入三者互斥且必须给一个；音频不存在/不可读、超过 300s 退出 4（加载模型前）。
@@ -78,6 +79,9 @@ qtts check AUDIO (--text TEXT | --text-file FILE | --srt FILE)
   units/reference/hypothesis/errors/asr/comparison_language/normalization`；
   `--json` 与 `--report` 逐字节一致。`--report` 不得指向被分析音频；没有碰撞检查。
 - 语言非法或 ASR 模型不支持时在加载权重前退出 2；ASR 缺失 3、歧义 2。
+- `--qc-metrics` 为 opt-in，结果写入嵌套 `qc`（`metrics_mode/metrics/unavailable/
+  completion/analysis/recipe`）；只报告，不参与 CER/WER 门禁。`--qc-recipe` 必须
+  同时给 `--qc-metrics`，否则退出 2。
 
 ## qc
 
@@ -136,6 +140,7 @@ qtts bench --suite smoke|batch|longform
   [--cer] [--asr-model ID]
   [--speaker-sim --reference-voice NAME]
   [--max-cer R] [--min-speaker-similarity S]
+  [--qc-metrics basic|full]
   [--dry-run] [--report FILE] [--json]
 ```
 
@@ -145,6 +150,8 @@ qtts bench --suite smoke|batch|longform
 - 指标：`load_ms`、cold/warm first segment、`wall_s`、`generate_s`、`audio_s`、
   `rtf`、`wall_rtf`、RSS、可选 CER/说话人相似度。
 - `--dry-run` 不加载模型、不 import torch/qwen、不写文件。
+- `--qc-metrics basic|full` 为每个 case 写 `qc.cases[]` 指标，只报告、不改变
+  退出码；与 `--dry-run` 互斥（退出 2）。
 - 门禁失败仍输出完整 payload，`ok=false`、`gate_failures[]`，退出 5；
   报告写失败退出 4。`--report` 不得指向输入/音频；没有碰撞检查。
 

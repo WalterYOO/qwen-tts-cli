@@ -23,7 +23,12 @@ from ..sidecar import build_recipe, recipe_path, write_recipe
 from ..textnorm import NORMALIZATION_VERSION
 from ..tts_engine import TtsEngine, clear_model_cache
 from ..utils import atomic_write_bytes, confirm, eprint, is_tty, sha256_file
-from ..voice_archive import export_voice, import_voice
+from ..voice_archive import (
+    export_bundle,
+    export_voice,
+    import_bundle as import_voice_bundle,
+    import_voice,
+)
 from ..voice_btts import BttsBundle, BundleVoice, load_bundle, read_bundle_file
 from ..voice_store import VoiceStore, utc_now, validate_name
 
@@ -69,7 +74,13 @@ def _require_consent(args) -> dict[str, Any]:
 def _add_clone(cfg, args) -> dict[str, Any]:
     name = validate_name(args.name)
     store = VoiceStore(cfg.data_dir)
-    if store.exists(name):
+    actual = store.existing_names().get(name.casefold())
+    if actual is not None:
+        if actual != name:
+            raise InputError(
+                f"voice name collides case-insensitively with existing {actual!r}: "
+                f"{name!r}"
+            )
         raise InputError(f"voice already exists: {name}")
     if not args.ref_audio:
         raise UsageError("voice add --kind clone requires --ref-audio FILE")
@@ -260,7 +271,13 @@ def _freeze_clone_prompt(
 def _add_design(cfg, args) -> dict[str, Any]:
     name = validate_name(args.name)
     store = VoiceStore(cfg.data_dir)
-    if store.exists(name):
+    actual = store.existing_names().get(name.casefold())
+    if actual is not None:
+        if actual != name:
+            raise InputError(
+                f"voice name collides case-insensitively with existing {actual!r}: "
+                f"{name!r}"
+            )
         raise InputError(f"voice already exists: {name}")
     description = (args.description or "").strip()
     design_block = None
@@ -931,6 +948,25 @@ def preview(cfg, args) -> dict[str, Any]:
 
 def export(cfg, args) -> dict[str, Any]:
     store = VoiceStore(cfg.data_dir)
+    if args.all:
+        if args.name:
+            raise UsageError("--all cannot be combined with a voice NAME")
+        if args.out:
+            raise UsageError("--all uses --out-dir, not --out")
+        if not args.out_dir:
+            raise UsageError("--all requires --out-dir DIRECTORY")
+        return export_bundle(
+            store,
+            args.out_dir,
+            force=bool(args.force),
+            dry_run=bool(getattr(args, "dry_run", False)),
+        )
+    if args.out_dir:
+        raise UsageError("--out-dir requires --all")
+    if not args.name:
+        raise UsageError("voice export NAME -o FILE, or --all --out-dir DIR")
+    if not args.out:
+        raise UsageError("voice export NAME requires -o/--out FILE")
     return export_voice(
         store,
         args.name,
@@ -943,6 +979,16 @@ def export(cfg, args) -> dict[str, Any]:
 def import_(cfg, args) -> dict[str, Any]:
     store = VoiceStore(cfg.data_dir)
     return import_voice(store, args.archive, name=args.name, force=bool(args.force))
+
+
+def import_bundle(cfg, args) -> dict[str, Any]:
+    store = VoiceStore(cfg.data_dir)
+    return import_voice_bundle(
+        store,
+        args.bundle_dir,
+        force=bool(args.force),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1490,6 +1536,29 @@ def format_result(payload: dict[str, Any]) -> str:
     if payload.get("names_only"):
         names = payload.get("names") or []
         return "\n".join(names) if names else "no matching voices."
+    if "bundle_dir" in payload:
+        verb = "would import" if payload.get("dry_run") else "imported"
+        lines = [
+            f"{verb} {len(payload.get('voices') or [])} voice(s) from "
+            f"{payload['bundle_dir']}"
+        ]
+        for entry in payload.get("voices") or []:
+            action = "replaced" if entry.get("replaced") else "imported"
+            lines.append(f"  {entry['name']}: {action}")
+        for warning in payload.get("warnings") or []:
+            lines.append(f"  warning: {warning}")
+        return "\n".join(lines)
+    if payload.get("bundle") and "voices" in payload:
+        verb = "would export" if payload.get("dry_run") else "exported"
+        lines = [
+            f"{verb} {len(payload['voices'])} voice(s) -> {payload['out_dir']} "
+            f"({payload['bundle']})"
+        ]
+        for entry in payload["voices"]:
+            lines.append(f"  {entry['name']} ({entry['kind']}): {entry['archive']}")
+        for warning in payload.get("warnings") or []:
+            lines.append(f"  warning: {warning}")
+        return "\n".join(lines)
     if "old" in payload and "new" in payload:
         verb = "would rename" if payload.get("dry_run") else "renamed"
         return f"{verb} voice {payload['old']} -> {payload['new']}"

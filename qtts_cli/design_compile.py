@@ -312,10 +312,10 @@ def compile_design(document: dict[str, Any]) -> CompiledDesign:
         avoid = document.get("avoid") or []
         if language == "zh":
             rendered = _render_zh(identity, delivery, scene, avoid, warnings)
-        elif language == "en":
-            rendered = _render_en(identity, delivery, scene, avoid, warnings)
         else:
-            rendered = ""
+            # Qwen3-TTS accepts English design instructions for every supported
+            # language; keep one renderer so non-zh templates are not empty.
+            rendered = _render_en(identity, delivery, scene, avoid, warnings)
     return CompiledDesign(
         structured=document,
         rendered_instruction=rendered,

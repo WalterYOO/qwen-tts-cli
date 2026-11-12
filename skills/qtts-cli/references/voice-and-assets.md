@@ -79,6 +79,21 @@ qtts voice import alice.qttsvoice --name alice-copy
 - **`voice import` 没有同意旗标**；导入前由用户确认授权。
 - full 包可能含参考音频、逐字转写与 consent，按个人数据处理。
 
+## 多音色 bundle
+
+```bash
+qtts voice export --all --out-dir ./voices-bundle
+qtts voice import-bundle ./voices-bundle --dry-run --json
+qtts voice import-bundle ./voices-bundle
+```
+
+- 目录含 `bundle.json`（`format="qtts-voice-bundle"`、`bundle_schema_version: 2`）
+  与每个单音色 `.qttsvoice`（archive schema 1 不变）。
+- 导出/导入都先 staging 全部归档再一次性发布；失败回滚，崩溃后由
+  `.bundle-export.json` / `.bundle-import.json` 自动恢复。
+- 导出拒绝大小写冲突、symlink 输出与非托管文件；导入拒绝 symlink、大小/哈希
+  不符与大小写冲突；`--force` 替换，`--dry-run` 只校验不落盘。
+
 ## 从 btts 导入
 
 ```bash

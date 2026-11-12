@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -248,9 +249,38 @@ def test_lint_reports_unknown_fields_and_name_format():
     assert any(item["code"] == "name-format" for item in report["issues"])
 
 
+@pytest.mark.parametrize("language", ["ja", "ko", "de", "fr", "ru", "pt", "es", "it"])
+def test_multilanguage_templates_compile_and_lint(language):
+    document = normalize_document(example_document("demo-voice", language=language))
+    assert document["language"] == language
+    assert document["covers"]
+    compiled = compile_design(document)
+    assert compiled.rendered_instruction.strip()
+    report = lint_design(document, compiled)
+    assert not [issue for issue in report["issues"] if issue["level"] == "block"]
+
+
+def test_design_language_display_names_are_canonical():
+    from qtts_cli.commands.design import _language_name
+
+    assert _language_name("ja") == "Japanese"
+    assert _language_name("Japanese") == "Japanese"
+    assert _language_name("japanese") == "Japanese"
+    assert _language_name("zh") == "Chinese"
+
+
+def test_design_init_multilanguage(tmp_path):
+    path = tmp_path / "ja-voice.yaml"
+    assert main(["design", "init", str(path), "--language", "ja"]) == 0
+    document, _, _ = load_design(path)
+    assert document["language"] == "ja"
+    assert document["template"] == "qtts/ja-podcast-host/v1"
+    assert "また番組" in document["covers"][0]
+
+
 def test_lint_unsupported_language_needs_override():
     document = normalize_document(
-        {"name": "demo-voice", "language": "fr", "template": ZH_TEMPLATE, "covers": ["bonjour"]}
+        {"name": "demo-voice", "language": "xx", "template": ZH_TEMPLATE, "covers": ["hello"]}
     )
     report = lint_design(document, compile_design(document))
     assert any(
@@ -487,6 +517,35 @@ def test_run_lock_is_exclusive(tmp_path):
                 pass
     with RunLock(tmp_path):
         pass
+
+
+def test_run_lock_uses_msvcrt_on_windows(tmp_path, monkeypatch):
+    calls = []
+
+    class FakeMsvcrt:
+        LK_NBLCK = 2
+        LK_UNLCK = 0
+        fail = False
+
+        @classmethod
+        def locking(cls, fd, mode, count):
+            calls.append((fd, mode, count))
+            if cls.fail:
+                raise OSError("busy")
+
+    monkeypatch.setitem(sys.modules, "msvcrt", FakeMsvcrt)
+    monkeypatch.setattr(sys, "platform", "win32")
+    with RunLock(tmp_path):
+        pass
+    assert [(mode, count) for _, mode, count in calls] == [(2, 1), (0, 1)]
+
+    calls.clear()
+    FakeMsvcrt.fail = True
+    with pytest.raises(UsageError, match="locked"):
+        with RunLock(tmp_path):
+            pass
+    assert len(calls) == 1
+    assert calls[0][1:] == (2, 1)
 
 
 def test_matrix_signature_tracks_options():
@@ -879,6 +938,193 @@ def test_design_explore_resume_ignores_manifest_paths(tmp_path, monkeypatch):
     assert (out / record["wav"]).is_file()
 
 
+def test_design_prune_keeps_top_n_and_reports_pruned_state(tmp_path, monkeypatch):
+    _patch_fake_model(monkeypatch)
+    design = _write(tmp_path / "demo-voice.yaml", dump_design(_document()))
+    out = tmp_path / "run"
+    args = ["design", "explore", str(design), "--out", str(out),
+            "--seeds", "3,5", "--sampling", "stable"]
+    assert main(args) == 0
+    for take in ("s3-c0-stable", "s5-c0-stable"):
+        assert (out / "candidates" / f"{take}.wav").is_file()
+
+    # Default is a preview and writes nothing.
+    assert main(["design", "prune", str(out), "--keep", "1"]) == 0
+    assert (out / "candidates" / "s5-c0-stable.wav").is_file()
+
+    assert main(["design", "prune", str(out), "--keep", "1", "--yes"]) == 0
+    manifest = json.loads((out / "run.json").read_text())
+    by_id = {record["take_id"]: record for record in manifest["candidates"]}
+    assert by_id["s3-c0-stable"].get("pruned") is not True
+    assert by_id["s5-c0-stable"]["pruned"] is True
+    assert by_id["s5-c0-stable"]["wav"] is None
+    assert by_id["s5-c0-stable"]["recipe"] is None
+    assert not (out / "candidates" / "s5-c0-stable.wav").exists()
+    assert not (out / "candidates" / "s5-c0-stable.recipe.json").exists()
+    assert (out / "candidates" / "s3-c0-stable.wav").is_file()
+    assert not (out / ".prune").exists()
+
+    report = build_report(out, write_reel=False)
+    assert report["summary"]["pruned"] == 1
+    assert report["summary"]["analyzed_count"] == 1
+    pruned = next(item for item in report["candidates"] if item["take_id"] == "s5-c0-stable")
+    assert pruned["status"] == "pruned"
+    assert pruned["rank"] is None
+    assert pruned["recommended"] is False
+    assert pruned["failure_count"] == 0
+    assert [item["take_id"] for item in report["candidates"]] == [
+        "s3-c0-stable",
+        "s5-c0-stable",
+    ]
+    assert report["candidates"][0]["rank"] == 1
+
+    calls = _FakeEngine.calls
+    assert main(args + ["--resume"]) == 0
+    assert _FakeEngine.calls == calls
+
+
+def test_design_prune_rejects_symlinked_candidate(tmp_path, monkeypatch):
+    _patch_fake_model(monkeypatch)
+    design = _write(tmp_path / "demo-voice.yaml", dump_design(_document()))
+    out = tmp_path / "run"
+    args = ["design", "explore", str(design), "--out", str(out),
+            "--seeds", "3,5", "--sampling", "stable"]
+    assert main(args) == 0
+    target = out / "candidates" / "s3-c0-stable.wav"
+    link = out / "candidates" / "s5-c0-stable.wav"
+    link.unlink()
+    link.symlink_to(target)
+    assert main(["design", "prune", str(out), "--keep", "1", "--yes"]) == 4
+    assert link.is_symlink()
+    assert target.is_file()
+
+
+def test_design_prune_recovers_interrupted_staging(tmp_path, monkeypatch):
+    _patch_fake_model(monkeypatch)
+    design = _write(tmp_path / "demo-voice.yaml", dump_design(_document()))
+    out = tmp_path / "run"
+    args = ["design", "explore", str(design), "--out", str(out),
+            "--seeds", "3,5", "--sampling", "stable"]
+    assert main(args) == 0
+    # Simulate a crash after moving a file but before run.json was rewritten.
+    staged = out / ".prune" / "deadbeef"
+    (staged / "candidates").mkdir(parents=True)
+    src = out / "candidates" / "s5-c0-stable.wav"
+    dst = staged / "candidates" / "s5-c0-stable.wav"
+    import os as _os
+    _os.replace(src, dst)
+    assert not src.exists()
+
+    assert main(["design", "prune", str(out), "--keep", "2", "--yes"]) == 0
+    assert src.is_file()
+    assert not staged.exists()
+
+
+def test_design_prune_apply_honors_run_lock(tmp_path, monkeypatch):
+    from qtts_cli.design_run import RunLock
+
+    _patch_fake_model(monkeypatch)
+    design = _write(tmp_path / "demo-voice.yaml", dump_design(_document()))
+    out = tmp_path / "run"
+    assert main([
+        "design", "explore", str(design), "--out", str(out),
+        "--seeds", "3,5", "--sampling", "stable",
+    ]) == 0
+
+    with RunLock(out):
+        assert main(["design", "prune", str(out), "--keep", "1", "--yes"]) == 2
+        assert main(["design", "prune", str(out), "--keep", "1"]) == 0
+    assert (out / "candidates" / "s5-c0-stable.wav").is_file()
+    assert (out / "candidates" / "s3-c0-stable.wav").is_file()
+
+
+def test_design_prune_dry_run_does_not_recover(tmp_path, monkeypatch):
+    _patch_fake_model(monkeypatch)
+    design = _write(tmp_path / "demo-voice.yaml", dump_design(_document()))
+    out = tmp_path / "run"
+    args = ["design", "explore", str(design), "--out", str(out),
+            "--seeds", "3,5", "--sampling", "stable"]
+    assert main(args) == 0
+    staged = out / ".prune" / "deadbeef"
+    (staged / "candidates").mkdir(parents=True)
+    src = out / "candidates" / "s5-c0-stable.wav"
+    dst = staged / "candidates" / "s5-c0-stable.wav"
+    src.rename(dst)
+
+    assert main(["design", "prune", str(out), "--keep", "2"]) == 0
+    assert dst.is_file()
+    assert not src.exists()
+    assert staged.is_dir()
+
+
+def test_design_prune_recovery_ignores_paths_outside_candidates(tmp_path):
+    from qtts_cli.design_prune import _recover
+
+    run_dir = _run_with_candidates(tmp_path)
+    staged = run_dir / ".prune" / "deadbeef"
+    (staged / "report").mkdir(parents=True)
+    (staged / "report" / "pwn.txt").write_text("x")
+    (staged / "candidates").mkdir()
+    (staged / "candidates" / "silent.wav").symlink_to(
+        run_dir / "candidates" / "good.wav"
+    )
+
+    _recover(run_dir)
+    assert not (run_dir / "report" / "pwn.txt").exists()
+    assert not staged.exists()
+    assert (run_dir / "candidates" / "good.wav").is_file()
+
+
+def test_design_prune_recovery_rejects_symlinked_candidates(tmp_path):
+    from qtts_cli.design_prune import _recover
+
+    run_dir = _run_with_candidates(tmp_path)
+    staged = run_dir / ".prune" / "deadbeef"
+    (staged / "candidates").mkdir(parents=True)
+    (staged / "candidates" / "good.wav").write_bytes(b"staged")
+    outside = tmp_path / "outside-candidates"
+    outside.mkdir()
+    (run_dir / "candidates").rename(outside / "candidates")
+    (run_dir / "candidates").symlink_to(outside / "candidates")
+
+    with pytest.raises(InputError, match="candidates"):
+        _recover(run_dir)
+    assert (staged / "candidates" / "good.wav").read_bytes() == b"staged"
+
+
+def test_design_prune_rejects_symlinked_directories(tmp_path, monkeypatch):
+    _patch_fake_model(monkeypatch)
+    design = _write(tmp_path / "demo-voice.yaml", dump_design(_document()))
+    out = tmp_path / "run"
+    args = ["design", "explore", str(design), "--out", str(out),
+            "--seeds", "3,5", "--sampling", "stable"]
+    assert main(args) == 0
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep")
+    (out / ".prune").symlink_to(outside)
+    assert main(["design", "prune", str(out), "--keep", "1", "--yes"]) == 4
+    assert (outside / "keep.txt").is_file()
+    (out / ".prune").unlink()
+
+    moved = tmp_path / "moved-candidates"
+    (out / "candidates").rename(moved)
+    (out / "candidates").symlink_to(moved)
+    assert main(["design", "prune", str(out), "--keep", "1", "--yes"]) == 4
+    assert (moved / "s5-c0-stable.wav").is_file()
+
+
+def test_report_rejects_symlinked_report_directory(tmp_path):
+    run_dir = _run_with_candidates(tmp_path)
+    outside = tmp_path / "outside-report"
+    outside.mkdir()
+    (run_dir / "report").symlink_to(outside)
+    with pytest.raises(InputError, match="symlink"):
+        build_report(run_dir, write_reel=False)
+    assert not (outside / "report.json").exists()
+
+
 def test_design_freeze_as_design(tmp_path, capsys):
     run_dir = _run_with_candidates(tmp_path)
     data_dir = tmp_path / "data"
@@ -897,6 +1143,21 @@ def test_design_freeze_as_design(tmp_path, capsys):
 
     assert main(base) == 2
     assert main(base + ["--force"]) == 0
+
+
+def test_design_freeze_rejects_casefold_collision(tmp_path, monkeypatch, capsys):
+    from qtts_cli.voice_store import VoiceStore
+
+    run_dir = _run_with_candidates(tmp_path)
+    monkeypatch.setattr(
+        VoiceStore, "existing_names", lambda self: {"frozen": "Frozen"}
+    )
+    assert main([
+        "design", "freeze", str(run_dir), "--take", "s2-c0-default",
+        "--name", "frozen", "--as", "design",
+        "--data-dir", str(tmp_path / "data"),
+    ]) == 2
+    assert "case-insensitively" in capsys.readouterr().err
 
 
 def test_design_freeze_rejects_failed_and_unverifiable_takes(tmp_path):

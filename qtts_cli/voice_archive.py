@@ -27,7 +27,7 @@ from typing import Any, Optional
 
 from . import __version__
 from .errors import InputError
-from .utils import atomic_write_json, sha256_file
+from .utils import atomic_write_json, read_json, sha256_file
 from .voice_store import SCHEMA_VERSION as VOICE_SCHEMA_VERSION
 from .voice_store import VoiceStore, utc_now, validate_name
 
@@ -41,6 +41,15 @@ MAX_MEMBER_BYTES = 64 * 1024 * 1024
 MAX_TOTAL_BYTES = 256 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 500.0
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+BUNDLE_FORMAT = "qtts-voice-bundle"
+BUNDLE_SCHEMA_VERSION = 2
+BUNDLE_MANIFEST = "bundle.json"
+BUNDLE_MAX_MANIFEST_BYTES = 1024 * 1024
+BUNDLE_MAX_VOICES = 256
+BUNDLE_JOURNAL = ".bundle-import.json"
+BUNDLE_EXPORT_JOURNAL = ".bundle-export.json"
+_ARCHIVE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\.qttsvoice$")
 
 
 def _json_bytes(obj: Any) -> bytes:
@@ -275,6 +284,16 @@ def _parse_manifest(raw: bytes) -> dict[str, Any]:
     return manifest
 
 
+def _read_archive_manifest(path: Path) -> dict[str, Any]:
+    """Validate members and return the archive manifest without extracting."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            _validate_members(archive.infolist())
+            return _parse_manifest(_read_member(archive, MANIFEST))
+    except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError) as exc:
+        raise InputError(f"invalid .qttsvoice archive: {exc}") from exc
+
+
 def _validate_voice_meta(meta: Any, *, expected_name: str, expected_kind: str) -> dict[str, Any]:
     if not isinstance(meta, dict):
         raise InputError("voice.json must be an object")
@@ -376,17 +395,16 @@ def _install_profile(store: VoiceStore, staging: Path, target_name: str, force: 
     return True
 
 
-def import_voice(
+def _stage_archive(
     store: VoiceStore,
-    archive_path: str | Path,
-    *,
-    name: Optional[str] = None,
-    force: bool = False,
-) -> dict[str, Any]:
-    path = Path(archive_path).expanduser()
-    if not path.is_file():
-        raise InputError(f"archive not found: {path}", details={"archive": str(path)})
-    replaced = False
+    path: Path,
+    target_name: str,
+) -> tuple[Path, dict[str, Any], list[str]]:
+    """Validate one archive and extract it into a staging directory.
+
+    Nothing is published here; callers may stage several archives before making
+    a single all-or-nothing install decision.
+    """
     staging: Optional[Path] = None
     try:
         with zipfile.ZipFile(path) as archive:
@@ -410,14 +428,6 @@ def import_voice(
                 meta, expected_name=manifest["name"], expected_kind=manifest["kind"]
             )
 
-            target_name = validate_name(name or manifest["name"])
-            target = store.dir_for(target_name)
-            if target.exists() and not force:
-                raise InputError(
-                    f"voice already exists: {target_name}; pass --force to replace",
-                    details={"voice": target_name},
-                )
-
             staging = store.staging_dir(target_name)
             for member, entry in listed.items():
                 info = by_name[member]
@@ -439,6 +449,43 @@ def import_voice(
         _validate_profile(staging, new_meta, target_name)
         atomic_write_json(staging / "voice.json", new_meta)
         _validate_profile(staging, new_meta, target_name)
+        return staging, new_meta, sorted(listed)
+    except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError) as exc:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        raise InputError(f"invalid .qttsvoice archive: {exc}") from exc
+    except BaseException:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def import_voice(
+    store: VoiceStore,
+    archive_path: str | Path,
+    *,
+    name: Optional[str] = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    path = Path(archive_path).expanduser()
+    if not path.is_file():
+        raise InputError(f"archive not found: {path}", details={"archive": str(path)})
+    staging: Optional[Path] = None
+    manifest = _read_archive_manifest(path)
+    try:
+        target_name = validate_name(name or manifest["name"])
+        actual = store.existing_names().get(target_name.casefold())
+        if actual is not None and actual != target_name:
+            raise InputError(
+                f"voice name collides case-insensitively with existing {actual!r}: "
+                f"{target_name!r}"
+            )
+        if actual is not None and not force:
+            raise InputError(
+                f"voice already exists: {target_name}; pass --force to replace",
+                details={"voice": target_name},
+            )
+        staging, new_meta, files = _stage_archive(store, path, target_name)
         replaced = _install_profile(store, staging, target_name, force)
         staging = None
         return {
@@ -447,12 +494,632 @@ def import_voice(
             "output": str(store.dir_for(target_name)),
             "voice": new_meta,
             "replaced": replaced,
-            "files": sorted(listed),
+            "files": files,
         }
-    except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError) as exc:
-        # Corrupt archives and CRC failures must be input errors (exit 4), not
-        # tracebacks. The staging directory is removed by the finally block.
-        raise InputError(f"invalid .qttsvoice archive: {exc}") from exc
     finally:
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------- #
+# Multi-voice bundles (schema 2, directory of single-voice archives)
+# --------------------------------------------------------------------------- #
+def _bundle_bytes(manifest: dict[str, Any]) -> bytes:
+    return (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+
+
+def _read_bundle_manifest(directory: Path) -> dict[str, Any]:
+    if directory.is_symlink():
+        raise InputError(
+            f"bundle directory is a symlink: {directory}",
+            details={"bundle": str(directory)},
+        )
+    if not directory.is_dir():
+        raise InputError(f"bundle directory not found: {directory}")
+    path = directory / BUNDLE_MANIFEST
+    if not path.is_file() or path.is_symlink():
+        raise InputError(
+            f"bundle has no regular {BUNDLE_MANIFEST}",
+            details={"bundle": str(directory)},
+        )
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(BUNDLE_MAX_MANIFEST_BYTES + 1)
+    except OSError as exc:
+        raise InputError(f"cannot read {BUNDLE_MANIFEST}: {exc}") from exc
+    if len(raw) > BUNDLE_MAX_MANIFEST_BYTES:
+        raise InputError(f"{BUNDLE_MANIFEST} is too large")
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InputError(f"invalid {BUNDLE_MANIFEST}: {exc}") from exc
+    if not isinstance(manifest, dict):
+        raise InputError(f"{BUNDLE_MANIFEST} must be an object")
+    if manifest.get("format") != BUNDLE_FORMAT:
+        raise InputError(
+            f"unsupported bundle format: {manifest.get('format')!r}; expected {BUNDLE_FORMAT}"
+        )
+    if manifest.get("bundle_schema_version") != BUNDLE_SCHEMA_VERSION:
+        raise InputError(
+            "unsupported bundle_schema_version: "
+            f"{manifest.get('bundle_schema_version')!r}"
+        )
+    voices = manifest.get("voices")
+    if not isinstance(voices, list) or not voices:
+        raise InputError(f"{BUNDLE_MANIFEST}.voices must be a non-empty list")
+    if len(voices) > BUNDLE_MAX_VOICES:
+        raise InputError(f"bundle has too many voices: {len(voices)} > {BUNDLE_MAX_VOICES}")
+    names: set[str] = set()
+    archives: set[str] = set()
+    for entry in voices:
+        if not isinstance(entry, dict):
+            raise InputError(f"{BUNDLE_MANIFEST}.voices entries must be objects")
+        name = validate_name(entry.get("name"))
+        archive = entry.get("archive")
+        if not isinstance(archive, str) or not _ARCHIVE_NAME_RE.fullmatch(archive):
+            raise InputError(f"invalid bundle archive name for {name!r}: {archive!r}")
+        if entry.get("kind") not in ("clone", "design"):
+            raise InputError(f"invalid bundle voice kind for {name!r}")
+        digest = entry.get("sha256")
+        if not isinstance(digest, str) or not _SHA256_RE.fullmatch(digest):
+            raise InputError(f"invalid bundle sha256 for {name!r}")
+        size = entry.get("size")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise InputError(f"invalid bundle size for {name!r}")
+        folded = name.casefold()
+        if folded in names:
+            raise InputError(f"duplicate bundle voice name: {name!r}")
+        names.add(folded)
+        if archive.casefold() in archives:
+            raise InputError(f"duplicate bundle archive: {archive!r}")
+        archives.add(archive.casefold())
+    return manifest
+
+
+def _safe_bundle_child(directory: Path, name: Any, prefix: str) -> Optional[Path]:
+    if (
+        not isinstance(name, str)
+        or not name.startswith(prefix)
+        or "/" in name
+        or "\\" in name
+        or name in (".", "..")
+    ):
+        return None
+    candidate = directory / name
+    if candidate.is_symlink():
+        return None
+    try:
+        candidate.resolve().relative_to(directory.resolve())
+    except ValueError:
+        return None
+    return candidate
+
+
+def _recover_export(directory: Path) -> None:
+    path = directory / BUNDLE_EXPORT_JOURNAL
+    if not path.is_file():
+        return
+    try:
+        journal = read_json(path)
+    except (OSError, ValueError):
+        journal = None
+    if not isinstance(journal, dict):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return
+    backup = _safe_bundle_child(directory, journal.get("backup_dir"), ".bundle-backup-")
+    staging = _safe_bundle_child(directory, journal.get("staging_dir"), ".bundle-stage-")
+    committed = journal.get("state") == "committed"
+    managed = bool(journal.get("managed"))
+    backed_up = journal.get("backed_up") is True
+    backed_up_files = set(journal.get("backed_up_files") or [])
+    restoring_files = set(journal.get("restoring_files") or [])
+    restored_files = set(journal.get("restored_files") or [])
+    if not committed and managed and backed_up:
+        valid = backup is not None and bool(backed_up_files)
+        present: set[str] = set()
+        if valid and backup.is_dir():
+            present = {
+                child.name
+                for child in backup.iterdir()
+                if child.is_file() and not child.is_symlink()
+            }
+        missing = backed_up_files - present
+        valid = valid and all(
+            (directory / name).is_file()
+            and (name in restoring_files or name in restored_files)
+            for name in missing
+        )
+        if not valid:
+            raise InputError(
+                "bundle export journal is inconsistent; the backup directory is "
+                f"missing or incomplete. Inspect {directory} and delete {path} "
+                "to discard the journal",
+                details={"journal": str(path), "backup_dir": journal.get("backup_dir")},
+            )
+    if not committed:
+        # Restore everything we moved into the backup directory first.  This
+        # also covers a crash halfway through the backup phase, where only the
+        # ``backed_up`` flag would be missing.
+        restored: set[str] = set()
+        if backup is not None and backup.is_dir():
+            for child in sorted(backup.iterdir()):
+                if not child.is_file() or child.is_symlink():
+                    continue
+                restoring_files.add(child.name)
+                journal["restoring_files"] = sorted(restoring_files)
+                atomic_write_json(path, journal)
+                os.replace(child, directory / child.name)
+                restoring_files.discard(child.name)
+                restored_files.add(child.name)
+                restored.add(child.name)
+                journal["restoring_files"] = sorted(restoring_files)
+                journal["restored_files"] = sorted(restored_files)
+                atomic_write_json(path, journal)
+        recovered = restored | restored_files | {
+            name for name in restoring_files if (directory / name).is_file()
+        }
+        if managed and backed_up and not backed_up_files.issubset(recovered):
+            raise InputError(
+                "bundle export recovery could not restore every backed-up file; "
+                f"inspect {directory} and delete {path} to discard the journal",
+                details={"journal": str(path), "restored": sorted(restored)},
+            )
+        for archive in journal.get("archives") or []:
+            if (
+                not isinstance(archive, str)
+                or "/" in archive
+                or "\\" in archive
+                or archive in backed_up_files
+                or archive in restored
+            ):
+                continue
+            destination = directory / archive
+            # Only delete an archive we know was just published: either the
+            # destination had no previous bundle, or the backup phase had
+            # completed (so every old archive is in the backup directory).
+            may_delete = (not managed) or (backup is not None and backed_up)
+            if may_delete and destination.is_file() and not destination.is_symlink():
+                destination.unlink()
+        if not managed:
+            new_manifest = directory / BUNDLE_MANIFEST
+            if new_manifest.is_file() and not new_manifest.is_symlink():
+                new_manifest.unlink()
+    if backup is not None:
+        shutil.rmtree(backup, ignore_errors=True)
+    if staging is not None:
+        shutil.rmtree(staging, ignore_errors=True)
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _bundle_policy(directory: Path, *, force: bool) -> set[str]:
+    """Validate an existing output directory; return names we may replace."""
+    if not directory.exists():
+        return set()
+    if directory.is_symlink() or not directory.is_dir():
+        raise InputError(f"bundle output is not a directory: {directory}")
+    children = sorted(directory.iterdir())
+    if not children:
+        return set()
+    manifest_path = directory / BUNDLE_MANIFEST
+    if not manifest_path.is_file():
+        raise InputError(
+            f"bundle output directory is not empty: {directory}; use an empty directory"
+        )
+    previous = _read_bundle_manifest(directory)
+    managed = {BUNDLE_MANIFEST} | {entry["archive"] for entry in previous["voices"]}
+    internal = {BUNDLE_EXPORT_JOURNAL}
+    internal.update(
+        child.name
+        for child in children
+        if child.name.startswith((".bundle-stage-", ".bundle-backup-"))
+    )
+    extras = [
+        child.name
+        for child in children
+        if child.name not in managed and child.name not in internal
+    ]
+    if extras:
+        raise InputError(
+            f"bundle output directory contains unmanaged files: {', '.join(extras)}"
+        )
+    if not force:
+        existing = [entry["archive"] for entry in previous["voices"]
+                    if (directory / entry["archive"]).exists()]
+        if existing:
+            raise InputError(
+                f"bundle archives already exist; pass --force to replace: {', '.join(existing)}"
+            )
+    return managed
+
+
+def export_bundle(
+    store: VoiceStore,
+    out_dir: str | Path,
+    *,
+    force: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    directory = Path(out_dir).expanduser()
+    try:
+        directory.resolve().relative_to(store.root.resolve())
+    except ValueError:
+        pass
+    else:
+        raise InputError(
+            f"refusing to write a bundle inside the voice store: {directory}",
+            details={"bundle": str(directory), "store": str(store.root)},
+        )
+    if directory.is_symlink():
+        raise InputError(f"bundle output is a symlink: {directory}")
+    if not dry_run and directory.is_dir():
+        _recover_export(directory)
+    managed = _bundle_policy(directory, force=force)
+    scan = store.scan_entries()
+    warnings = list(scan.get("warnings") or [])
+    selected: list[dict[str, Any]] = []
+    for entry in scan.get("voices") or []:
+        name = entry.get("name")
+        meta = entry.get("meta") or {}
+        if entry.get("status") != "ok" or not meta:
+            warnings.append(f"skipped voice {name}: {entry.get('status')}")
+            continue
+        kind = str(meta.get("kind"))
+        if kind == "finetune":
+            warnings.append(f"skipped finetune voice {name}: machine-local")
+            continue
+        selected.append({"name": name, "kind": kind, "meta": meta})
+    if not selected:
+        raise InputError("no exportable user voices")
+    folded: set[str] = set()
+    for entry in selected:
+        key = str(entry["name"]).casefold()
+        if key in folded:
+            raise InputError(
+                f"voice names collide case-insensitively: {entry['name']!r}; "
+                "rename one of them before exporting a bundle"
+            )
+        folded.add(key)
+        entry["archive"] = f"{entry['name']}{ARCHIVE_SUFFIX}"
+    if len(selected) > BUNDLE_MAX_VOICES:
+        raise InputError(f"too many voices to export: {len(selected)}")
+
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "bundle": str(directory / BUNDLE_MANIFEST),
+            "out_dir": str(directory),
+            "voices": [
+                {"name": entry["name"], "kind": entry["kind"],
+                 "archive": entry["archive"]}
+                for entry in selected
+            ],
+            "sha256": None,
+            "warnings": warnings,
+        }
+
+    directory.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    staging = directory / f".bundle-stage-{token}"
+    backup = directory / f".bundle-backup-{token}"
+    journal = {
+        "state": "publishing",
+        "managed": bool(managed),
+        "backed_up": False,
+        "staging_dir": staging.name,
+        "backup_dir": backup.name if managed else None,
+        "archives": [entry["archive"] for entry in selected],
+        "restoring_files": [],
+        "restored_files": [],
+    }
+    try:
+        # Write the journal before creating staging so a crash at any point
+        # leaves recovery enough information to clean up.
+        atomic_write_json(directory / BUNDLE_EXPORT_JOURNAL, journal)
+        staging.mkdir()
+        for entry in selected:
+            archive = staging / entry["archive"]
+            export_voice(store, entry["name"], archive, force=True)
+            entry["sha256"] = sha256_file(archive)
+            entry["size"] = archive.stat().st_size
+        manifest = {
+            "format": BUNDLE_FORMAT,
+            "bundle_schema_version": BUNDLE_SCHEMA_VERSION,
+            "qtts_version": __version__,
+            "created_at": utc_now(),
+            "voices": [
+                {
+                    "name": entry["name"],
+                    "kind": entry["kind"],
+                    "archive": entry["archive"],
+                    "sha256": entry["sha256"],
+                    "size": entry["size"],
+                }
+                for entry in selected
+            ],
+        }
+        if managed:
+            backup.mkdir()
+            for child in sorted(directory.iterdir()):
+                if child.name in managed:
+                    os.replace(child, backup / child.name)
+        journal["backed_up"] = True
+        journal["backed_up_files"] = sorted(
+            child.name for child in backup.iterdir()
+        ) if managed else []
+        atomic_write_json(directory / BUNDLE_EXPORT_JOURNAL, journal)
+        for entry in selected:
+            os.replace(staging / entry["archive"], directory / entry["archive"])
+        atomic_write_json(directory / BUNDLE_MANIFEST, manifest)
+        journal["state"] = "committed"
+        atomic_write_json(directory / BUNDLE_EXPORT_JOURNAL, journal)
+    except BaseException:
+        # The journal is on disk from the first step; reuse the same crash
+        # recovery path instead of keeping a second, divergent rollback.
+        _recover_export(directory)
+        raise
+    shutil.rmtree(staging, ignore_errors=True)
+    shutil.rmtree(backup, ignore_errors=True)
+    try:
+        (directory / BUNDLE_EXPORT_JOURNAL).unlink()
+    except OSError:
+        pass
+    return {
+        "ok": True,
+        "dry_run": False,
+        "bundle": str(directory / BUNDLE_MANIFEST),
+        "out_dir": str(directory),
+        "voices": [
+            {"name": entry["name"], "kind": entry["kind"],
+             "archive": entry["archive"], "sha256": entry["sha256"],
+             "size": entry["size"]}
+            for entry in selected
+        ],
+        "sha256": sha256_file(directory / BUNDLE_MANIFEST),
+        "warnings": warnings,
+    }
+
+
+def _recover_bundle_journal(store: VoiceStore) -> None:
+    path = store.root / BUNDLE_JOURNAL
+    if not path.is_file():
+        return
+    try:
+        journal = read_json(path)
+    except (OSError, ValueError):
+        journal = None
+    if not isinstance(journal, dict):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        return
+    raw_backup = journal.get("backup_dir")
+    backup_dir = _safe_bundle_child(store.root, raw_backup, ".bundle-backup-")
+    committed = journal.get("state") == "committed"
+    raw_entries = journal.get("entries")
+    if not committed and not isinstance(raw_entries, list):
+        raise InputError(
+            "bundle import journal is corrupt; inspect the store and delete "
+            f"{path} to discard the journal",
+            details={"journal": str(path), "backup_dir": raw_backup},
+        )
+    entries: list[dict[str, Any]] = []
+    if not committed:
+        for item in raw_entries:
+            if not isinstance(item, dict) or not isinstance(item.get("target"), str):
+                raise InputError(
+                    "bundle import journal has a malformed entry; inspect the "
+                    f"store and delete {path} to discard the journal",
+                    details={"journal": str(path), "entry": item},
+                )
+            entries.append(item)
+        try:
+            for entry in entries:
+                try:
+                    target = store.dir_for(entry["target"])
+                except InputError as exc:
+                    if entry.get("installed"):
+                        raise InputError(
+                            "bundle import journal targets an invalid voice name; "
+                            f"backup and journal are preserved: {path}",
+                            details={"journal": str(path), "target": entry["target"]},
+                        ) from exc
+                    continue
+                if entry.get("restored"):
+                    continue
+                backup = backup_dir / target.name if backup_dir is not None else None
+                if backup is not None and backup.exists():
+                    if target.exists():
+                        shutil.rmtree(target)
+                    # Write ``restoring`` before consuming the backup so a
+                    # crash between the replace and the next journal write can
+                    # be recognized as "the old profile is already in place".
+                    entry["restoring"] = True
+                    atomic_write_json(path, journal)
+                    os.replace(backup, target)
+                    entry["installed"] = False
+                    entry["restoring"] = False
+                    entry["restored"] = True
+                    atomic_write_json(path, journal)
+                    continue
+                if entry.get("restoring"):
+                    if not target.exists():
+                        raise InputError(
+                            "bundle import journal needs manual recovery: the "
+                            f"restore target is missing: {target}",
+                            details={"journal": str(path), "target": target.name},
+                        )
+                    entry["installed"] = False
+                    entry["restoring"] = False
+                    entry["restored"] = True
+                    atomic_write_json(path, journal)
+                    continue
+                if not entry.get("installed"):
+                    continue
+                if entry.get("replaced", True):
+                    # No backup, no restore marker: we cannot tell whether the
+                    # target is the old or the new profile. Fail closed.
+                    raise InputError(
+                        "bundle import journal needs manual recovery; the backup "
+                        f"is missing for replaced voice {target.name}. Inspect "
+                        f"the store and delete {path} to discard the journal",
+                        details={"journal": str(path), "target": target.name},
+                    )
+                if target.exists():
+                    # Newly installed voice with no previous profile: roll back.
+                    shutil.rmtree(target)
+                entry["installed"] = False
+                entry["restored"] = True
+                atomic_write_json(path, journal)
+        except OSError as exc:
+            raise InputError(
+                "bundle import journal recovery failed; backup and journal are "
+                f"preserved for manual recovery: {path}",
+                details={"journal": str(path), "backup_dir": raw_backup},
+            ) from exc
+    if backup_dir is not None and backup_dir.exists():
+        try:
+            shutil.rmtree(backup_dir)
+        except OSError as exc:
+            raise InputError(
+                "bundle import journal backup could not be removed; journal is "
+                f"preserved for manual recovery: {path}",
+                details={"journal": str(path), "backup_dir": raw_backup},
+            ) from exc
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def import_bundle(
+    store: VoiceStore,
+    bundle_dir: str | Path,
+    *,
+    force: bool = False,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    directory = Path(bundle_dir).expanduser()
+    if not dry_run:
+        _recover_bundle_journal(store)
+    manifest = _read_bundle_manifest(directory)
+    warnings: list[str] = []
+    entries = manifest["voices"]
+    listed = {entry["archive"] for entry in entries}
+    for child in sorted(directory.iterdir()):
+        if child.name.endswith(ARCHIVE_SUFFIX) and child.name not in listed:
+            warnings.append(f"ignored archive not listed in {BUNDLE_MANIFEST}: {child.name}")
+
+    existing = store.existing_names()
+    targets: list[dict[str, Any]] = []
+    for entry in entries:
+        name = entry["name"]
+        archive = directory / entry["archive"]
+        if archive.is_symlink():
+            raise InputError(f"bundle archive is a symlink: {archive}")
+        if not archive.is_file():
+            raise InputError(f"bundle archive not found: {archive}")
+        if archive.stat().st_size != entry["size"]:
+            raise InputError(f"bundle archive size mismatch: {entry['archive']}")
+        if sha256_file(archive) != entry["sha256"]:
+            raise InputError(f"bundle archive sha256 mismatch: {entry['archive']}")
+        archive_manifest = _read_archive_manifest(archive)
+        if archive_manifest["name"] != name:
+            raise InputError(
+                "bundle voice name does not match its archive manifest: "
+                f"{name!r} != {archive_manifest['name']!r}"
+            )
+        if archive_manifest["kind"] != entry["kind"]:
+            raise InputError(
+                "bundle voice kind does not match its archive manifest: "
+                f"{name!r} ({entry['kind']!r} != {archive_manifest['kind']!r})"
+            )
+        actual = existing.get(name.casefold())
+        if actual is not None and actual != name:
+            raise InputError(
+                f"voice name collides case-insensitively with existing {actual!r}: {name!r}"
+            )
+        replaced = actual is not None
+        if replaced and not force:
+            raise InputError(f"voice already exists: {name}; pass --force to replace")
+        targets.append({"entry": entry, "name": name, "archive": archive,
+                        "replaced": replaced})
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "bundle_dir": str(directory),
+            "voices": [
+                {"name": item["name"], "replaced": item["replaced"]}
+                for item in targets
+            ],
+            "warnings": warnings,
+        }
+
+    staged: list[tuple[str, Path, dict[str, Any], list[str]]] = []
+    try:
+        for item in targets:
+            staging_path, meta, files = _stage_archive(store, item["archive"], item["name"])
+            staged.append((item["name"], staging_path, meta, files))
+    except BaseException:
+        for _, staging_path, _, _ in staged:
+            shutil.rmtree(staging_path, ignore_errors=True)
+        raise
+
+    token = uuid.uuid4().hex
+    backup_dir = store.root / f".bundle-backup-{token}"
+    backup_dir.mkdir(exist_ok=False)
+    journal_entries = [
+        {
+            "target": name,
+            "installed": False,
+            "replaced": store.dir_for(name).exists(),
+        }
+        for name, _, _, _ in staged
+    ]
+    journal = {
+        "backup_dir": backup_dir.name,
+        "entries": journal_entries,
+    }
+    atomic_write_json(store.root / BUNDLE_JOURNAL, journal)
+    try:
+        for index, (name, staging_path, _meta, _files) in enumerate(staged):
+            target = store.dir_for(name)
+            if target.exists():
+                os.replace(target, backup_dir / name)
+            journal_entries[index]["installed"] = True
+            atomic_write_json(store.root / BUNDLE_JOURNAL, journal)
+            os.replace(staging_path, target)
+    except BaseException:
+        # The on-disk journal is authoritative; run the same idempotent
+        # recovery used by the next invocation.
+        try:
+            _recover_bundle_journal(store)
+        finally:
+            for _, staging_path, _, _ in staged:
+                shutil.rmtree(staging_path, ignore_errors=True)
+        raise
+    journal["state"] = "committed"
+    atomic_write_json(store.root / BUNDLE_JOURNAL, journal)
+    shutil.rmtree(backup_dir, ignore_errors=True)
+    try:
+        (store.root / BUNDLE_JOURNAL).unlink()
+    except OSError:
+        pass
+    return {
+        "ok": True,
+        "bundle_dir": str(directory),
+        "voices": [
+            {"name": item["name"], "replaced": item["replaced"],
+             "files": files}
+            for item, (_, _, _, files) in zip(targets, staged)
+        ],
+        "warnings": warnings,
+    }

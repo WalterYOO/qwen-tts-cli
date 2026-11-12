@@ -13,6 +13,7 @@ from ..completeness import assess
 from ..design_compile import CompiledDesign, compile_design
 from ..design_lint import lint_design
 from ..design_yaml import (
+    SUPPORTED_LANGUAGES,
     TEMPLATES,
     dump_design,
     example_document,
@@ -42,7 +43,10 @@ def init(cfg, args) -> dict[str, Any]:
         language = language or "zh"
         template = template_for_language(language)
         if template is None:
-            raise UsageError(f"unsupported design language: {language!r}; use zh or en")
+            supported = ", ".join(sorted(SUPPORTED_LANGUAGES))
+            raise UsageError(
+                f"unsupported design language: {language!r}; use {supported}"
+            )
     name = args.name or path.stem
     validate_name(name)
     if path.exists() and not args.force:
@@ -240,6 +244,8 @@ def explore(cfg, args) -> dict[str, Any]:
                               completion_status="failed")
                 save_manifest(out, manifest)
                 continue
+            if record.get("pruned"):
+                continue
             wav_rel = f"candidates/{take_id}.wav"
             recipe_rel = f"candidates/{take_id}.recipe.json"
             record["wav"] = wav_rel
@@ -325,9 +331,26 @@ def explore(cfg, args) -> dict[str, Any]:
     return manifest
 
 
+_LANGUAGE_NAMES = {
+    "zh": "Chinese",
+    "cn": "Chinese",
+    "en": "English",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "de": "German",
+    "fr": "French",
+    "ru": "Russian",
+    "pt": "Portuguese",
+    "es": "Spanish",
+    "it": "Italian",
+}
+
+
 def _language_name(value: Any) -> str:
+    from ..catalog import display_language
+
     key = str(value or "zh").strip().lower()
-    return {"zh": "Chinese", "cn": "Chinese", "en": "English"}.get(key, key or "Chinese")
+    return _LANGUAGE_NAMES.get(key) or display_language(key) or "Chinese"
 
 
 def _design_block(manifest: dict[str, Any], run_dir: Path) -> dict[str, Any]:
@@ -449,6 +472,12 @@ def freeze(cfg, args) -> dict[str, Any]:
 
     name = validate_name(args.name)
     store = VoiceStore(cfg.data_dir)
+    actual = store.existing_names().get(name.casefold())
+    if actual is not None and actual != name:
+        raise UsageError(
+            f"voice name collides case-insensitively with existing {actual!r}: "
+            f"{name!r}"
+        )
     target = store.dir_for(name)
     if target.is_symlink():
         raise UsageError(f"refusing to replace symlinked voice directory: {target}")
@@ -630,7 +659,17 @@ def report(cfg, args) -> dict[str, Any]:
     )
 
 
+def prune(cfg, args) -> dict[str, Any]:
+    from ..design_prune import prune_run
+
+    return prune_run(args.run_dir, keep=int(args.keep), apply=bool(args.yes))
+
+
 def format_result(payload: dict[str, Any]) -> str:
+    if "kept" in payload and "pruned" in payload and "run_dir" in payload:
+        from ..design_prune import format_result as format_prune
+
+        return format_prune(payload)
     if payload.get("kind") == "design_run":
         candidates = payload.get("candidates") or []
         ok = sum(1 for item in candidates if item.get("status") == "ok")

@@ -167,7 +167,9 @@ qtts voice delete NAME [--yes] [--dry-run]
 qtts voice preview NAME [--text TEXT] [--out FILE] [--format wav|flac]
   [--language LANG] [--no-save]
 qtts voice export NAME -o FILE.qttsvoice [--force] [--dry-run]
+qtts voice export --all --out-dir DIR [--force] [--dry-run]
 qtts voice import FILE.qttsvoice [--name NAME] [--force]
+qtts voice import-bundle DIR [--force] [--dry-run]
 qtts voice import-btts BUNDLE (--voice NAME ... | --all)
   [--name NAME] [--i-have-rights] [--auto-ref-text] [--ref-text TEXT]
   [--asr-model PATH|ID] [--mode icl|xvec] [--model MODEL] [--force]
@@ -188,6 +190,10 @@ qtts voice import-btts BUNDLE (--voice NAME ... | --all)
   `prompt.safetensors`、`ref.wav`、`preview.wav`），已有目标需 `--force`。
 - `voice import` 逐项校验路径、大小、压缩比、sha256 与 safetensors 结构，不使用
   `extractall`；替换失败回滚。**没有同意旗标**，导入前由用户确认授权。
+- `voice export --all --out-dir DIR` 写 `bundle.json`（`bundle_schema_version: 2`）
+  + 多个单音色 `.qttsvoice`（archive schema 1）；`import-bundle` 先全部 staging
+  再统一发布，`--dry-run` 只校验，`--force` 替换。两侧有崩溃恢复 journal，
+  拒绝大小写冲突、symlink、非托管文件与哈希/大小不符。
 - `voice import-btts` 读取 btts `voice export` 的目录或 `.zip`；有 `manifest.json`
   时校验 SHA-256、大小与完整文件集，拒绝路径穿越/绝对路径/反斜杠/symlink/
   特殊文件/大小写冲突/未知文件。必须 `--i-have-rights`；已有音色需 `--force`。
@@ -196,7 +202,8 @@ qtts voice import-btts BUNDLE (--voice NAME ... | --all)
 ## design
 
 ```bash
-qtts design init FILE [--template T] [--name NAME] [--language zh|en] [--force]
+qtts design init FILE [--template T] [--name NAME]
+  [--language zh|en|ja|ko|de|fr|ru|pt|es|it] [--force]
 qtts design lint FILE [--show-rendered] [--strict] [--json]
 qtts design explore FILE --out RUN_DIR [--resume] [--wide]
   [--seeds 19,97] [--sampling default|stable|expressive]...
@@ -207,18 +214,23 @@ qtts design report RUN_DIR [--metrics basic|full]
 qtts design freeze RUN_DIR --take TAKE --name NAME --as clone|design
   [--confirm-transcript] [--ref-text TEXT] [--allow-long-ref]
   [--allow-incomplete] [--force] [--tag TAG]... [--i-have-rights]
+qtts design prune RUN_DIR --keep N [--dry-run | --yes] [--json]
 ```
 
 - YAML 是 btts 结构化字段 + qtts 模板；`description`/`instruction_override` 优先级
   高于编译结果。拒绝 anchor/alias、重复 key、>256 KiB、非 UTF-8。
 - `lint` 解析错误 4、block 1、`--strict` warning 1；有 block 时 grade 强制 red。
 - `explore --dry-run` 不加载模型、不写盘；真实运行一次加载 VoiceDesign，逐候选
-  原子写 WAV/recipe，`run.json` 是唯一索引；`--resume` 输入变化退出 2。
+  原子写 WAV/recipe，`run.json` 是唯一索引；`--resume` 输入变化退出 2。run 锁
+  POSIX 用 `fcntl.flock`、Windows 用 `msvcrt.locking`，冲突退出 2。
 - `report` 只读；缺失指标为 null 且不计 failure；损坏 WAV 标记 failed 不中止；
   `--require-full-metrics` / `--fail-on-degraded` 退出 5。
 - `freeze --as design` 固化可重生成配方；`--as clone` 需 `--confirm-transcript`，
   克隆还需 `--i-have-rights`，拒绝 failed/suspect/too_short，unknown 需
   `--allow-incomplete`。
+- `prune` 按 report 排序保留前 N 个候选，其余标为 `pruned`（`wav/recipe=null`）；
+  默认 dry-run，`--yes` 才移动文件，两阶段 + 原子 manifest，崩溃可恢复。`--yes`
+  与 explore 共用 run 锁；RUN_DIR 是单写者目录，symlink 防护为 best-effort。
 - 盲听页面 `report/audition.html` 的“blind mode”会隐藏排名与推荐高亮；最终选择
   必须人耳试听，指标只负责筛掉坏候选。
 

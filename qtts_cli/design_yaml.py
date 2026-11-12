@@ -32,8 +32,72 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "identity": {"pace": "medium", "energy": "medium"},
         "covers": ["Welcome back to the show."],
     },
+    "qtts/ja-podcast-host/v1": {
+        "language": "ja",
+        "identity": {"pace": "medium", "energy": "medium"},
+        "covers": ["また番組に戻ってきました。"],
+    },
+    "qtts/ko-podcast-host/v1": {
+        "language": "ko",
+        "identity": {"pace": "medium", "energy": "medium"},
+        "covers": ["다시 프로그램으로 돌아왔습니다."],
+    },
+    "qtts/de-podcast-host/v1": {
+        "language": "de",
+        "identity": {"pace": "medium", "energy": "medium"},
+        "covers": ["Willkommen zurück in der Sendung."],
+    },
+    "qtts/fr-podcast-host/v1": {
+        "language": "fr",
+        "identity": {"pace": "medium", "energy": "medium"},
+        "covers": ["Bienvenue de nouveau dans l'émission."],
+    },
+    "qtts/ru-podcast-host/v1": {
+        "language": "ru",
+        "identity": {"pace": "medium", "energy": "medium"},
+        "covers": ["С возвращением в нашу передачу."],
+    },
+    "qtts/pt-podcast-host/v1": {
+        "language": "pt",
+        "identity": {"pace": "medium", "energy": "medium"},
+        "covers": ["Bem-vindo de volta ao programa."],
+    },
+    "qtts/es-podcast-host/v1": {
+        "language": "es",
+        "identity": {"pace": "medium", "energy": "medium"},
+        "covers": ["Bienvenidos de nuevo al programa."],
+    },
+    "qtts/it-podcast-host/v1": {
+        "language": "it",
+        "identity": {"pace": "medium", "energy": "medium"},
+        "covers": ["Bentornati al programma."],
+    },
 }
-DEFAULT_TEMPLATES = {"zh": "qtts/zh-late-night-radio/v1", "en": "qtts/en-podcast-host/v1"}
+DEFAULT_TEMPLATES = {
+    "zh": "qtts/zh-late-night-radio/v1",
+    "en": "qtts/en-podcast-host/v1",
+    "ja": "qtts/ja-podcast-host/v1",
+    "ko": "qtts/ko-podcast-host/v1",
+    "de": "qtts/de-podcast-host/v1",
+    "fr": "qtts/fr-podcast-host/v1",
+    "ru": "qtts/ru-podcast-host/v1",
+    "pt": "qtts/pt-podcast-host/v1",
+    "es": "qtts/es-podcast-host/v1",
+    "it": "qtts/it-podcast-host/v1",
+}
+SUPPORTED_LANGUAGES = frozenset(DEFAULT_TEMPLATES)
+EXAMPLE_COVERS = {
+    "zh": ["晚上好，欢迎收听今天的节目。", "外面下着雨，我们慢慢聊。"],
+    "en": ["Welcome back to the show.", "Let's take this slowly."],
+    "ja": ["また番組に戻ってきました。", "今日はゆっくり話しましょう。"],
+    "ko": ["다시 프로그램으로 돌아왔습니다.", "오늘은 천천히 이야기해 봐요."],
+    "de": ["Willkommen zurück in der Sendung.", "Lass uns heute langsam sprechen."],
+    "fr": ["Bienvenue de nouveau dans l'émission.", "Parlons-en doucement aujourd'hui."],
+    "ru": ["С возвращением в нашу передачу.", "Давайте сегодня поговорим неспешно."],
+    "pt": ["Bem-vindo de volta ao programa.", "Vamos conversar com calma hoje."],
+    "es": ["Bienvenidos de nuevo al programa.", "Hablemos despacio hoy."],
+    "it": ["Bentornati al programma.", "Parliamo con calma oggi."],
+}
 
 KNOWN_TOP_LEVEL = {
     "schema_version",
@@ -237,17 +301,14 @@ def example_document(name: str, *, language: str = "zh", template: Optional[str]
             },
             "scene": {"proximity": "close_mic", "room": "dry_studio"},
             "avoid": ["childlike", "shouting"],
-            "covers": [
-                "晚上好，欢迎收听今天的节目。",
-                "外面下着雨，我们慢慢聊。",
-            ],
+            "covers": list(EXAMPLE_COVERS["zh"]),
             "description": None,
             "instruction_override": None,
         }
     return {
         "schema_version": DESIGN_SCHEMA_VERSION,
         "name": name,
-        "language": "en",
+        "language": language,
         "template": template,
         "identity": {
             "age": "30s",
@@ -260,7 +321,7 @@ def example_document(name: str, *, language: str = "zh", template: Optional[str]
         "delivery_baseline": {"pace": "medium", "energy": "medium", "tone": ["calm"]},
         "scene": {"proximity": "close_mic", "room": "dry_studio"},
         "avoid": ["childlike", "shouting"],
-        "covers": ["Welcome back to the show.", "Let's take this slowly."],
+        "covers": list(EXAMPLE_COVERS.get(language, info["covers"])),
         "description": None,
         "instruction_override": None,
     }
