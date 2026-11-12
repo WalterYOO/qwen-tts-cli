@@ -152,15 +152,21 @@ qtts voice add NAME --kind clone --ref-audio FILE
   [--i-have-rights] [--license TEXT] [--consent-note TEXT] [--tags a,b]
   [--model MODEL] [--yes]
 
-qtts voice add NAME --kind design --description TEXT --sample-text TEXT
-  [--language Chinese] [--materialize-clone] [--model MODEL]
+qtts voice add NAME --kind design (--description TEXT | --design-yaml FILE)
+  [--sample-text TEXT] [--language Chinese] [--materialize-clone] [--model MODEL]
 
-qtts voice list [--json]
+qtts voice list [QUERY] [--match exact|prefix|contains|glob]
+  [--tag TAG]... [--kind clone|design|finetune] [--language LANG]
+  [--names-only] [--include-builtin] [--json]
+qtts voice show NAME [--json]
 qtts voice inspect NAME [--json]
+qtts voice rename OLD NEW [--dry-run]
+qtts voice tag NAME [--add TAG]... [--remove TAG]... [--set TAG]... [--clear]
+  [--dry-run]
+qtts voice delete NAME [--yes] [--dry-run]
 qtts voice preview NAME [--text TEXT] [--out FILE] [--format wav|flac]
-  [--language LANG]
-qtts voice rm NAME [--yes]
-qtts voice export NAME -o FILE.qttsvoice [--force]
+  [--language LANG] [--no-save]
+qtts voice export NAME -o FILE.qttsvoice [--force] [--dry-run]
 qtts voice import FILE.qttsvoice [--name NAME] [--force]
 qtts voice import-btts BUNDLE (--voice NAME ... | --all)
   [--name NAME] [--i-have-rights] [--auto-ref-text] [--ref-text TEXT]
@@ -186,6 +192,35 @@ qtts voice import-btts BUNDLE (--voice NAME ... | --all)
   时校验 SHA-256、大小与完整文件集，拒绝路径穿越/绝对路径/反斜杠/symlink/
   特殊文件/大小写冲突/未知文件。必须 `--i-have-rights`；已有音色需 `--force`。
 - `voice rm` 只删除 store 根目录内单个音色；非 TTY 必须 `--yes`。
+
+## design
+
+```bash
+qtts design init FILE [--template T] [--name NAME] [--language zh|en] [--force]
+qtts design lint FILE [--show-rendered] [--strict] [--json]
+qtts design explore FILE --out RUN_DIR [--resume] [--wide]
+  [--seeds 19,97] [--sampling default|stable|expressive]...
+  [--max-new-tokens N] [--retry-failed] [--yes] [--dry-run]
+qtts design report RUN_DIR [--metrics basic|full]
+  [--csv/--no-csv] [--html/--no-html] [--reel/--no-reel] [--gap 1.0]
+  [--require-full-metrics] [--fail-on-degraded]
+qtts design freeze RUN_DIR --take TAKE --name NAME --as clone|design
+  [--confirm-transcript] [--ref-text TEXT] [--allow-long-ref]
+  [--allow-incomplete] [--force] [--tag TAG]... [--i-have-rights]
+```
+
+- YAML 是 btts 结构化字段 + qtts 模板；`description`/`instruction_override` 优先级
+  高于编译结果。拒绝 anchor/alias、重复 key、>256 KiB、非 UTF-8。
+- `lint` 解析错误 4、block 1、`--strict` warning 1；有 block 时 grade 强制 red。
+- `explore --dry-run` 不加载模型、不写盘；真实运行一次加载 VoiceDesign，逐候选
+  原子写 WAV/recipe，`run.json` 是唯一索引；`--resume` 输入变化退出 2。
+- `report` 只读；缺失指标为 null 且不计 failure；损坏 WAV 标记 failed 不中止；
+  `--require-full-metrics` / `--fail-on-degraded` 退出 5。
+- `freeze --as design` 固化可重生成配方；`--as clone` 需 `--confirm-transcript`，
+  克隆还需 `--i-have-rights`，拒绝 failed/suspect/too_short，unknown 需
+  `--allow-incomplete`。
+- 盲听页面 `report/audition.html` 的“blind mode”会隐藏排名与推荐高亮；最终选择
+  必须人耳试听，指标只负责筛掉坏候选。
 
 ## takes
 

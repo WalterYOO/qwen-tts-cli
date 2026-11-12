@@ -16,6 +16,7 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
+from .completeness import assess
 from .errors import InputError
 from .qc import normalize_for_qc
 from .textnorm import detect_language
@@ -283,6 +284,32 @@ def _silence_mask(
     return mask, longest
 
 
+def _tail_metrics(
+    data: np.ndarray,
+    rms_db: np.ndarray,
+    frame_s: float,
+    sr: int,
+    silence_dbfs: float,
+) -> tuple[Optional[float], Optional[float], float]:
+    """Return ``(tail_rms_dbfs, reference_rms_dbfs, tail_silence_s)``."""
+    tail_samples = data[-max(1, int(round(0.1 * sr))) :]
+    mean_square = float(np.mean(tail_samples**2))
+    tail_rms = (
+        None if mean_square <= 0.0 else round(20.0 * math.log10(math.sqrt(mean_square)), 2)
+    )
+    voiced_frames = rms_db[rms_db > silence_dbfs]
+    reference = (
+        round(float(np.median(voiced_frames)), 2) if voiced_frames.size else None
+    )
+    tail_silence = 0.0
+    for value in rms_db[::-1]:
+        if float(value) < silence_dbfs:
+            tail_silence += frame_s
+        else:
+            break
+    return tail_rms, reference, round(tail_silence, 3)
+
+
 def analyze(
     samples: Sequence[float] | np.ndarray,
     sr: int,
@@ -294,10 +321,23 @@ def analyze(
     silence_dbfs: float = DEFAULT_SILENCE_DBFS,
     min_silence_s: float = DEFAULT_MIN_SILENCE_S,
     frame_ms: float = DEFAULT_FRAME_MS,
+    metrics: str = "basic",
+    recipe: Optional[dict[str, Any]] = None,
+    hnr_backend: str = "praat",
 ) -> dict[str, Any]:
-    """Measure audio quality. Missing measurements are null, never fabricated."""
+    """Measure audio quality. Missing measurements are null, never fabricated.
+
+    ``metrics="basic"`` keeps the pre-0.4 metric set; ``metrics="full"`` adds
+    F0/voicing/HNR/spectral features from :mod:`qtts_cli.audio_features`.
+    """
     if int(sr) <= 0:
         raise InputError("sample rate must be positive", details={"sample_rate": sr})
+    mode = (metrics or "basic").lower()
+    if mode not in ("basic", "full"):
+        raise InputError(
+            f"unsupported metrics mode: {metrics!r}; expected basic or full",
+            details={"metrics": metrics},
+        )
     data = _as_channels(samples)
     rate = int(sr)
     duration = float(data.shape[0]) / float(rate)
@@ -327,6 +367,18 @@ def analyze(
     silence_ratio = min(1.0, silent_s / duration) if duration > 0 else 0.0
     non_silent_s = max(0.0, duration - silent_s)
 
+    overall_square = float(np.mean(data**2))
+    rms_dbfs = (
+        None
+        if overall_square <= 0.0
+        else round(20.0 * math.log10(math.sqrt(overall_square)), 2)
+    )
+    if rms_dbfs is None:
+        unavailable["rms_dbfs"] = "digital_silence"
+    tail_rms, reference_rms, tail_silence = _tail_metrics(
+        data, rms_db, frame_s, rate, float(silence_dbfs)
+    )
+
     lufs, lufs_reason = integrated_loudness(data, rate)
     if lufs is None:
         unavailable["lufs"] = lufs_reason or "unavailable"
@@ -355,10 +407,21 @@ def analyze(
             else:
                 similarity = round(float(value), 4)
 
-    return {
+    completion = assess(
+        duration_s=duration,
+        text=text,
+        language=language,
+        recipe=recipe,
+        tail_rms_dbfs=tail_rms,
+        reference_rms_dbfs=reference_rms,
+        tail_silence_s=tail_silence,
+    )
+
+    result: dict[str, Any] = {
         "duration_s": round(duration, 4),
         "sample_rate": rate,
         "channels": int(data.shape[1]),
+        "rms_dbfs": rms_dbfs,
         "peak_dbfs": peak_db,
         "clipping_ratio": round(float(clipping_count) / float(data.size), 6),
         "clipping_count": clipping_count,
@@ -369,5 +432,21 @@ def analyze(
         "true_peak_dbtp": true_peak,
         "speech_rate": speech_rate,
         "speaker_similarity": similarity,
+        "completion": completion,
         "unavailable": unavailable,
     }
+
+    if mode == "full":
+        from .audio_features import analyze_features
+
+        features = analyze_features(
+            data,
+            rate,
+            silence_dbfs=float(silence_dbfs),
+            hnr_backend=hnr_backend,
+        )
+        feature_unavailable = features.pop("unavailable", {}) or {}
+        result["analysis"] = features.pop("analysis", {})
+        result.update(features)
+        unavailable.update(feature_unavailable)
+    return result

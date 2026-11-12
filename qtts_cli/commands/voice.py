@@ -22,7 +22,7 @@ from ..plan import SAMPLING_DEFAULTS, resolve_dtype_name, resolve_voice
 from ..sidecar import build_recipe, recipe_path, write_recipe
 from ..textnorm import NORMALIZATION_VERSION
 from ..tts_engine import TtsEngine, clear_model_cache
-from ..utils import atomic_write_bytes, confirm, is_tty, sha256_file
+from ..utils import atomic_write_bytes, confirm, eprint, is_tty, sha256_file
 from ..voice_archive import export_voice, import_voice
 from ..voice_btts import BttsBundle, BundleVoice, load_bundle, read_bundle_file
 from ..voice_store import VoiceStore, utc_now, validate_name
@@ -37,6 +37,8 @@ DEFAULT_DESIGN_SAMPLE = "你好，很高兴认识你。"
 def add(cfg, args) -> dict[str, Any]:
     if getattr(args, "auto_ref_text", False) and args.kind != "clone":
         raise UsageError("--auto-ref-text is only valid with --kind clone")
+    if getattr(args, "design_yaml", None) and args.kind != "design":
+        raise UsageError("--design-yaml is only valid with --kind design")
     if getattr(args, "asr_model", None) and not getattr(args, "auto_ref_text", False):
         raise UsageError("--asr-model requires --auto-ref-text")
     if args.kind == "clone":
@@ -261,8 +263,39 @@ def _add_design(cfg, args) -> dict[str, Any]:
     if store.exists(name):
         raise InputError(f"voice already exists: {name}")
     description = (args.description or "").strip()
+    design_block = None
+    design_yaml = getattr(args, "design_yaml", None)
+    if design_yaml:
+        from ..design_compile import compile_design
+        from ..design_lint import lint_design
+        from ..design_yaml import load_design
+
+        document, raw_text, yaml_sha = load_design(design_yaml)
+        compiled = compile_design(document)
+        report = lint_design(document, compiled)
+        if not report["ok"]:
+            raise UsageError(
+                "design YAML has blocking lint issues",
+                details={"issues": [
+                    item for item in report["issues"] if item["level"] == "block"
+                ]},
+            )
+        if description and description != compiled.rendered_instruction.strip():
+            raise UsageError("use either --description or --design-yaml, not both")
+        description = compiled.rendered_instruction.strip()
+        design_block = {
+            "schema_version": document.get("schema_version", 1),
+            "template": compiled.template,
+            "template_sha256": compiled.template_sha256,
+            "structured": document,
+            "rendered_instruction": compiled.rendered_instruction,
+            "rendered_sha256": compiled.rendered_sha256,
+            "compiler_version": compiled.compiler_version,
+            "yaml_sha256": yaml_sha,
+            "yaml": raw_text,
+        }
     if not description:
-        raise UsageError("voice add --kind design requires --description TEXT")
+        raise UsageError("voice add --kind design requires --description TEXT or --design-yaml FILE")
     sample_text = (args.sample_text or DEFAULT_DESIGN_SAMPLE).strip()
     language = getattr(args, "language", None) or "Chinese"
 
@@ -299,6 +332,7 @@ def _add_design(cfg, args) -> dict[str, Any]:
                 "language": language,
                 "ref_audio": None,
                 "materialized": False,
+                **({"design": design_block} if design_block else {}),
             },
             model={
                 "id": design_model.model_id,
@@ -421,42 +455,163 @@ def _materialize_design(
 # --------------------------------------------------------------------------- #
 # list / inspect
 # --------------------------------------------------------------------------- #
+_LANGUAGE_ALIASES = {
+    "zh": "chinese",
+    "cn": "chinese",
+    "yue": "cantonese",
+    "en": "english",
+    "ja": "japanese",
+    "jp": "japanese",
+    "ko": "korean",
+    "de": "german",
+    "fr": "french",
+    "es": "spanish",
+    "it": "italian",
+    "pt": "portuguese",
+    "ru": "russian",
+}
+
+
+def _language_key(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    key = str(value).strip().casefold()
+    if not key:
+        return None
+    return _LANGUAGE_ALIASES.get(key, key)
+
+
+def _name_matches(name: str, query: str, mode: str) -> bool:
+    candidate = name.casefold()
+    needle = query.casefold()
+    if mode == "exact":
+        return candidate == needle
+    if mode == "prefix":
+        return candidate.startswith(needle)
+    return needle in candidate
+
+
+def _voice_record(store: VoiceStore, name: str, meta: dict[str, Any]) -> dict[str, Any]:
+    source = meta.get("source") or {}
+    design = source.get("design") if isinstance(source.get("design"), dict) else {}
+    return {
+        "name": name,
+        "kind": meta.get("kind"),
+        "language": meta.get("language"),
+        "created_at": meta.get("created_at"),
+        "model": (meta.get("model") or {}).get("id"),
+        "materialized": bool(source.get("materialized")),
+        "has_prompt": store.prompt_sha256(name) is not None,
+        "tags": [str(tag) for tag in (meta.get("tags") or [])],
+        "source_kind": source.get("kind") or source.get("type"),
+        "design_template": design.get("template") if design else None,
+    }
+
+
 def list_voices(cfg, args) -> dict[str, Any]:
+    query = getattr(args, "query", None)
+    match = getattr(args, "match", None) or "fuzzy"
+    names_only = bool(getattr(args, "names_only", False))
+    if names_only and getattr(args, "json", False):
+        raise UsageError("--names-only cannot be combined with --json")
+    if query is not None:
+        query = query.strip()
+        if query.startswith("@"):
+            query = query[1:].strip()
+        if not query:
+            raise UsageError("empty voice query")
+    kinds = {str(value).casefold() for value in (getattr(args, "kind", None) or [])}
+    unknown_kinds = kinds - {"clone", "design", "finetune"}
+    if unknown_kinds:
+        raise UsageError(f"unknown voice kind: {sorted(unknown_kinds)[0]}")
+    tags = {
+        tag.casefold()
+        for value in (getattr(args, "tag", None) or [])
+        for tag in [str(value).strip()] if tag
+    }
+    language = _language_key(getattr(args, "language", None))
+    include_builtin = bool(getattr(args, "include_builtin", False))
+    structural = bool(kinds or tags)
+    filtered = bool(query or structural or language or names_only)
+
     models = scan(cfg.model_dir)
     builtin: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for model in models:
-        if model.kind != "builtin":
-            continue
-        for speaker in model.speakers:
-            key = speaker.lower()
-            if key in seen:
+    allow_builtin = not names_only and not structural and (
+        include_builtin or language is None
+    )
+    if allow_builtin:
+        for model in models:
+            if model.kind != "builtin":
                 continue
-            seen.add(key)
-            builtin.append(
-                {
-                    "name": speaker,
-                    "ref": f"builtin:{speaker}",
-                    "model": model.name,
-                    "languages": model.languages,
-                    "supports_instruct": model.supports_instruct,
-                }
-            )
+            model_languages = {_language_key(item) for item in (model.languages or [])}
+            if language is not None and language not in model_languages:
+                continue
+            for speaker in model.speakers:
+                key = speaker.casefold()
+                if key in seen:
+                    continue
+                if query is not None and not _name_matches(speaker, query, match):
+                    continue
+                seen.add(key)
+                builtin.append(
+                    {
+                        "name": speaker,
+                        "ref": f"builtin:{speaker}",
+                        "model": model.name,
+                        "languages": model.languages,
+                        "supports_instruct": model.supports_instruct,
+                    }
+                )
+
     store = VoiceStore(cfg.data_dir)
-    voices = []
-    for meta in store.list():
-        voices.append(
-            {
-                "name": meta.get("name"),
-                "kind": meta.get("kind"),
-                "language": meta.get("language"),
-                "created_at": meta.get("created_at"),
-                "model": (meta.get("model") or {}).get("id"),
-                "materialized": bool((meta.get("source") or {}).get("materialized")),
-                "has_prompt": store.prompt_sha256(str(meta.get("name"))) is not None,
-            }
-        )
-    return {"ok": True, "builtin": builtin, "voices": voices}
+    scan_result = store.scan_entries()
+    warnings = list(scan_result["warnings"])
+    voices: list[dict[str, Any]] = []
+    for entry in scan_result["voices"]:
+        if entry["status"] not in ("ok", "mismatch"):
+            continue
+        meta = entry["meta"] or {}
+        name = entry["name"]
+        if query is not None and not _name_matches(name, query, match):
+            continue
+        if kinds and str(meta.get("kind", "")).casefold() not in kinds:
+            continue
+        entry_tags = {str(tag).casefold() for tag in (meta.get("tags") or [])}
+        if tags and not tags.issubset(entry_tags):
+            continue
+        if language is not None and _language_key(meta.get("language")) != language:
+            continue
+        voices.append(_voice_record(store, name, meta))
+
+    if names_only:
+        names = [entry["name"] for entry in voices]
+        return {
+            "ok": True,
+            "kind": "voice_list",
+            "names_only": True,
+            "names": names,
+            "count": len(names),
+            "warnings": warnings,
+        }
+    return {
+        "ok": True,
+        "schema_version": 1,
+        "kind": "voice_list",
+        "query": query,
+        "match": match,
+        "filters": {
+            "tags": sorted(tags),
+            "kinds": sorted(kinds),
+            "language": language,
+            "include_builtin": include_builtin,
+        },
+        "filtered": filtered,
+        "count": len(builtin) + len(voices),
+        "builtin": builtin,
+        "voices": voices,
+        "warnings": warnings,
+    }
 
 
 def inspect(cfg, args) -> dict[str, Any]:
@@ -473,17 +628,79 @@ def inspect(cfg, args) -> dict[str, Any]:
                 "model": model.to_dict(),
             }
     store = VoiceStore(cfg.data_dir)
-    meta = store.require(name)
-    preview = store.dir_for(name) / "preview.wav"
+    directory = store.resolve_dir(name)
+    if directory is None or not directory.exists():
+        raise InputError(f"voice not found: {name}", details={"voice": name})
+    warnings: list[str] = []
+    if directory.is_symlink():
+        warnings.append("voice directory is a symlink")
+    meta_path = directory / "voice.json"
+    if meta_path.is_symlink():
+        warnings.append("voice.json is a symlink")
+    if not meta_path.is_file():
+        raise InputError(
+            f"voice {directory.name} has no voice.json", details={"voice": directory.name}
+        )
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise InputError(
+            f"corrupt voice metadata: {meta_path}: {exc}",
+            details={"voice": directory.name},
+        ) from exc
+    if not isinstance(meta, dict):
+        raise InputError(
+            f"invalid voice metadata: {meta_path}", details={"voice": directory.name}
+        )
+    stored = meta.get("name")
+    if stored != directory.name:
+        raise InputError(
+            f"voice name mismatch: directory {directory.name!r} contains {stored!r}; "
+            f"run: qtts voice rename {directory.name} {stored}",
+            details={"voice": directory.name, "name": stored},
+        )
+    if meta.get("kind") == "clone":
+        store.validate_reference(meta, directory)
+
+    files = []
+    for child in sorted(directory.iterdir()):
+        if child.name.startswith(".") or not (child.is_file() or child.is_symlink()):
+            continue
+        files.append(
+            {
+                "name": child.name,
+                "size": child.stat().st_size if child.is_file() else None,
+                "symlink": child.is_symlink(),
+            }
+        )
+        if child.is_symlink():
+            warnings.append(f"profile file is a symlink: {child.name}")
+
+    source = meta.get("source") or {}
+    design = source.get("design") if isinstance(source.get("design"), dict) else None
+    design_yaml = directory / "design.yaml"
+    if design_yaml.is_file():
+        try:
+            design_text = design_yaml.read_text(encoding="utf-8")[:65536]
+        except (OSError, UnicodeDecodeError):
+            design_text = None
+    else:
+        design_text = None
+
+    preview = directory / "preview.wav"
     payload = {
         "ok": True,
         "kind": meta.get("kind"),
         "voice": meta,
-        "prompt_sha256": store.prompt_sha256(name),
+        "directory": directory.name,
+        "files": files,
+        "prompt_sha256": store.prompt_sha256(directory.name),
         "preview": str(preview) if preview.is_file() else None,
+        "design": design,
+        "design_yaml": design_text,
+        "warnings": warnings,
     }
     if meta.get("kind") == "finetune":
-        source = meta.get("source") or {}
         model = meta.get("model") or {}
         path = model.get("path")
         payload["checkpoint"] = {
@@ -495,6 +712,53 @@ def inspect(cfg, args) -> dict[str, Any]:
     return payload
 
 
+def show(cfg, args) -> dict[str, Any]:
+    """``voice show`` is the canonical name; ``inspect`` stays as an alias."""
+    return inspect(cfg, args)
+
+
+def rename(cfg, args) -> dict[str, Any]:
+    store = VoiceStore(cfg.data_dir)
+    result = store.rename(args.old, args.new, dry_run=bool(args.dry_run))
+    return {"ok": True, **result}
+
+
+def tag(cfg, args) -> dict[str, Any]:
+    store = VoiceStore(cfg.data_dir)
+    list_only = not (
+        args.add or args.remove or args.set or args.clear
+    )
+    result = store.set_tags(
+        args.name,
+        add=args.add or (),
+        remove=args.remove or (),
+        replace=args.set,
+        clear=bool(args.clear),
+        dry_run=bool(args.dry_run),
+    )
+    return {"ok": True, "list_only": list_only, **result}
+
+
+def delete(cfg, args) -> dict[str, Any]:
+    store = VoiceStore(cfg.data_dir)
+    if not args.dry_run and not args.yes:
+        if not is_tty():
+            raise UsageError("voice delete requires --yes in non-interactive mode")
+        if not confirm(f"Delete voice {args.name}?"):
+            return {"ok": True, "cancelled": True, "voice": args.name}
+    try:
+        meta = store.get(args.name)
+    except InputError:
+        meta = None
+    result = store.delete(args.name, dry_run=bool(args.dry_run))
+    payload: dict[str, Any] = {"ok": True, **result}
+    if not args.dry_run:
+        payload["removed"] = args.name
+        if meta and meta.get("kind") == "finetune":
+            payload["checkpoint"] = (meta.get("model") or {}).get("path")
+    return payload
+
+
 # --------------------------------------------------------------------------- #
 # preview / rm
 # --------------------------------------------------------------------------- #
@@ -503,6 +767,20 @@ def preview(cfg, args) -> dict[str, Any]:
     models = scan(cfg.model_dir)
     store = VoiceStore(cfg.data_dir)
     name = args.name
+    no_save = bool(getattr(args, "no_save", False))
+    if no_save and not args.out:
+        raise UsageError("--no-save requires --out")
+    if getattr(args, "format", None) == "flac" and not args.out:
+        raise UsageError("--format flac requires --out ending in .flac")
+    if no_save and args.out:
+        profile = store.resolve_dir(name)
+        if profile is not None:
+            target = Path(args.out).expanduser().resolve()
+            if target == (profile / "preview.wav").resolve():
+                raise UsageError("--no-save cannot write the profile preview.wav")
+    if args.out:
+        # Validate suffix/format agreement before any model loads.
+        resolve_output_format(Path(args.out), getattr(args, "format", None))
 
     builtin_model: Optional[ModelInfo] = None
     speaker = None
@@ -600,8 +878,21 @@ def preview(cfg, args) -> dict[str, Any]:
     else:
         out = store.dir_for(name) / "preview.wav"
     fmt = resolve_output_format(out, args.format)
+    if (
+        builtin_model is None
+        and out.name == "preview.wav"
+        and out.parent == store.dir_for(name)
+        and out.is_file()
+        and not no_save
+    ):
+        eprint(f"overwriting preview: {out}")
     write_audio(out, audio, sr, fmt)
-    if builtin_model is None and out.name == "preview.wav" and out.parent == store.dir_for(name):
+    if (
+        not no_save
+        and builtin_model is None
+        and out.name == "preview.wav"
+        and out.parent == store.dir_for(name)
+    ):
         store.set_preview(name, out)
 
     recipe = build_recipe(
@@ -640,7 +931,13 @@ def preview(cfg, args) -> dict[str, Any]:
 
 def export(cfg, args) -> dict[str, Any]:
     store = VoiceStore(cfg.data_dir)
-    return export_voice(store, args.name, args.out, force=bool(args.force))
+    return export_voice(
+        store,
+        args.name,
+        args.out,
+        force=bool(args.force),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
 
 
 def import_(cfg, args) -> dict[str, Any]:
@@ -1190,6 +1487,30 @@ def _split_tags(value: Optional[str]) -> list[str]:
 
 
 def format_result(payload: dict[str, Any]) -> str:
+    if payload.get("names_only"):
+        names = payload.get("names") or []
+        return "\n".join(names) if names else "no matching voices."
+    if "old" in payload and "new" in payload:
+        verb = "would rename" if payload.get("dry_run") else "renamed"
+        return f"{verb} voice {payload['old']} -> {payload['new']}"
+    if "before" in payload and "after" in payload:
+        if payload.get("list_only"):
+            return f"{payload['voice']}: {', '.join(payload['before']) or '(no tags)'}"
+        if not payload.get("changed"):
+            return f"{payload['voice']}: tags unchanged ({', '.join(payload['after']) or 'none'})"
+        verb = "would set" if payload.get("dry_run") else "set"
+        return (
+            f"{verb} tags for {payload['voice']}: "
+            f"{', '.join(payload['after']) or '(none)'}"
+        )
+    if payload.get("archive") and payload.get("dry_run"):
+        meta = payload.get("voice") or {}
+        return (
+            f"would export voice {meta.get('name')} -> {payload['archive']} "
+            f"({len(payload.get('files') or [])} files)"
+        )
+    if payload.get("dry_run") and payload.get("path") and "voice" in payload:
+        return f"would delete voice {payload['voice']} ({payload['path']})"
     if payload.get("archive") and "replaced" in payload:
         meta = payload.get("voice") or {}
         action = "replaced" if payload.get("replaced") else "imported"
@@ -1228,17 +1549,36 @@ def format_result(payload: dict[str, Any]) -> str:
             lines.append(f"  warning: {warning}")
         return "\n".join(lines)
     if "builtin" in payload and "voices" in payload:
-        lines = ["built-in voices:"]
-        for entry in payload["builtin"]:
-            lines.append(f"  {entry['name']:10s} {entry['model']}  {','.join(entry['languages'][:4])}")
-        lines.append("user voices:")
-        if not payload["voices"]:
-            lines.append("  (none)")
-        for entry in payload["voices"]:
-            lines.append(
-                f"  {entry['name']:10s} kind={entry['kind']} lang={entry['language']} "
-                f"prompt={'yes' if entry['has_prompt'] else 'no'}"
-            )
+        lines: list[str] = []
+        if payload.get("filtered"):
+            for entry in payload["builtin"]:
+                lines.append(
+                    f"  {entry['name']:10s} builtin  {','.join(entry['languages'][:4])}"
+                )
+            for entry in payload["voices"]:
+                lines.append(
+                    f"  {entry['name']:10s} kind={entry['kind']} lang={entry['language']} "
+                    f"tags={','.join(entry.get('tags') or []) or '-'}"
+                )
+            if not lines:
+                lines.append("no matching voices.")
+        else:
+            lines.append("built-in voices:")
+            for entry in payload["builtin"]:
+                lines.append(
+                    f"  {entry['name']:10s} {entry['model']}  "
+                    f"{','.join(entry['languages'][:4])}"
+                )
+            lines.append("user voices:")
+            if not payload["voices"]:
+                lines.append("  (none)")
+            for entry in payload["voices"]:
+                lines.append(
+                    f"  {entry['name']:10s} kind={entry['kind']} lang={entry['language']} "
+                    f"prompt={'yes' if entry['has_prompt'] else 'no'}"
+                )
+        for warning in payload.get("warnings") or []:
+            lines.append(f"  warning: {warning}")
         return "\n".join(lines)
     if payload.get("voice") and isinstance(payload.get("voice"), dict) and payload["voice"].get("name"):
         meta = payload["voice"]
@@ -1263,6 +1603,20 @@ def format_result(payload: dict[str, Any]) -> str:
         if payload.get("materialized"):
             preview = payload.get("design_preview") or {}
             lines.append(f"  materialized clone; preview {preview.get('duration_s')}s")
+        files = payload.get("files") or []
+        if files:
+            names = ", ".join(entry["name"] for entry in files)
+            lines.append(f"  files: {names}")
+        if payload.get("prompt_sha256"):
+            lines.append(f"  prompt_sha256: {payload['prompt_sha256']}")
+        if payload.get("preview"):
+            lines.append(f"  preview: {payload['preview']}")
+        if payload.get("design") is not None:
+            lines.append("  design: embedded")
+        if payload.get("design_yaml"):
+            lines.append(f"  design.yaml: {len(payload['design_yaml'])} bytes")
+        for warning in payload.get("warnings") or []:
+            lines.append(f"  warning: {warning}")
         return "\n".join(lines)
     if payload.get("output"):
         return f"wrote {payload['output']} ({payload['duration_s']}s)"

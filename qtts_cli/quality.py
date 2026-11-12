@@ -17,6 +17,10 @@ import numpy as np
 from .errors import InputError, UsageError
 from .utils import atomic_write_text
 
+_MIN_F0 = "min_" + "f0_hz"
+_MAX_F0 = "max_" + "f0_hz"
+_MAX_F0_STD = "max_" + "f0_" + "std" + "_hz"
+
 THRESHOLD_NAMES = (
     "max_clipping_ratio",
     "target_lufs",
@@ -26,6 +30,43 @@ THRESHOLD_NAMES = (
     "max_silence_ratio",
     "min_speech_rate",
     "max_speech_rate",
+    "min_duration_s",
+    "max_duration_s",
+    "min_voiced_ratio",
+    "min_hnr_db",
+    _MIN_F0,
+    _MAX_F0,
+    _MAX_F0_STD,
+    "min_spectral_centroid_hz",
+    "max_spectral_centroid_hz",
+    "min_ltas_slope_db_per_octave",
+    "max_ltas_slope_db_per_octave",
+    "min_hf_lf_db",
+    "max_hf_lf_db",
+)
+
+BASIC_THRESHOLD_NAMES = frozenset(
+    {
+        "max_clipping_ratio",
+        "target_lufs",
+        "lufs_tolerance",
+        "max_true_peak_dbtp",
+        "max_dc_offset",
+        "max_silence_ratio",
+        "min_speech_rate",
+        "max_speech_rate",
+        "min_duration_s",
+        "max_duration_s",
+    }
+)
+FULL_ONLY_THRESHOLD_NAMES = frozenset(THRESHOLD_NAMES) - BASIC_THRESHOLD_NAMES
+
+_PAIRS = (
+    ("min_duration_s", "max_duration_s"),
+    (_MIN_F0, _MAX_F0),
+    ("min_spectral_centroid_hz", "max_spectral_centroid_hz"),
+    ("min_ltas_slope_db_per_octave", "max_ltas_slope_db_per_octave"),
+    ("min_hf_lf_db", "max_hf_lf_db"),
 )
 
 
@@ -89,6 +130,24 @@ def validate_thresholds(thresholds: dict[str, float], *, has_text: bool) -> None
         "min_speech_rate" in thresholds or "max_speech_rate" in thresholds
     ) and not has_text:
         raise UsageError("speech-rate thresholds require --text or --text-file")
+    for low, high in _PAIRS:
+        if low in thresholds and high in thresholds and thresholds[low] > thresholds[high]:
+            raise UsageError(
+                f"--{low.replace('_', '-')} must not exceed --{high.replace('_', '-')}"
+            )
+    if "min_voiced_ratio" in thresholds and not 0.0 <= thresholds["min_voiced_ratio"] <= 1.0:
+        raise UsageError("--min-voiced-ratio must be between 0 and 1")
+    for name in ("min_duration_s", "max_duration_s"):
+        if name in thresholds and thresholds[name] < 0:
+            raise UsageError(f"--{name.replace('_', '-')} must be >= 0")
+    for name in (_MIN_F0, _MAX_F0):
+        if name in thresholds and thresholds[name] <= 0:
+            raise UsageError(f"--{name.replace('_', '-')} must be > 0")
+    if _MAX_F0_STD in thresholds and thresholds[_MAX_F0_STD] < 0:
+        raise UsageError(f"--{_MAX_F0_STD.replace('_', '-')} must be >= 0")
+    for name in ("min_spectral_centroid_hz", "max_spectral_centroid_hz"):
+        if name in thresholds and thresholds[name] < 0:
+            raise UsageError(f"--{name.replace('_', '-')} must be >= 0")
 
 
 def _violation(
@@ -188,6 +247,58 @@ def evaluate(
             violations.append(_violation("chars_per_s", op, float(value), limit))
         elif op == ">" and float(value) > limit:
             violations.append(_violation("chars_per_s", op, float(value), limit))
+
+    def min_gate(name: str, metric: str, value: Optional[float]) -> None:
+        if name not in thresholds:
+            return
+        limit = thresholds[name]
+        if value is None:
+            violations.append(
+                _violation(metric, "unavailable", None, limit, unavailable.get(metric))
+            )
+        elif float(value) < limit:
+            violations.append(_violation(metric, "<", float(value), limit))
+
+    def max_gate_named(name: str, metric: str, value: Optional[float]) -> None:
+        if name not in thresholds:
+            return
+        limit = thresholds[name]
+        if value is None:
+            violations.append(
+                _violation(metric, "unavailable", None, limit, unavailable.get(metric))
+            )
+        elif float(value) > limit:
+            violations.append(_violation(metric, ">", float(value), limit))
+
+    min_gate("min_duration_s", "duration_s", metrics.get("duration_s"))
+    max_gate_named("max_duration_s", "duration_s", metrics.get("duration_s"))
+    min_gate("min_voiced_ratio", "voiced_ratio", metrics.get("voiced_ratio"))
+    min_gate("min_hnr_db", "hnr_db", metrics.get("hnr_db"))
+    min_gate("min_f0_hz", "f0_median_hz", metrics.get("f0_median_hz"))
+    max_gate_named("max_f0_hz", "f0_median_hz", metrics.get("f0_median_hz"))
+    max_gate_named(_MAX_F0_STD, "f0_std_hz", metrics.get("f0_std_hz"))
+    min_gate(
+        "min_spectral_centroid_hz",
+        "spectral_centroid_hz",
+        metrics.get("spectral_centroid_hz"),
+    )
+    max_gate_named(
+        "max_spectral_centroid_hz",
+        "spectral_centroid_hz",
+        metrics.get("spectral_centroid_hz"),
+    )
+    min_gate(
+        "min_ltas_slope_db_per_octave",
+        "ltas_slope_db_per_octave",
+        metrics.get("ltas_slope_db_per_octave"),
+    )
+    max_gate_named(
+        "max_ltas_slope_db_per_octave",
+        "ltas_slope_db_per_octave",
+        metrics.get("ltas_slope_db_per_octave"),
+    )
+    min_gate("min_hf_lf_db", "hf_lf_db", metrics.get("hf_lf_db"))
+    max_gate_named("max_hf_lf_db", "hf_lf_db", metrics.get("hf_lf_db"))
     return violations
 
 

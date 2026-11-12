@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Optional
 
@@ -10,8 +11,10 @@ import numpy as np
 from ..audio_io import read_audio
 from ..audio_qc import analyze, cosine_similarity
 from ..catalog import ModelInfo, find_model, scan, select
+from ..completeness import FAILURE_STATUSES
 from ..errors import InputError, ModelError, QttsError, UsageError
 from ..quality import (
+    FULL_ONLY_THRESHOLD_NAMES,
     embedding_array,
     evaluate,
     thresholds_from_args,
@@ -39,6 +42,28 @@ def _read_text(args) -> Optional[str]:
         raise InputError(
             f"cannot read text file {path}: {exc}", details={"path": str(path)}
         ) from exc
+
+
+def _read_recipe(args) -> Optional[dict[str, Any]]:
+    path_arg = getattr(args, "recipe", None)
+    if not path_arg:
+        return None
+    path = Path(path_arg).expanduser()
+    if not path.is_file():
+        raise InputError(f"recipe file not found: {path}", details={"path": str(path)})
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise InputError(f"cannot read recipe {path}: {exc}", details={"path": str(path)}) from exc
+    if not isinstance(payload, dict):
+        raise InputError(f"recipe must be a JSON object: {path}", details={"path": str(path)})
+    return payload
+
+
+FULL_METRIC_KEYS = tuple(
+    "f0_" + suffix
+    for suffix in ("median_hz", "mean_hz", "std_hz", "p10_hz", "p90_hz")
+) + ("voiced_ratio", "hnr_db", "spectral_centroid_hz", "ltas_slope_db_per_octave", "hf_lf_db")
 
 
 def _read_audio(args) -> tuple[np.ndarray, int]:
@@ -165,15 +190,27 @@ def report_payload(
     thresholds: dict[str, float],
     violations: list[dict[str, Any]],
     reference_voice: Optional[str],
+    metrics_mode: str = "basic",
+    completion_checked: bool = False,
 ) -> dict[str, Any]:
     audio_path = Path(audio).expanduser() if audio is not None else None
     metric_payload = {
         key: value
         for key, value in metrics.items()
-        if key not in ("duration_s", "sample_rate", "channels", "unavailable")
+        if key
+        not in (
+            "duration_s",
+            "sample_rate",
+            "channels",
+            "unavailable",
+            "completion",
+            "analysis",
+        )
     }
     return {
         "schema_version": 1,
+        "metrics_version": 1,
+        "metrics_mode": metrics_mode,
         "ok": not violations,
         "audio": {
             "path": audio_path.name if audio_path else None,
@@ -183,6 +220,9 @@ def report_payload(
             "sha256": sha256_file(audio_path) if audio_path else None,
         },
         "metrics": metric_payload,
+        "completion": metrics.get("completion"),
+        "completion_checked": completion_checked,
+        "analysis": metrics.get("analysis"),
         "unavailable": metrics.get("unavailable") or {},
         "thresholds": thresholds,
         "violations": violations,
@@ -190,18 +230,68 @@ def report_payload(
     }
 
 
+def _completion_violation(metrics: dict[str, Any]) -> Optional[dict[str, Any]]:
+    completion = metrics.get("completion") or {}
+    status = completion.get("status")
+    if status not in FAILURE_STATUSES:
+        return None
+    return {
+        "metric": "completion",
+        "op": "status",
+        "value": status,
+        "threshold": "complete",
+        "reason": ",".join(completion.get("reasons") or []) or None,
+    }
+
+
+def _require_full_violations(metrics: dict[str, Any]) -> list[dict[str, Any]]:
+    unavailable = metrics.get("unavailable") or {}
+    violations: list[dict[str, Any]] = []
+    for key in FULL_METRIC_KEYS:
+        if metrics.get(key) is None:
+            violations.append(
+                {
+                    "metric": key,
+                    "op": "unavailable",
+                    "value": None,
+                    "threshold": 1.0,
+                    "reason": unavailable.get(key, "unavailable"),
+                }
+            )
+    return violations
+
+
 def run(cfg, args) -> dict[str, Any]:
     thresholds = thresholds_from_args(args)
     text = _read_text(args)
     validate_thresholds(thresholds, has_text=bool(text and text.strip()))
+
+    metrics_mode = (getattr(args, "metrics", None) or "basic").lower()
+    require_full = bool(getattr(args, "require_full_metrics", False))
+    if require_full and metrics_mode != "full":
+        raise UsageError("--require-full-metrics requires --metrics full")
+    if metrics_mode != "full":
+        unsupported = sorted(set(thresholds) & FULL_ONLY_THRESHOLD_NAMES)
+        if unsupported:
+            flags = ", ".join("--" + name.replace("_", "-") for name in unsupported)
+            raise UsageError(f"{flags} requires --metrics full")
 
     reference_voice = getattr(args, "reference_voice", None)
     store = VoiceStore(cfg.data_dir)
     if reference_voice:
         validate_reference_voice(store, reference_voice)
 
+    recipe = _read_recipe(args)
     samples, sr = _read_audio(args)
-    metrics = analyze(samples, sr, text=text, language=args.language)
+    metrics = analyze(
+        samples,
+        sr,
+        text=text,
+        language=args.language,
+        metrics=metrics_mode,
+        recipe=recipe,
+        hnr_backend=getattr(args, "hnr_backend", "praat"),
+    )
 
     if reference_voice:
         models = scan(cfg.model_dir)
@@ -217,8 +307,25 @@ def run(cfg, args) -> dict[str, Any]:
         metrics["unavailable"].pop("speaker_similarity", None)
 
     violations = evaluate(metrics, thresholds)
+    if bool(getattr(args, "fail_on_incomplete", False)):
+        completion_violation = _completion_violation(metrics)
+        if completion_violation is not None:
+            violations.append(completion_violation)
+    if require_full:
+        violations.extend(_require_full_violations(metrics))
+    completion_checked = bool(
+        recipe is not None
+        or metrics_mode == "full"
+        or getattr(args, "fail_on_incomplete", False)
+    )
     payload = report_payload(
-        args.audio, metrics, thresholds, violations, reference_voice
+        args.audio,
+        metrics,
+        thresholds,
+        violations,
+        reference_voice,
+        metrics_mode,
+        completion_checked,
     )
     if getattr(args, "report", None):
         write_report(args.report, payload)
@@ -235,6 +342,7 @@ def format_result(payload: dict[str, Any]) -> str:
         f"{audio.get('sample_rate')}Hz {audio.get('channels')}ch"
     ]
     for key in (
+        "rms_dbfs",
         "peak_dbfs",
         "clipping_ratio",
         "dc_offset",
@@ -251,6 +359,22 @@ def format_result(payload: dict[str, Any]) -> str:
         lines.append(
             f"  speech_rate: {speech.get('chars_per_s')} chars/s, "
             f"{speech.get('words_per_min')} wpm"
+        )
+    if payload.get("metrics_mode") == "full":
+        for key in FULL_METRIC_KEYS:
+            value = metrics.get(key)
+            lines.append(f"  {key}: {value if value is not None else 'n/a'}")
+        analysis = payload.get("analysis") or {}
+        if analysis:
+            lines.append(
+                f"  analysis: f0={analysis.get('f0_backend')} "
+                f"hnr={analysis.get('hnr_backend')}"
+            )
+    completion = payload.get("completion") or {}
+    if completion and payload.get("completion_checked"):
+        lines.append(
+            f"  completion: {completion.get('status')} "
+            f"({','.join(completion.get('reasons') or []) or 'no reasons'})"
         )
     for violation in payload.get("violations") or []:
         lines.append(

@@ -16,7 +16,7 @@ description: >-
 长音频对齐与 `--auto-ref-text` 也会用到 ASR。
 
 命令在项目根目录执行。若 `qtts` 不在 PATH，改用 `uv run qtts` 或 `.venv/bin/qtts`，
-选定一个并全程复用。本文按 0.3.2 编写，先 `qtts --version` 核对。
+选定一个并全程复用。本文按 0.4.0 编写，先 `qtts --version` 核对。
 
 ## 最小可用路径
 
@@ -81,6 +81,7 @@ qtts say "你好，世界。" --voice builtin:Vivian --out hello.wav --subtitle 
 | 批量 | `batch plan` → `batch run` | 新 `--out-dir`；`--resume` | workflows.md |
 | 音色克隆 | `voice add NAME --kind clone ...` | 用户确认授权；`preview` | voice-and-assets.md |
 | 音色设计 | `voice add NAME --kind design ...` | `preview`；要稳定用 `--materialize-clone` | voice-and-assets.md |
+| 结构化设计/盲听 | `design init` → `lint` → `explore` → `report` | 人耳试听后再 `freeze` | commands-core.md |
 | 音色归档 | `voice export` / `import` / `import-btts` | 校验 manifest 与 hash | voice-and-assets.md |
 | 对齐已有音频 | `align AUDIO --text-file ...` | >300s 自动切窗 | workflows.md |
 | 有声书 | `audiobook build book.yaml` | 先 `--dry-run` | workflows.md |

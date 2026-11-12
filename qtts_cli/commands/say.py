@@ -139,6 +139,45 @@ def run(
     if takes_spec and getattr(args, "jsonl", False):
         raise UsageError("--takes/--select cannot be combined with --jsonl")
     script_path = getattr(args, "script", None)
+    design_arg = getattr(args, "design", None)
+    design_info = None
+    if design_arg:
+        conflicts = [
+            name
+            for name in ("voice", "instruct", "script")
+            if getattr(args, name, None)
+        ]
+        if getattr(args, "jsonl", False):
+            conflicts.append("--jsonl")
+        if conflicts:
+            raise UsageError(
+                "--design cannot be combined with " + ", ".join("--" + name for name in conflicts)
+            )
+        from ..design_compile import compile_design
+        from ..design_lint import lint_design
+        from ..design_yaml import load_design
+
+        document, raw_text, yaml_sha = load_design(design_arg)
+        compiled = compile_design(document)
+        report = lint_design(document, compiled)
+        if not report["ok"]:
+            raise UsageError(
+                "design YAML has blocking lint issues",
+                details={"issues": [
+                    item for item in report["issues"] if item["level"] == "block"
+                ]},
+            )
+        rendered = compiled.rendered_instruction.strip()
+        if not rendered:
+            raise UsageError("design YAML compiled to an empty instruction")
+        args.voice = f"design:{rendered}"
+        design_info = {
+            "source": str(Path(design_arg).expanduser()),
+            "design_yaml_sha256": yaml_sha,
+            "rendered_instruction_sha256": compiled.rendered_sha256,
+            "compiler_version": compiled.compiler_version,
+            "template": compiled.template,
+        }
     structured = bool(
         script_path and Path(script_path).suffix.lower() in (".yaml", ".yml", ".json")
     )
@@ -308,6 +347,9 @@ def run(
             require_clone_prompt=spec.require_clone_prompt,
             speaker_policy=spec.speaker_policy(),
         )
+
+    if design_info is not None:
+        plan.voice.identity["design"] = design_info
 
     # Backend-specific checks (API key, ref audio, offline) run after the plan
     # exists and before any create/load/aligner/cache preparation.
@@ -761,6 +803,7 @@ def run(
             "generate_ms": round(sum(m.get("generate_ms") or 0.0 for m in segment_meta), 1),
         },
         backend=backend_payload,
+        design=design_info,
     )
     voices = []
     models_used = []
@@ -1096,6 +1139,8 @@ def run_jsonl(cfg, args) -> dict[str, Any]:
     """`say --stdin --jsonl`: one request per line, one result per line."""
     if takes_request(args) is not None:
         raise UsageError("--takes/--select cannot be combined with --jsonl")
+    if getattr(args, "design", None):
+        raise UsageError("--design cannot be combined with --jsonl")
     if not getattr(args, "stdin", False):
         raise UsageError("--jsonl requires --stdin")
     if getattr(args, "json", False):

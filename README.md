@@ -36,6 +36,7 @@
 |---|---|
 | **统一生成入口** | `qtts say` 通过 `builtin:` / `voice:` / `design:` 三种引用自动路由到 CustomVoice、Base 克隆或 VoiceDesign |
 | **音色资产库** | 克隆音色、设计音色、设计后固化为克隆 profile；支持列出、检查、试听、删除 |
+| **结构化音色设计** | `design init/lint/explore/report/freeze` 用 YAML 描述音色身份与交付基线，离线编译/评分，候选矩阵生成、指标排序、盲听听审与 recipe 固化 |
 | **参考音频准入** | 时长、采样率、削波、静音比例、有效语音占比等检查；保存 consent/license 元数据 |
 | **文本流水线** | 数字/日期/金额/URL/emoji 规范化，语义分段，token/时长预算，逐段语言标记 |
 | **字幕与对齐** | `align` 和 `say --subtitle` 输出 SRT / VTT / ASS / JSON；内容逐字来自规范化原文 |
@@ -538,7 +539,7 @@ qtts [--config FILE] [--data-dir DIR] [--model-dir DIR] [--cache-dir DIR]
 
 ```text
 qtts say [TEXT | - | --file FILE | --script FILE | --stdin --jsonl]
-  [--voice builtin:NAME | voice:NAME | design:DESCRIPTION]
+  [--voice builtin:NAME | voice:NAME | design:DESCRIPTION | --design FILE.yaml]
   [--lexicon FILE.json]
   [--language auto|Chinese|English|...]
   [--instruct TEXT]
@@ -566,6 +567,7 @@ qtts say [TEXT | - | --file FILE | --script FILE | --stdin --jsonl]
 要点：
 
 - `--script` 接受 `.yaml/.yml/.json` 多角色脚本（见[多角色脚本](#7-多角色脚本)）；纯文本脚本仍按普通输入读取。脚本模式下 `--voice` 只作为 defaults 缺省值，`--model` 若与多模型脚本冲突会退出 2；与 TEXT/`--stdin`/`--file` 同时出现会退出 2；显式传入的 `--language/--instruct/--max-new-tokens/--pause-ms` 覆盖脚本 `defaults` 并体现在 plan/recipe 中。
+- `--design FILE.yaml` 先严格解析并 lint 设计文件，再把编译后的 instruction 作为 `design:` 音色描述；与 `--voice`/`--instruct`/`--script`/`--jsonl` 互斥。recipe 额外记录 `design.design_yaml_sha256`、`rendered_instruction_sha256` 与 `compiler_version`。
 - `--lexicon` 使用 `{"schema_version":1,"entries":[{"term","spoken"}]}`；最长匹配优先，匹配前做大小写/全角归一，重复 term 直接退出 4。TTS 读 `spoken`，字幕与 `join(cue.text)` 保持原文 `term`；缓存键包含词典内容哈希。
 - `--instruct` 只支持 1.7B CustomVoice / VoiceDesign；Base、0.6B CustomVoice 收到会直接退出 4。
 - `--language auto` 按段判定并逐段校验。
@@ -579,6 +581,29 @@ qtts say [TEXT | - | --file FILE | --script FILE | --stdin --jsonl]
 - `--stdin --jsonl` 每行一个请求：`{"id","text","voice"?,"out"?}`；每行结果 `{"id","status":"ok","output","recipe","metrics"}` 或 `{"id","status":"error","error":{"code","message","details"}}`。单条失败继续，全部成功退出 0、任一失败退出 6、空 stdin 或启动参数错误退出 2。`--jsonl` 不能与 `--json`、`--out`、`--recipe-out`、`--subtitle-out-prefix`、`--dry-run`、位置文本或 `--out-dir -` 组合；`out` 必须是文件路径，不能是 `-`。
 - stdout 一次只能承载一个产物：`--out -`、`--json`、`--subtitle-out-prefix -`、`--recipe-out -` 互斥。
 - `--out -` 时 stdout 是纯音频，摘要写 stderr。未指定 `--recipe-out` 时，recipe 写到 data-dir 的 `recipes/<request hash>.recipe.json`；hash 覆盖 voice identity、seed、sampling、language、instruct 与逐段 cache key，避免相同文本的不同请求互相覆盖。
+
+### `qtts design`
+
+```text
+qtts design init FILE [--template T] [--name NAME] [--language zh|en] [--force]
+qtts design lint FILE [--show-rendered] [--strict] [--json]
+qtts design explore FILE --out RUN_DIR [--resume] [--wide]
+  [--seeds 19,97] [--sampling default|stable|expressive]...
+  [--max-new-tokens N] [--retry-failed] [--yes] [--dry-run]
+qtts design report RUN_DIR [--metrics basic|full]
+  [--csv/--no-csv] [--html/--no-html] [--reel/--no-reel] [--gap 1.0]
+  [--require-full-metrics] [--fail-on-degraded] [--json]
+qtts design freeze RUN_DIR --take TAKE --name NAME --as clone|design
+  [--confirm-transcript] [--ref-text TEXT] [--allow-long-ref]
+  [--allow-incomplete] [--force] [--tag TAG]... [--i-have-rights]
+```
+
+- 设计 YAML 是 btts 风格的结构化字段（`identity`/`delivery_baseline`/`scene`/`avoid`/`covers`）加 qtts 模板；`description` 与 `instruction_override` 是逃生口，优先级 `instruction_override > description > compiler`。YAML 拒绝 anchor/alias、重复 key、超过 256 KiB 与非 UTF-8。
+- `lint` 离线确定性运行；解析错误退出 4，block 退出 1，`--strict` 下 warning 也退出 1。输出五维评分与 `green/yellow/red`；有 block 时强制 red。
+- `explore` 默认 2 个 seed × 2 个采样 profile × 1 条 cover；`--wide` 叠加第二条 cover，候选上限 16（显式更大矩阵需 `--yes`）。每次候选写 WAV 与 recipe，`run.json` 是唯一索引；`--dry-run` 不加载模型、不写盘。
+- `report` 只读 run 目录，按 `failure_count → completion 严重度 → clipping → silence → hnr → voiced_ratio → take_id` 排序，生成 `report.json`、`metrics.csv`、`report.md`、`audition.html`（盲听模式）与 `all_candidates.wav`。缺失指标为 `null` 且不计 failure；`--require-full-metrics` 或 `--fail-on-degraded` 失败退出 5。
+- `freeze --as design` 保存可重生成的配方（YAML + rendered instruction + 哈希），`source.description` 直接可用；`--as clone` 以选中 take 为参考构建 ICL prompt，要求 `--confirm-transcript`，拒绝失败/疑似截断的候选，克隆还需 `--i-have-rights`。
+- 退出码：lint block 1、usage 2、模型 3、输入/解析 4、质量门禁 5、中断 130。
 
 ### `qtts script`
 

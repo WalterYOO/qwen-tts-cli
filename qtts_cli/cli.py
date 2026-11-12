@@ -97,6 +97,26 @@ def _add_qc_thresholds(parser: argparse.ArgumentParser) -> None:
                         help="fail above this many characters/second (requires text)")
 
 
+def _add_acoustic_thresholds(parser: argparse.ArgumentParser) -> None:
+    """Opt-in acoustic gates for ``qc --metrics full``."""
+    for name, help_text in (
+        ("--min-duration-s", "fail below this duration in seconds"),
+        ("--max-duration-s", "fail above this duration in seconds"),
+        ("--min-voiced-ratio", "fail below this voiced-frame ratio (0-1)"),
+        ("--min-hnr-db", "fail below this median HNR in dB (praat backend)"),
+        ("--min-f0-hz", "fail below this median F0 in Hz"),
+        ("--max-f0-hz", "fail above this median F0 in Hz"),
+        ("--max-f0-std-hz", "fail above this F0 standard deviation in Hz"),
+        ("--min-spectral-centroid-hz", "fail below this spectral centroid in Hz"),
+        ("--max-spectral-centroid-hz", "fail above this spectral centroid in Hz"),
+        ("--min-ltas-slope-db-per-octave", "fail below this LTAS slope"),
+        ("--max-ltas-slope-db-per-octave", "fail above this LTAS slope"),
+        ("--min-hf-lf-db", "fail below this HF/LF energy ratio in dB"),
+        ("--max-hf-lf-db", "fail above this HF/LF energy ratio in dB"),
+    ):
+        parser.add_argument(name, type=float, default=None, help=help_text)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = QttsArgumentParser(
         prog="qtts",
@@ -113,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
     from .commands import bench as bench_cmd
     from .commands import check as check_cmd
     from .commands import completion as completion_cmd
+    from .commands import design as design_cmd
     from .commands import doctor as doctor_cmd
     from .commands import dub as dub_cmd
     from .commands import finetune as finetune_cmd
@@ -139,6 +160,9 @@ def build_parser() -> argparse.ArgumentParser:
     say.add_argument("--script", help="read a plain-text or YAML/JSON multi-role script")
     say.add_argument("--voice",
                      help="builtin:Vivian | voice:NAME | design:DESCRIPTION")
+    say.add_argument("--design",
+                     help="design YAML file (cannot be combined with "
+                          "--voice/--instruct/--script/--jsonl)")
     # SUPPRESS lets `say --script` distinguish an explicit CLI default from an
     # omitted option; missing values are resolved in commands.say.
     say.add_argument("--language", default=argparse.SUPPRESS,
@@ -227,6 +251,102 @@ def build_parser() -> argparse.ArgumentParser:
     batch_run.set_defaults(func=batch_cmd.run, formatter=batch_cmd.format_result)
 
     # -- voice -------------------------------------------------------------- #
+    design = sub.add_parser("design", help="structured voice-design workflow")
+    design_sub = design.add_subparsers(dest="design_command", required=True)
+
+    design_init = design_sub.add_parser("init", help="write a design YAML template")
+    _add_common(design_init, suppress=True)
+    design_init.add_argument("file")
+    design_init.add_argument("--template", help="template id (see docs)")
+    design_init.add_argument("--name", help="voice name (default: file stem)")
+    design_init.add_argument("--language", choices=["zh", "en"],
+                             help="design language (default: inferred from --template, else zh)")
+    design_init.add_argument("--force", action="store_true")
+    design_init.set_defaults(func=design_cmd.init, formatter=design_cmd.format_result)
+
+    design_lint = design_sub.add_parser("lint", help="lint a design YAML offline")
+    _add_common(design_lint, suppress=True)
+    design_lint.add_argument("file")
+    design_lint.add_argument("--show-rendered", action="store_true",
+                             help="print the compiled instruction")
+    design_lint.add_argument("--strict", action="store_true",
+                             help="treat warnings as failures (exit 1)")
+    design_lint.set_defaults(func=design_cmd.lint, formatter=design_cmd.format_result)
+
+    design_explore = design_sub.add_parser(
+        "explore", help="build a candidate matrix for a design file"
+    )
+    _add_common(design_explore)
+    design_explore.add_argument("file")
+    design_explore.add_argument("--out", required=True, help="run directory")
+    design_explore.add_argument("--resume", action="store_true",
+                                help="reuse an existing run directory")
+    design_explore.add_argument("--wide", action="store_true",
+                                help="also synthesize cover #2")
+    design_explore.add_argument("--seeds", help="comma-separated seeds (default: 2 random primes)")
+    design_explore.add_argument("--sampling", action="append",
+                                choices=["default", "stable", "expressive"],
+                                help="sampling profile (repeatable)")
+    design_explore.add_argument("--max-new-tokens", type=int, default=2048)
+    design_explore.add_argument("--retry-failed", action="store_true",
+                                help="re-run candidates that failed previously")
+    design_explore.add_argument("--yes", action="store_true",
+                                help="allow an explicit matrix larger than 16 candidates")
+    design_explore.add_argument("--dry-run", action="store_true",
+                                help="print the matrix without loading a model")
+    design_explore.set_defaults(func=design_cmd.explore,
+                                formatter=design_cmd.format_result)
+
+    design_report = design_sub.add_parser(
+        "report", help="measure and rank an existing design run"
+    )
+    _add_common(design_report, suppress=True)
+    design_report.add_argument("run_dir")
+    design_report.add_argument("--metrics", choices=["basic", "full"], default="basic")
+    design_report.add_argument("--csv", dest="csv", action="store_true", default=True)
+    design_report.add_argument("--no-csv", dest="csv", action="store_false")
+    design_report.add_argument("--html", dest="html", action="store_true", default=True)
+    design_report.add_argument("--no-html", dest="html", action="store_false")
+    design_report.add_argument("--reel", dest="reel", action="store_true", default=True)
+    design_report.add_argument("--no-reel", dest="reel", action="store_false")
+    design_report.add_argument("--gap", type=float, default=1.0,
+                               help="silence between candidates in the reel (0-30s)")
+    design_report.add_argument("--require-full-metrics", action="store_true",
+                               help="exit 5 when any full metric is unavailable")
+    design_report.add_argument("--fail-on-degraded", action="store_true",
+                               help="exit 5 when no candidate is complete")
+    design_report.set_defaults(func=design_cmd.report,
+                               formatter=design_cmd.format_result)
+
+    design_freeze = design_sub.add_parser(
+        "freeze", help="freeze an audition take into a voice profile"
+    )
+    _add_common(design_freeze, suppress=True)
+    design_freeze.add_argument("run_dir")
+    design_freeze.add_argument("--take", required=True, help="candidate take_id")
+    design_freeze.add_argument("--name", required=True, help="voice profile name")
+    design_freeze.add_argument("--as", dest="as_kind", required=True,
+                               choices=["clone", "design"],
+                               help="profile kind to create")
+    design_freeze.add_argument("--confirm-transcript", action="store_true",
+                               help="confirm the reference transcript")
+    design_freeze.add_argument("--ref-text", help="override the reference transcript")
+    design_freeze.add_argument("--allow-long-ref", action="store_true",
+                               help="allow references longer than 30s")
+    design_freeze.add_argument("--allow-incomplete", action="store_true",
+                               help="allow candidates whose completion is unknown")
+    design_freeze.add_argument("--force", action="store_true",
+                               help="replace an existing voice profile")
+    design_freeze.add_argument("--tag", action="append",
+                               help="tag to attach (repeatable or comma-separated)")
+    design_freeze.add_argument("--license", help="consent license label")
+    design_freeze.add_argument("--consent-note", help="consent note")
+    design_freeze.add_argument("--i-have-rights", action="store_true",
+                               help="confirm you have the rights to clone this voice")
+    design_freeze.add_argument("--model", help="override the clone model")
+    design_freeze.set_defaults(func=design_cmd.freeze,
+                               formatter=design_cmd.format_result)
+
     voice = sub.add_parser("voice", help="manage the voice asset library")
     voice_sub = voice.add_subparsers(dest="voice_command", required=True)
 
@@ -242,6 +362,8 @@ def build_parser() -> argparse.ArgumentParser:
                            help="ASR model path or id for --auto-ref-text")
     voice_add.add_argument("--mode", choices=["icl", "xvec"], default="icl")
     voice_add.add_argument("--description", help="natural-language voice description (design)")
+    voice_add.add_argument("--design-yaml",
+                           help="design YAML file to compile (kind design)")
     voice_add.add_argument("--sample-text", help="sample text used for design/materialization")
     voice_add.add_argument("--language", default=argparse.SUPPRESS,
                            help="reference language (default: Chinese profile; omitted leaves ASR auto)")
@@ -255,14 +377,65 @@ def build_parser() -> argparse.ArgumentParser:
     voice_add.add_argument("--yes", action="store_true")
     voice_add.set_defaults(func=voice_cmd.add, formatter=voice_cmd.format_result)
 
+    def _add_list_filters(parser) -> None:
+        parser.add_argument("query", nargs="?", help="name query (optional)")
+        parser.add_argument("--match", choices=["fuzzy", "prefix", "exact"], default="fuzzy")
+        parser.add_argument("--tag", action="append", default=[],
+                            help="require a tag (repeatable, AND)")
+        parser.add_argument("--kind", action="append", default=[],
+                            choices=["clone", "design", "finetune"],
+                            help="filter by profile kind (repeatable)")
+        parser.add_argument("--language", help="filter by profile language")
+        parser.add_argument("--names-only", action="store_true",
+                            help="print matching names only")
+        parser.add_argument("--include-builtin", action="store_true",
+                            help="include built-in voices when language filters are used")
+
     voice_list = voice_sub.add_parser("list", help="list built-in and user voices")
     _add_common(voice_list, suppress=True)
+    _add_list_filters(voice_list)
     voice_list.set_defaults(func=voice_cmd.list_voices, formatter=voice_cmd.format_result)
 
-    voice_inspect = voice_sub.add_parser("inspect", help="show voice details")
+    voice_filter = voice_sub.add_parser("filter", help="alias for voice list with filters")
+    _add_common(voice_filter, suppress=True)
+    _add_list_filters(voice_filter)
+    voice_filter.set_defaults(func=voice_cmd.list_voices, formatter=voice_cmd.format_result)
+
+    voice_show = voice_sub.add_parser("show", help="show voice metadata and files")
+    _add_common(voice_show, suppress=True)
+    voice_show.add_argument("name")
+    voice_show.set_defaults(func=voice_cmd.show, formatter=voice_cmd.format_result)
+
+    voice_inspect = voice_sub.add_parser("inspect", help="show voice details (alias for show)")
     _add_common(voice_inspect, suppress=True)
     voice_inspect.add_argument("name")
     voice_inspect.set_defaults(func=voice_cmd.inspect, formatter=voice_cmd.format_result)
+
+    voice_rename = voice_sub.add_parser("rename", help="rename a user voice")
+    _add_common(voice_rename, suppress=True)
+    voice_rename.add_argument("old")
+    voice_rename.add_argument("new")
+    voice_rename.add_argument("--dry-run", action="store_true")
+    voice_rename.set_defaults(func=voice_cmd.rename, formatter=voice_cmd.format_result)
+
+    voice_tag = voice_sub.add_parser("tag", help="inspect or edit voice tags")
+    _add_common(voice_tag, suppress=True)
+    voice_tag.add_argument("name")
+    voice_tag.add_argument("--add", action="append", default=[], help="add a tag (repeatable)")
+    voice_tag.add_argument("--remove", action="append", default=[],
+                           help="remove a tag (repeatable)")
+    voice_tag.add_argument("--set", action="append", default=None,
+                           help="replace all tags (repeatable)")
+    voice_tag.add_argument("--clear", action="store_true", help="remove all tags")
+    voice_tag.add_argument("--dry-run", action="store_true")
+    voice_tag.set_defaults(func=voice_cmd.tag, formatter=voice_cmd.format_result)
+
+    voice_delete = voice_sub.add_parser("delete", help="delete a user voice")
+    _add_common(voice_delete, suppress=True)
+    voice_delete.add_argument("name")
+    voice_delete.add_argument("--yes", action="store_true")
+    voice_delete.add_argument("--dry-run", action="store_true")
+    voice_delete.set_defaults(func=voice_cmd.delete, formatter=voice_cmd.format_result)
 
     voice_preview = voice_sub.add_parser("preview", help="render an audition clip")
     _add_common(voice_preview, suppress=True)
@@ -271,6 +444,8 @@ def build_parser() -> argparse.ArgumentParser:
     voice_preview.add_argument("--out", help="output file")
     voice_preview.add_argument("--format", choices=["wav", "flac"])
     voice_preview.add_argument("--language", default="Chinese")
+    voice_preview.add_argument("--no-save", action="store_true",
+                               help="do not update the profile preview (requires --out)")
     voice_preview.set_defaults(func=voice_cmd.preview, formatter=voice_cmd.format_result)
 
     voice_rm = voice_sub.add_parser("rm", help="delete a user voice")
@@ -284,6 +459,8 @@ def build_parser() -> argparse.ArgumentParser:
     voice_export.add_argument("name")
     voice_export.add_argument("-o", "--out", required=True, help="archive path (.qttsvoice)")
     voice_export.add_argument("--force", action="store_true", help="overwrite an existing archive")
+    voice_export.add_argument("--dry-run", action="store_true",
+                              help="validate and list members without writing")
     voice_export.set_defaults(func=voice_cmd.export, formatter=voice_cmd.format_result)
 
     voice_import = voice_sub.add_parser("import", help="import a .qttsvoice archive")
@@ -516,6 +693,17 @@ def build_parser() -> argparse.ArgumentParser:
     qc.add_argument("--reference-voice", help="clone profile for speaker similarity")
     qc.add_argument("--model", help="Base model override for speaker embeddings")
     _add_qc_thresholds(qc)
+    _add_acoustic_thresholds(qc)
+    qc.add_argument("--metrics", choices=["basic", "full"], default="basic",
+                    help="metric set (default: basic)")
+    qc.add_argument("--recipe", help="candidate recipe JSON for completion checks")
+    qc.add_argument("--hnr-backend", choices=["praat"], default="praat",
+                    help="HNR backend (praat-parselmouth; requires the metrics extra)")
+    qc.add_argument("--fail-on-incomplete",
+                    help="exit 5 when completion is suspect_truncated/too_short/failed",
+                    action="store_true")
+    qc.add_argument("--require-full-metrics", action="store_true",
+                    help="exit 5 when any full metric is unavailable (requires --metrics full)")
     qc.add_argument("--report", help="write a deterministic JSON report")
     qc.set_defaults(func=qc_cmd.run, formatter=qc_cmd.format_result)
 

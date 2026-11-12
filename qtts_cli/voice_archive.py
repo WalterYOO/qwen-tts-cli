@@ -57,6 +57,7 @@ def export_voice(
     out: str | Path,
     *,
     force: bool = False,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     meta = store.require(name)
     kind = str(meta.get("kind"))
@@ -67,9 +68,22 @@ def export_voice(
             details={"voice": name, "kind": kind},
         )
     voice_dir = store.dir_for(name)
+    if voice_dir.is_symlink():
+        raise InputError(
+            f"voice directory is a symlink; refusing to export: {name}",
+            details={"voice": name},
+        )
+    meta_path = voice_dir / "voice.json"
+    if meta_path.is_symlink():
+        raise InputError(
+            f"voice.json is a symlink; refusing to export: {name}",
+            details={"voice": name},
+        )
+    if kind == "clone":
+        store.validate_reference(meta, voice_dir)
     members: dict[str, bytes] = {}
 
-    members["voice.json"] = (voice_dir / "voice.json").read_bytes()
+    members["voice.json"] = meta_path.read_bytes()
     if kind == "clone":
         prompt = voice_dir / "prompt.safetensors"
         if not prompt.is_file():
@@ -80,6 +94,11 @@ def export_voice(
         members["prompt.safetensors"] = prompt.read_bytes()
     for optional in ("ref.wav", "preview.wav"):
         candidate = voice_dir / optional
+        if candidate.is_symlink():
+            raise InputError(
+                f"profile file is a symlink; refusing to export: {candidate.name}",
+                details={"voice": name, "file": candidate.name},
+            )
         if candidate.is_file():
             members[optional] = candidate.read_bytes()
 
@@ -95,11 +114,30 @@ def export_voice(
     }
 
     out_path = Path(out).expanduser()
+    try:
+        out_path.resolve().relative_to(store.root.resolve())
+    except ValueError:
+        pass
+    else:
+        raise InputError(
+            f"refusing to write an archive inside the voice store: {out_path}",
+            details={"archive": str(out_path), "store": str(store.root)},
+        )
     if out_path.exists() and not force:
         raise InputError(
             f"archive already exists: {out_path}; pass --force to overwrite",
             details={"archive": str(out_path)},
         )
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "archive": str(out_path),
+            "voice": meta,
+            "kind": kind,
+            "files": files,
+            "archive_sha256": None,
+        }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{out_path.name}.", suffix=".tmp",
                                     dir=str(out_path.parent))

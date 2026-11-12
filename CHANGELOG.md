@@ -7,6 +7,20 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-12
+
+### Added
+
+- **结构化音色设计（design）**：新增 `qtts design init/lint/explore/report/freeze`。设计 YAML 采用 btts 风格结构化字段加 qtts 模板（`qtts/zh-late-night-radio/v1`、`qtts/en-podcast-host/v1`），`description`/`instruction_override` 为逃生口；严格拒绝 anchor/alias、重复 key、超过 256 KiB 与非 UTF-8。`lint` 离线编译并输出五维评分、block/warn/info 与 `green/yellow/red`（有 block 强制 red），`--strict` 把 warning 提升为退出 1。`explore` 以确定性矩阵（默认 2 seed × 2 sampling profile，`--wide` 叠加第二条 cover，上限 16）一次加载 VoiceDesign 模型，逐候选原子写 WAV/recipe 与 `run.json`，支持 `--resume`（design/template/compiler/source/matrix/model 任一变化退出 2）、`--retry-failed`、`--dry-run` 与 fcntl run 锁。`report` 只读 run 目录，按 `failure_count → completion 严重度 → clipping → silence → hnr → voiced_ratio → take_id` 排序，生成 `report.json`/`metrics.csv`/`report.md`/`audition.html`（盲听模式）/`all_candidates.wav`；缺失指标为 `null` 不计 failure，损坏 WAV/路径逃逸候选标记 failed 而不中止，`--require-full-metrics`/`--fail-on-degraded` 退出 5。`freeze --as design` 写入可重生成配方与 `source.description`；`--as clone` 以 take 为 ICL 参考，要求 `--confirm-transcript`、拒绝失败/疑似截断候选、`--force` 备份替换并在失败时恢复。
+- **`say --design FILE`**：解析并 lint 设计 YAML，编译 instruction 后按 `design:` 路径生成；与 `--voice`/`--instruct`/`--script`/`--jsonl` 互斥，recipe 记录 `design_yaml_sha256`/`rendered_instruction_sha256`/`compiler_version`。`voice add --kind design --design-yaml FILE` 同样内嵌 design provenance。
+- **full 音频指标与完成度**：`qc --metrics full` 新增 YIN/CMNDF F0（median/mean/std/p10/p90）、voiced ratio、praat HNR、spectral centroid、LTAS slope 与 HF/LF ratio；缺失依赖/帧数时统一 `null` + `unavailable`。新增 token 预算/时长/tail 能量驱动的 complete/unknown/suspect_truncated/too_short 判定，`--require-full-metrics` 与 `--fail-on-incomplete` 接入 QC 门禁。新增 `audio_features.py`、`completeness.py` 与 `tests/test_audio_features.py`、`tests/test_completeness.py`。
+- **voice 资产库管理面**：`voice list` 支持 query/match/tag/kind/language/names-only/include-builtin 与 warnings；新增 `voice show/inspect/rename/tag/delete`（`rm` 兼容），rename 使用 journal 崩溃恢复与大小写-only 安全校验，tag 写入拒绝 symlink，delete 使用 tombstone；`voice preview --no-save`、`voice export --dry-run` 与 symlink/归档路径防护。
+- **QC/quality 扩展**：新增 `--metrics basic|full`、`--recipe FILE`、`--hnr-backend praat`、`--fail-on-incomplete`、`--require-full-metrics` 及 duration/voiced/HNR/F0/centroid/LTAS/HF-LF opt-in 阈值；basic 模式指标集合与旧版逐字节兼容。
+
+### Changed
+
+- `design` 与 `voice` 的 JSON 文本输出增加 `tags`、`source_kind`、`design_template`、warnings 与降级信息；旧字段保持不变。
+
 ## [0.3.2] - 2026-11-09
 
 ### Added

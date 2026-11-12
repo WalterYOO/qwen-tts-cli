@@ -36,6 +36,7 @@ def build_recipe(
     postprocess: Optional[dict[str, Any]] = None,
     timing: Optional[dict[str, Any]] = None,
     backend: Optional[dict[str, Any]] = None,
+    design: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     recipe: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -77,6 +78,8 @@ def build_recipe(
         recipe["device"] = device
     if subtitle is not None:
         recipe["subtitle"] = subtitle
+    if design is not None:
+        recipe["design"] = design
     return recipe
 
 
