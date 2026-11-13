@@ -171,8 +171,9 @@ qtts voice export --all --out-dir DIR [--force] [--dry-run]
 qtts voice import FILE.qttsvoice [--name NAME] [--force]
 qtts voice import-bundle DIR [--force] [--dry-run]
 qtts voice import-btts BUNDLE (--voice NAME ... | --all)
-  [--name NAME] [--i-have-rights] [--auto-ref-text] [--ref-text TEXT]
-  [--asr-model PATH|ID] [--mode icl|xvec] [--model MODEL] [--force]
+  [--name NAME] [--i-have-rights] [--design-mode auto|recipe|clone]
+  [--dry-run] [--auto-ref-text] [--ref-text TEXT] [--asr-model PATH|ID]
+  [--mode icl|xvec] [--model MODEL] [--force]
 ```
 
 - 内置音色：Serena、Vivian、Uncle_Fu、Ryan、Aiden、Ono_Anna、Sohee、Eric、Dylan。
@@ -197,6 +198,10 @@ qtts voice import-btts BUNDLE (--voice NAME ... | --all)
 - `voice import-btts` 读取 btts `voice export` 的目录或 `.zip`；有 `manifest.json`
   时校验 SHA-256、大小与完整文件集，拒绝路径穿越/绝对路径/反斜杠/symlink/
   特殊文件/大小写冲突/未知文件。必须 `--i-have-rights`；已有音色需 `--force`。
+- design 默认 `--design-mode auto` -> 离线 recipe（不加载模型/ASR）；传
+  `--auto-ref-text`/`--ref-text`/`--mode`/`--model` 时自动走 clone，也可显式
+  `--design-mode clone`。`--dry-run` 只规划不落盘；安装用 `.btts-import.json`
+  journal + lock，崩溃后自动恢复。
 - `voice rm` 只删除 store 根目录内单个音色；非 TTY 必须 `--yes`。
 
 ## design

@@ -527,9 +527,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--name", help="install a single selected voice under a different name"
     )
     voice_import_btts.add_argument(
+        "--design-mode",
+        choices=["auto", "recipe", "clone"],
+        help=(
+            "design-voice import policy (default: auto, or clone when a "
+            "clone-only option is given)"
+        ),
+    )
+    voice_import_btts.add_argument(
         "--i-have-rights",
         action="store_true",
-        help="confirm you have the rights to clone these voices",
+        help="confirm you have the rights to import these voices",
     )
     voice_import_btts.add_argument(
         "--auto-ref-text",
@@ -544,13 +552,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--asr-model", help="ASR model path or id for --auto-ref-text"
     )
     voice_import_btts.add_argument(
-        "--mode", choices=["icl", "xvec"], default="icl"
+        "--mode", choices=["icl", "xvec"], default=None
     )
     voice_import_btts.add_argument(
         "--model", help="override the automatically selected clone model"
     )
     voice_import_btts.add_argument(
         "--force", action="store_true", help="replace existing voices"
+    )
+    voice_import_btts.add_argument(
+        "--dry-run", action="store_true",
+        help="validate the bundle and plan without writing profiles",
     )
     voice_import_btts.set_defaults(
         func=voice_cmd.import_btts, formatter=voice_cmd.format_result

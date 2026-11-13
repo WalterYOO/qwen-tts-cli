@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 from .design_compile import CompiledDesign
-from .design_yaml import SUPPORTED_LANGUAGES, TEMPLATES
+from .design_yaml import SUPPORTED_LANGUAGES, resolve_template_id
 from .errors import InputError
 from .voice_store import validate_name
 
@@ -51,7 +51,7 @@ def lint_design(document: dict[str, Any], compiled: CompiledDesign) -> dict[str,
         code = "invalid-schema" if "schema_version" in message else "invalid-field"
         issues.append(_issue("block", code, message))
 
-    if document.get("template") not in TEMPLATES:
+    if resolve_template_id(document.get("template")) is None:
         issues.append(
             _issue("block", "invalid-template", f"unknown template: {document.get('template')!r}", "template")
         )

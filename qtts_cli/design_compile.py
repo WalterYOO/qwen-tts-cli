@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from .design_yaml import TEMPLATES
+from .design_yaml import TEMPLATES, resolve_template_id
 from .utils import sha256_text
 
 COMPILER_VERSION = "1"
@@ -24,40 +24,84 @@ _ZH = {
         "clear": "清澈",
         "slightly_husky": "略带沙哑",
         "bright": "明亮",
-        "deep": "低沉",
+        "dark": "偏暗",
+        "breathy": "带气声",
+        "nasal": "带鼻音",
+        "smooth": "顺滑",
+        "crisp": "清脆",
         "soft": "柔和",
+        "metallic": "有金属感",
+        "deep": "低沉",
         "husky": "沙哑",
     },
-    "pitch": {"low": "偏低", "low_mid": "中低", "mid": "中等", "high": "偏高"},
+    "pitch": {
+        "low": "偏低",
+        "low_mid": "中低",
+        "mid": "中等",
+        "high_mid": "中高",
+        "high": "偏高",
+    },
     "articulation": {
         "clear": "清晰",
         "relaxed": "松弛",
+        "precise": "准确",
+        "lazy": "慵懒",
         "crisp": "利落",
         "soft": "柔和",
-        "precise": "准确",
     },
     "persona": {
         "late_night_host": "深夜电台主持人",
+        "documentary_narrator": "纪录片旁白",
+        "anime_character": "动画角色",
         "podcast_host": "播客主持人",
         "narrator": "旁白",
         "audiobook_narrator": "有声书主播",
+        "game_character": "游戏角色",
         "news_anchor": "新闻主播",
     },
-    "pace": {"slow": "慢", "medium_slow": "偏慢", "medium": "适中", "fast": "偏快"},
-    "energy": {"low": "低", "medium_low": "中低", "medium": "中等", "high": "高"},
+    "pace": {
+        "slow": "慢",
+        "medium_slow": "偏慢",
+        "medium": "适中",
+        "medium_fast": "偏快",
+        "fast": "快",
+    },
+    "energy": {
+        "low": "低",
+        "medium_low": "中低",
+        "medium": "中等",
+        "medium_high": "中高",
+        "high": "高",
+    },
     "tone": {
         "calm": "平静",
         "intimate": "亲密",
         "warm": "温暖",
+        "cool": "冷静",
+        "playful": "俏皮",
         "serious": "严肃",
+        "gentle": "温柔",
+        "wry": "略带调侃",
         "lively": "活泼",
     },
-    "proximity": {"close_mic": "近场麦克风", "far_mic": "远场麦克风"},
-    "room": {"dry_studio": "干声录音棚", "treated_room": "吸音房间", "outdoor": "户外"},
+    "proximity": {
+        "close_mic": "近场麦克风",
+        "mid_distance": "中等距离",
+        "far_field": "远场麦克风",
+        "far_mic": "远场麦克风",
+    },
+    "room": {
+        "dry_studio": "干声录音棚",
+        "treated_room": "吸音房间",
+        "natural_room": "自然房间",
+        "outdoor": "户外",
+    },
     "avoid": {
         "childlike": "童声",
         "shouting": "喊叫",
         "robotic": "机械感",
+        "overly_bright": "过亮",
+        "monotone": "单调",
         "overly_dramatic": "过度戏剧化",
     },
 }
@@ -69,49 +113,106 @@ _EN = {
         "clear": "clear",
         "slightly_husky": "slightly husky",
         "bright": "bright",
-        "deep": "deep",
+        "dark": "dark",
+        "breathy": "breathy",
+        "nasal": "nasal",
+        "smooth": "smooth",
+        "crisp": "crisp",
         "soft": "soft",
+        "metallic": "metallic",
+        "deep": "deep",
         "husky": "husky",
     },
-    "pitch": {"low": "low", "low_mid": "low-mid", "mid": "mid", "high": "high"},
+    "pitch": {
+        "low": "low",
+        "low_mid": "low-mid",
+        "mid": "mid",
+        "high_mid": "high-mid",
+        "high": "high",
+    },
     "articulation": {
         "clear": "clear",
         "relaxed": "relaxed",
+        "precise": "precise",
+        "lazy": "lazy",
         "crisp": "crisp",
         "soft": "soft",
-        "precise": "precise",
     },
     "persona": {
         "late_night_host": "late-night radio host",
+        "documentary_narrator": "documentary narrator",
+        "anime_character": "animation character",
         "podcast_host": "podcast host",
         "narrator": "narrator",
         "audiobook_narrator": "audiobook narrator",
+        "game_character": "game character",
         "news_anchor": "news anchor",
     },
-    "pace": {"slow": "slow", "medium_slow": "slightly slow", "medium": "medium", "fast": "fast"},
-    "energy": {"low": "low", "medium_low": "medium-low", "medium": "medium", "high": "high"},
+    "pace": {
+        "slow": "slow",
+        "medium_slow": "slightly slow",
+        "medium": "medium",
+        "medium_fast": "medium-fast",
+        "fast": "fast",
+    },
+    "energy": {
+        "low": "low",
+        "medium_low": "medium-low",
+        "medium": "medium",
+        "medium_high": "medium-high",
+        "high": "high",
+    },
     "tone": {
         "calm": "calm",
         "intimate": "intimate",
         "warm": "warm",
+        "cool": "cool",
+        "playful": "playful",
         "serious": "serious",
+        "gentle": "gentle",
+        "wry": "wry",
         "lively": "lively",
     },
-    "proximity": {"close_mic": "close-mic", "far_mic": "distant mic"},
-    "room": {"dry_studio": "dry studio", "treated_room": "treated room", "outdoor": "outdoors"},
+    "proximity": {
+        "close_mic": "close-mic",
+        "mid_distance": "mid-distance",
+        "far_field": "far-field",
+        "far_mic": "distant mic",
+    },
+    "room": {
+        "dry_studio": "dry studio",
+        "treated_room": "treated room",
+        "natural_room": "natural room",
+        "outdoor": "outdoors",
+    },
     "avoid": {
         "childlike": "childlike",
         "shouting": "shouting",
         "robotic": "robotic",
+        "overly_bright": "overly bright",
+        "monotone": "monotone",
         "overly_dramatic": "overly dramatic",
     },
 }
 _AGE_ZH = {
+    "teen": "少年",
+    "child": "儿童",
     "20s": "二十多岁",
     "30s": "三十多岁",
     "40s": "四十多岁",
     "50s": "五十多岁",
     "60s": "六十多岁",
+    "senior": "老年",
+}
+_AGE_EN = {
+    "teen": "teenage",
+    "child": "child",
+    "20s": "in their twenties",
+    "30s": "in their thirties",
+    "40s": "in their forties",
+    "50s": "in their fifties",
+    "60s": "in their sixties",
+    "senior": "elderly",
 }
 
 
@@ -140,8 +241,11 @@ class CompiledDesign:
 
 
 def template_sha256(template: str) -> str:
+    canonical = resolve_template_id(template)
+    if canonical is None:
+        raise ValueError(f"invalid template: {template!r}")
     return sha256_text(
-        json.dumps(TEMPLATES[template], sort_keys=True, ensure_ascii=False)
+        json.dumps(TEMPLATES[canonical], sort_keys=True, ensure_ascii=False)
     )
 
 
@@ -186,9 +290,8 @@ def _age(value: Any, language: str) -> str:
     if value is None:
         return ""
     text = str(value).strip()
-    if language == "zh":
-        return _AGE_ZH.get(text.casefold(), text)
-    return text
+    table = _AGE_ZH if language == "zh" else _AGE_EN
+    return table.get(text.casefold(), text)
 
 
 def _render_zh(identity, delivery, scene, avoid, warnings) -> str:
@@ -289,9 +392,9 @@ def _render_en(identity, delivery, scene, avoid, warnings) -> str:
 
 def compile_design(document: dict[str, Any]) -> CompiledDesign:
     """Render ``document`` (output of :func:`design_yaml.normalize_document`)."""
-    template = document.get("template")
-    if template not in TEMPLATES:
-        raise ValueError(f"invalid template: {template!r}")
+    template = resolve_template_id(document.get("template"))
+    if template is None:
+        raise ValueError(f"invalid template: {document.get('template')!r}")
     language = str(document.get("language") or "zh").strip().lower()
     warnings: list[dict[str, Any]] = []
     override = str(document.get("instruction_override") or "").strip()

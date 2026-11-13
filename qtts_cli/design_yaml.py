@@ -72,6 +72,26 @@ TEMPLATES: dict[str, dict[str, Any]] = {
         "identity": {"pace": "medium", "energy": "medium"},
         "covers": ["Bentornati al programma."],
     },
+    "qtts/zh-documentary-narrator/v1": {
+        "language": "zh",
+        "identity": {"pace": "slow", "energy": "low"},
+        "covers": ["这片土地已经沉睡了千年。"],
+    },
+    "qtts/zh-anime-character/v1": {
+        "language": "zh",
+        "identity": {"pace": "medium_fast", "energy": "medium_high"},
+        "covers": ["你终于来了，我等你好久了。"],
+    },
+    "qtts/en-audiobook-narrator/v1": {
+        "language": "en",
+        "identity": {"pace": "slow", "energy": "low"},
+        "covers": ["The house stood silent at the end of the lane."],
+    },
+    "qtts/en-game-character/v1": {
+        "language": "en",
+        "identity": {"pace": "medium_fast", "energy": "medium_high"},
+        "covers": ["You made it. I was starting to worry."],
+    },
 }
 DEFAULT_TEMPLATES = {
     "zh": "qtts/zh-late-night-radio/v1",
@@ -98,6 +118,131 @@ EXAMPLE_COVERS = {
     "es": ["Bienvenidos de nuevo al programa.", "Hablemos despacio hoy."],
     "it": ["Bentornati al programma.", "Parliamo con calma oggi."],
 }
+
+# btts template IDs are accepted as import/input aliases only.  They never
+# become canonical qtts template IDs, so template_sha256, lint and resume have
+# exactly one identity per template.
+TEMPLATE_ALIASES = {
+    "zh-late-night-radio/v1": "qtts/zh-late-night-radio/v1",
+    "zh-documentary-narrator/v1": "qtts/zh-documentary-narrator/v1",
+    "zh-anime-character/v1": "qtts/zh-anime-character/v1",
+    "en-podcast-host/v1": "qtts/en-podcast-host/v1",
+    "en-audiobook-narrator/v1": "qtts/en-audiobook-narrator/v1",
+    "en-game-character/v1": "qtts/en-game-character/v1",
+}
+TEMPLATE_ALIASES.update(
+    {f"btts/{source}": target for source, target in list(TEMPLATE_ALIASES.items())}
+)
+
+# Starters are kept out of TEMPLATES so adding metadata does not change the
+# existing template_sha256 values (they participate in run/resume identity).
+TEMPLATE_STARTERS: dict[str, dict[str, Any]] = {
+    "qtts/zh-late-night-radio/v1": {
+        "identity": {
+            "age": "30s",
+            "gender_presentation": "female",
+            "timbre": ["warm", "clean", "slightly_husky"],
+            "pitch": "low_mid",
+            "articulation": "clear, relaxed",
+            "persona": "late_night_host",
+        },
+        "delivery_baseline": {
+            "pace": "medium_slow",
+            "energy": "medium_low",
+            "tone": ["calm", "intimate"],
+        },
+        "scene": {"proximity": "close_mic", "room": "dry_studio"},
+        "avoid": ["childlike", "shouting"],
+        "covers": ["晚上好，欢迎收听今天的节目。", "外面下着雨，我们慢慢聊。"],
+    },
+    "qtts/zh-documentary-narrator/v1": {
+        "identity": {
+            "age": "40s",
+            "gender_presentation": "male",
+            "timbre": ["deep", "smooth"],
+            "pitch": "low",
+            "articulation": "precise",
+            "persona": "documentary_narrator",
+        },
+        "delivery_baseline": {"pace": "slow", "energy": "low", "tone": ["serious"]},
+        "scene": {"proximity": "close_mic", "room": "dry_studio"},
+        "avoid": ["childlike", "overly_bright"],
+        "covers": ["这片土地已经沉睡了千年。", "风从山谷里吹来，带着雪的味道。"],
+    },
+    "qtts/zh-anime-character/v1": {
+        "identity": {
+            "age": "20s",
+            "gender_presentation": "female",
+            "timbre": ["bright", "clean"],
+            "pitch": "high_mid",
+            "articulation": "crisp",
+            "persona": "anime_character",
+        },
+        "delivery_baseline": {
+            "pace": "medium_fast",
+            "energy": "medium_high",
+            "tone": ["playful"],
+        },
+        "scene": {"proximity": "close_mic", "room": "dry_studio"},
+        "avoid": ["robotic", "monotone"],
+        "covers": ["你终于来了，我等你好久了。", "别担心，我会一直在你身边。"],
+    },
+    "qtts/en-podcast-host/v1": {
+        "identity": {
+            "age": "30s",
+            "gender_presentation": "female",
+            "timbre": ["warm", "clear"],
+            "pitch": "low_mid",
+            "articulation": "clear, relaxed",
+            "persona": "podcast_host",
+        },
+        "delivery_baseline": {"pace": "medium", "energy": "medium", "tone": ["calm"]},
+        "scene": {"proximity": "close_mic", "room": "dry_studio"},
+        "avoid": ["childlike", "shouting"],
+        "covers": ["Welcome back to the show.", "Let's take this slowly."],
+    },
+    "qtts/en-audiobook-narrator/v1": {
+        "identity": {
+            "age": "40s",
+            "gender_presentation": "male",
+            "timbre": ["deep", "smooth"],
+            "pitch": "low",
+            "articulation": "precise",
+            "persona": "audiobook_narrator",
+        },
+        "delivery_baseline": {"pace": "slow", "energy": "low", "tone": ["calm"]},
+        "scene": {"proximity": "close_mic", "room": "dry_studio"},
+        "avoid": ["childlike", "shouting"],
+        "covers": [
+            "The house stood silent at the end of the lane.",
+            "She had not spoken to him in years.",
+        ],
+    },
+    "qtts/en-game-character/v1": {
+        "identity": {
+            "age": "20s",
+            "gender_presentation": "neutral",
+            "timbre": ["bright", "crisp"],
+            "pitch": "high_mid",
+            "articulation": "crisp",
+            "persona": "game_character",
+        },
+        "delivery_baseline": {
+            "pace": "medium_fast",
+            "energy": "medium_high",
+            "tone": ["playful"],
+        },
+        "scene": {"proximity": "mid_distance", "room": "natural_room"},
+        "avoid": ["monotone", "robotic"],
+        "covers": ["You made it. I was starting to worry.", "Stay close. This place is not safe."],
+    },
+}
+for _language, _template in list(DEFAULT_TEMPLATES.items()):
+    if _template in TEMPLATE_STARTERS or _language in ("zh", "en"):
+        continue
+    base = copy.deepcopy(TEMPLATE_STARTERS["qtts/en-podcast-host/v1"])
+    base["covers"] = list(EXAMPLE_COVERS.get(_language, base["covers"]))
+    TEMPLATE_STARTERS[_template] = base
 
 KNOWN_TOP_LEVEL = {
     "schema_version",
@@ -155,12 +300,25 @@ class _StrictLoader(yaml.SafeLoader):
         return super().construct_mapping(node, deep=deep)
 
 
+def resolve_template_id(template: Any) -> Optional[str]:
+    """Return the canonical qtts template id, accepting btts input aliases."""
+    if not isinstance(template, str):
+        return None
+    value = template.strip()
+    if not value:
+        return None
+    if value in TEMPLATES:
+        return value
+    return TEMPLATE_ALIASES.get(value)
+
+
 def template_for_language(language: str) -> Optional[str]:
     return DEFAULT_TEMPLATES.get((language or "").strip().lower())
 
 
 def template_language(template: str) -> Optional[str]:
-    info = TEMPLATES.get(template)
+    canonical = resolve_template_id(template)
+    info = TEMPLATES.get(canonical) if canonical else None
     return info.get("language") if info else None
 
 
@@ -228,7 +386,8 @@ def normalize_document(document: dict[str, Any]) -> dict[str, Any]:
 
     name = data.get("name")
     language = str(data.get("language") or DEFAULT_LANGUAGE).strip().lower()
-    template = data.get("template")
+    raw_template = data.get("template")
+    template = resolve_template_id(raw_template) or raw_template
     identity = delivery = scene = {}
     avoid: list[str] = []
     covers: list[str] = []
@@ -275,53 +434,19 @@ def normalize_document(document: dict[str, Any]) -> dict[str, Any]:
 
 
 def example_document(name: str, *, language: str = "zh", template: Optional[str] = None) -> dict[str, Any]:
-    template = template or template_for_language(language)
-    if template is None:
+    canonical = resolve_template_id(template) if template else template_for_language(language)
+    if canonical is None:
+        if template:
+            raise InputError(f"unsupported design template: {template!r}")
         raise InputError(f"unsupported design language: {language!r}")
-    info = TEMPLATES[template]
-    language = info["language"]
-    if language == "zh":
-        return {
-            "schema_version": DESIGN_SCHEMA_VERSION,
-            "name": name,
-            "language": "zh",
-            "template": template,
-            "identity": {
-                "age": "30s",
-                "gender_presentation": "female",
-                "timbre": ["warm", "clean", "slightly_husky"],
-                "pitch": "low_mid",
-                "articulation": "clear, relaxed",
-                "persona": "late_night_host",
-            },
-            "delivery_baseline": {
-                "pace": "medium_slow",
-                "energy": "medium_low",
-                "tone": ["calm", "intimate"],
-            },
-            "scene": {"proximity": "close_mic", "room": "dry_studio"},
-            "avoid": ["childlike", "shouting"],
-            "covers": list(EXAMPLE_COVERS["zh"]),
-            "description": None,
-            "instruction_override": None,
-        }
+    info = TEMPLATES[canonical]
+    starter = copy.deepcopy(TEMPLATE_STARTERS[canonical])
     return {
         "schema_version": DESIGN_SCHEMA_VERSION,
         "name": name,
-        "language": language,
-        "template": template,
-        "identity": {
-            "age": "30s",
-            "gender_presentation": "female",
-            "timbre": ["warm", "clear"],
-            "pitch": "low_mid",
-            "articulation": "clear, relaxed",
-            "persona": "podcast_host",
-        },
-        "delivery_baseline": {"pace": "medium", "energy": "medium", "tone": ["calm"]},
-        "scene": {"proximity": "close_mic", "room": "dry_studio"},
-        "avoid": ["childlike", "shouting"],
-        "covers": list(EXAMPLE_COVERS.get(language, info["covers"])),
+        "language": info["language"],
+        "template": canonical,
+        **starter,
         "description": None,
         "instruction_override": None,
     }

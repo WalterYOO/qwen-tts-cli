@@ -5,7 +5,24 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.4.2] - 2026-11-13
+
+### Added
+
+- **btts design recipe 导入**：`voice import-btts` 新增 `--design-mode auto|recipe|clone`。默认 `auto` 将 design 音色离线导入为 qtts `kind=design` recipe，不 scan 模型、不跑 ASR；clone 音色仍按原路径导入。显式 `--auto-ref-text`/`--ref-text`/`--asr-model`/`--mode`/`--model` 时自动按 `clone` 处理以兼容旧调用；`recipe|auto` 与 clone-only 选项互斥（退出 2）。recipe 保留 instruction（含 identity fallback）、structured、模板、seed/cfg/max_new_tokens、内嵌 `design.yaml` 与哈希，并明确 `acoustic-equivalence-not-possible`，不重放 btts seed/cfg。
+- **btts 模板别名与 4 个新模板**：6 个 btts 模板 ID 与 `btts/...` 被 canonicalize 为 `qtts/...`；新增 `qtts/zh-documentary-narrator/v1`、`qtts/zh-anime-character/v1`、`qtts/en-audiobook-narrator/v1`、`qtts/en-game-character/v1`，`design init` 使用各自 starter。btts 词表 token 全部进入 qtts compiler（含 `far_field`/`far_mic`）。
+- **`voice import-btts --dry-run`**：只做 bundle 解析、选择、冲突/互斥与离线 ref admission；不写 store/staging、不 scan 模型、不加载 TTS/ASR。存在 pending journal 时拒绝 dry-run。
+- **btts 多音色 journal**：新增 `voice_import_journal.py` 与 `.btts-import.json`/`.btts-import.lock`，覆盖 backup/replace/restore/staging 清理崩溃窗口，恢复过程幂等；`source.btts` 增加 tags、consent、defaults.direction、truncations（超长字段含 sha256）、basename-only bundle 与 preview hash；`voice preview` 覆盖后更新 `source.preview.origin="qtts"`。
+
+### Changed
+
+- **BREAKING**：`voice import-btts` 对 design 音色的默认行为从“必须给 ref 文本并导入 clone”改为“导入 recipe”；需要旧行为请显式 `--design-mode clone` 并配合 `--auto-ref-text`/`--ref-text`/`--mode xvec`。`--mode` 默认值改为 `None`，仅在 clone 路径生效。
+- `consent.license` 从 `btts:<model license>` 改为 `btts-import`；btts 模型许可证完整保留在 `source.btts.license`。
+
+### Fixed
+
+- **btts import journal fail-closed 加固**：`schema_version` 必须是整数 `1`，`committed` 与各 entry flag 必须是布尔值，`committed=true` 要求所有 entry `installed=true`；`existing_path` 必须与 target 仅大小写不同；`restored/staging_removed` 但 backup 仍存在、`backup_done` 且 target 与 backup 同时存在、`existing_path` 指向其他真实音色等组合一律 fail-closed，保留 journal、backup 与 target。修复替换导入回滚时可能丢失旧 profile 的路径。
+- **并发导入**：等待导入锁期间重新核对 store，目标被其他进程改变时拒绝提交；`finally` 只在没有 pending journal 时清理 staging，避免把恢复所需状态误删。
 
 ## [0.4.1] - 2026-11-12
 

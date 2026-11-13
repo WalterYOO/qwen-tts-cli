@@ -54,7 +54,7 @@
 | **模型微调** | `finetune prepare/train/eval` 调用官方脚本准备 JSONL、训练与评测；校验/选择 checkpoint，注册为 `voice:` profile，并以 CER/说话人相似度门禁评测 |
 | **自动参考文本** | `voice add --kind clone --auto-ref-text` 用 ASR 转写参考音频，作为 ICL 的 `ref_text` 并记录来源与模型 |
 | **音色归档** | `voice export/import` 单文件 `.qttsvoice`，白名单成员、流式校验、原子替换；`voice export --all` / `import-bundle` 多音色目录（bundle schema 2，崩溃可恢复） |
-| **btts 导入** | `voice import-btts` 直接消费 `btts voice export --mode full` 目录/zip，校验 manifest 与路径安全；clone 复用参考音频+文本，design 需 ASR/显式文本/xvec，保留 btts provenance |
+| **btts 导入** | `voice import-btts` 直接消费 `btts voice export --mode full` 目录/zip，校验 manifest 与路径安全；design 默认离线导入 recipe，clone 复用参考音频+文本，保留模板别名与完整 btts provenance |
 | **项目锁文件** | `project init/lock` 固定模型全量 sha256、音色、采样参数、字幕策略与运行时版本 |
 | **计划与诊断** | `--dry-run` 不加载模型即可输出分段与预算；`doctor --bench` 产出本机性能基线 |
 | **机器可读** | 所有命令支持 `--json`；稳定退出码；错误走 stderr |
@@ -843,7 +843,8 @@ qtts voice export --all --out-dir DIR [--force] [--dry-run]
 qtts voice import FILE.qttsvoice [--name NAME] [--force]
 qtts voice import-bundle DIR [--force] [--dry-run]
 qtts voice import-btts BUNDLE (--voice NAME ... | --all) [--name NAME]
-  [--i-have-rights] [--auto-ref-text | --ref-text TEXT] [--asr-model PATH|ID]
+  [--i-have-rights] [--design-mode auto|recipe|clone] [--dry-run]
+  [--auto-ref-text | --ref-text TEXT] [--asr-model PATH|ID]
   [--mode icl|xvec] [--model NAME] [--force]
 ```
 
@@ -860,29 +861,33 @@ qtts voice import-btts BUNDLE (--voice NAME ... | --all) [--name NAME]
 btts voice export alice narrator -o ./btts-bundle
 # 或：btts voice export --all --zip -o ./btts-bundle.zip
 
-# clone 音色：默认使用 bundle 里的 ref.wav + ref.txt（ICL）
-qtts voice import-btts ./btts-bundle --voice alice \
-  --i-have-rights --model-dir "$QTTS_MODEL_DIR"
+# 默认 auto：clone 音色用 bundle 里的 ref.wav + ref.txt（ICL）；
+# design 音色离线导入 recipe（不加载模型、不跑 ASR）
+qtts voice import-btts ./btts-bundle --all --i-have-rights
 
-# design 音色：必须显式选择一种参考文本来源
+# 需要旧版 design -> clone 行为时显式选择
 qtts voice import-btts ./btts-bundle --voice narrator \
-  --i-have-rights --auto-ref-text --model-dir "$QTTS_MODEL_DIR"
+  --i-have-rights --design-mode clone --auto-ref-text \
+  --model-dir "$QTTS_MODEL_DIR"
 # 或：--ref-text "preview.wav 对应的文字"（仅单音色）
 # 或：--mode xvec（不使用参考文本，质量可能略降）
 
-# 全量导入并允许替换已有同名音色
-qtts voice import-btts ./btts-bundle.zip --all --i-have-rights --force
+# 只看计划，不写 profile、不加载模型
+qtts voice import-btts ./btts-bundle.zip --all --i-have-rights --dry-run
 ```
 
 btts bundle 的布局是根目录 `manifest.json` + `LICENSE.txt` + `README.txt` + 每音色的 `profile.json`/`preview.wav`；clone 音色另有 `ref.wav`/`ref.txt`，design 音色另有 `design.yaml`。`--zip` 包可含单一顶层目录。
 
+- **默认行为**：`--design-mode auto`（默认）。design 音色导入为 qtts `kind=design` recipe；clone 音色仍走 clone。显式传 `--auto-ref-text` / `--ref-text` / `--asr-model` / `--mode` / `--model` 时自动按 `clone` 处理，以兼容旧脚本；`--design-mode recipe|auto` 与这些 clone-only 选项互斥（退出 2）。需要旧行为就显式 `--design-mode clone`。
+- **recipe**：直接使用 btts 实际回放的 `design.instruction`（为空时回退 `identity.rendered_instruction`），保留 `identity.structured`、模板、seed/cfg_scale/max_new_tokens 与内嵌 `design.yaml` 原文及哈希。qtts 不重放 btts 的 seed/cfg，也不承诺跨模型声学等价；输出带 `acoustic-equivalence-not-possible` warning。design 没有可用的 instruction 时退出 4。
+- **模板**：6 个 btts 模板 ID 与 `btts/...` 都是输入别名，写入时 canonicalize 为 `qtts/...`；原始 btts ID 保留在 `source.design.template_id`。未知模板不猜测：`template=None`、保留 raw ID 并 warning。新增 `qtts/zh-documentary-narrator/v1`、`qtts/zh-anime-character/v1`、`qtts/en-audiobook-narrator/v1`、`qtts/en-game-character/v1`。
+- **preview**：btts `preview.wav` 复制为 profile preview，`source.preview.origin="btts"`；`voice preview` 覆盖后更新为 `origin="qtts"` 与新 hash，原始 hash 仍保留在 `source.btts.preview_sha256`。
 - **安全校验**：有 `manifest.json` 时逐文件校验 SHA-256 和大小；拒绝绝对路径、盘符、反斜杠、`..`、符号链接、特殊文件、大小写冲突、未知文件、重叠 zip 成员与超限成员。zip 读取期间的 `UserWarning` 会被提升为输入错误（退出 4），不会破坏 `--json` 的单错误对象契约。zip 必须带 manifest；目录 bundle 缺 manifest 时允许导入，但 JSON 与 `voice.json` 会显式记录 `manifest.present=false`/`verified=false` 并给出 warning。
-- **clone**：默认 ICL，使用 `reference.audio` + `reference.transcript`，走与 `voice add --kind clone` 相同的 prompt 生成与原子 staging；`--mode xvec` 可跳过参考文本。参考音频仍要通过准入检查。
-- **design**：btts 只有 `design.yaml` + `preview.wav`，没有参考文本。默认报错并要求三选一：`--auto-ref-text`（Qwen3-ASR 转写 preview）、`--ref-text TEXT`（仅单音色）或 `--mode xvec`。不会拿 preview 当 ICL 参考却编造文本。导入后是 qtts clone profile；btts 的 design 指令只写入 provenance，不写 `default_instruct`。
-- **同意**：必须显式 `--i-have-rights`。btts profile 的 `consent` 只作为 provenance 保留，不能替代 qtts 的同意记录；`voice.json` 的 `consent.license` 记为 `btts:<model license>`。
-- **provenance**：`source.origin="btts"`，`source.btts` 保留 btts name、voice_id、kind、language、license、model id/digest、profile sha256、manifest 摘要、reference/design 元数据与文件哈希；`model` 字段仍是 qtts 实际使用的本地 Qwen Base 模型。
-- **原子性**：所有选中音色先校验、staging 和生成 prompt，再统一发布；`--force` 是备份-替换-回滚，任一异常失败回滚整组，不留下半成品。该保证只覆盖异常路径，SIGKILL/掉电不在范围内。`--name` 只能用于单音色；`--all` 或多于一个 `--voice` 时使用 `--name` 退出 2。
-- **限制**：只支持 `btts voice export --mode full`；`--mode wav` 导出没有 profile，会明确提示用 `--mode full` 重新导出。单个 bundle 最多 512 个成员（约 100 个音色），单文件上限 64 MiB、总大小 512 MiB、压缩比上限 500:1；`manifest.json` 与其他 `profile.json` 一样限制 1 MiB。不导入 btts 模型权重/检查点，也不重放 `design.yaml` 的设计流程；btts 语言代码（`zh`/`en` 等）会映射为 qtts 显示名。全程不需要联网。
+- **clone**：ICL 使用 `reference.audio` + `reference.transcript`，走与 `voice add --kind clone` 相同的 prompt 生成与 staging；`--mode xvec` 可跳过参考文本。参考音频仍要通过准入检查。
+- **同意**：必须显式 `--i-have-rights`。btts profile 的 `consent` 只作为 provenance 保留，不能替代 qtts 的同意记录；`voice.json` 的 `consent.license` 记为 `btts-import`，模型许可证另存于 `source.btts.license`。
+- **provenance**：`source.origin="btts"`，`source.btts` 保留 name、voice_id、kind、language、tags、license、consent、model id/digest、profile sha256、manifest 摘要、reference/identity/design/defaults 元数据与文件哈希；超长字段截断并写入 `source.btts.truncations`（含长度与 sha256）。bundle 只记录 basename，不写绝对路径。
+- **原子性**：所有选中音色先校验、staging，再通过 `.btts-import.json` journal + `.btts-import.lock` 统一发布；安装中途失败会逆序回滚已替换/新装 profile 并清理 staging，进程崩溃后下一次运行先恢复 journal。`--dry-run` 不写 store、不 scan 模型、不加载 TTS/ASR；存在 pending journal 时拒绝 dry-run。`--name` 只能用于单音色；`--all` 或多于一个 `--voice` 时使用 `--name` 退出 2。
+- **限制**：只支持 `btts voice export --mode full`；`--mode wav` 导出没有 profile，会明确提示用 `--mode full` 重新导出。单个 bundle 最多 512 个成员（约 100 个音色），单文件上限 64 MiB、总大小 512 MiB、压缩比上限 500:1；`manifest.json` 与其他 `profile.json` 一样限制 1 MiB。不导入 btts 模型权重/检查点；btts 语言代码（`zh`/`en` 等）会映射为 qtts 显示名。全程不需要联网。
 
 `add` 的 clone 选项：
 
@@ -1187,6 +1192,7 @@ qtts_cli/
 ├── sidecar.py             # recipe 读写
 ├── voice_archive.py       # .qttsvoice 导出/导入与安全校验
 ├── voice_btts.py          # btts voice export bundle 解析与安全校验（FR-P2-09）
+├── voice_import_journal.py # btts 多音色安装 journal、锁与崩溃恢复
 ├── project.py             # project init/lock
 ├── postprocess.py         # 响度/true-peak/重采样/静音修剪纯 DSP
 ├── benchmark.py           # bench 语料、计时聚合、CER/speaker 评分
@@ -1207,6 +1213,7 @@ tests/
 ├── test_p1_batch.py       # P1 Wave 2 批量清单
 ├── test_p1_voice_archive.py
 ├── test_voice_import_btts.py  # btts 导入、安全校验与原子性
+├── test_voice_import_journal.py  # journal 崩溃窗口与恢复
 ├── test_p1_project.py
 ├── test_review_p0.py      # 审查回归
 ├── test_review_p1.py      # 审查回归

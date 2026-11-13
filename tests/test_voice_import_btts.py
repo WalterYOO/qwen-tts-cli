@@ -21,6 +21,7 @@ import soundfile
 from qtts_cli.cli import main
 from qtts_cli.commands import voice as voice_cmd
 from qtts_cli.errors import ModelError
+from qtts_cli.voice_archive import export_voice, import_voice
 from qtts_cli.voice_store import VoiceStore
 
 TEXT = "你好，欢迎使用语音克隆。"
@@ -84,7 +85,7 @@ def _design_profile(name: str, language: str = "zh") -> dict:
         "identity": {
             "structured": {},
             "rendered_instruction": "温柔女声",
-            "template": "warm",
+            "template": "zh-late-night-radio/v1",
             "compiler_version": "1",
         },
         "design": {
@@ -357,7 +358,7 @@ def test_clone_directory_bundle_success(
     assert meta["source"]["btts"]["license"]["model"] == "breezeblue-research-non-commercial"
     assert meta["source"]["btts"]["profile_sha256"]
     assert meta["consent"]["rights_confirmed"] is True
-    assert meta["consent"]["license"].startswith("btts:")
+    assert meta["consent"]["license"] == "btts-import"
     assert meta["model"]["id"].endswith("Base")
     assert fake_tts.calls[0]["ref_text"] == TEXT
     assert fake_tts.calls[0]["xvec"] is False
@@ -560,7 +561,69 @@ def test_missing_rights_is_rejected_before_model_load(
     assert fake_tts.cls.instances == 0
 
 
-def test_design_without_ref_text_is_an_input_error(
+def test_design_default_imports_recipe_without_model_or_asr(
+    monkeypatch, capsys, tmp_path, model_dir, fake_tts
+):
+    bundle = _bundle(tmp_path, [_design_voice()])
+    monkeypatch.setattr(
+        voice_cmd, "scan", lambda _dir: pytest.fail("model scan must not run")
+    )
+    rc, payload, err = _invoke(
+        capsys,
+        tmp_path,
+        model_dir,
+        "voice",
+        "import-btts",
+        str(bundle),
+        "--voice",
+        "narrator",
+        "--i-have-rights",
+        "--json",
+    )
+    assert rc == 0, err
+    entry = payload["voices"][0]
+    assert entry["kind"] == "design"
+    assert entry["design_mode"] == "recipe"
+    assert entry["ref_text_source"] is None
+    assert payload["design_mode"] == "auto"
+    assert any("acoustic-equivalence-not-possible" in item for item in payload["warnings"])
+
+    voice_dir = tmp_path / "data" / "voices" / "narrator"
+    assert (voice_dir / "voice.json").is_file()
+    assert (voice_dir / "preview.wav").read_bytes() == WAV
+    assert not (voice_dir / "ref.wav").exists()
+    meta = _voice_meta(tmp_path, "narrator")
+    assert meta["kind"] == "design"
+    assert meta["source"]["origin"] == "btts"
+    assert meta["source"]["description"] == "温柔女声"
+    assert meta["source"]["materialized"] is False
+    assert meta["source"]["design"]["template_id"] == "zh-late-night-radio/v1"
+    assert meta["source"]["design"]["template"] == "qtts/zh-late-night-radio/v1"
+    assert meta["source"]["design"]["rendered_instruction"] == "温柔女声"
+    assert meta["source"]["design"]["compiler_family"] == "btts"
+    assert meta["source"]["design"]["compiler_version"] == "1"
+    assert meta["source"]["design"]["seed"] == 19
+    assert meta["source"]["design"]["cfg_scale"] == 1.0
+    assert meta["source"]["design"]["max_new_tokens"] == 300
+    assert meta["source"]["design"]["yaml"].startswith("schema_version: 1")
+    assert meta["source"]["design"]["yaml_sha256"]
+    assert meta["source"]["preview"]["origin"] == "btts"
+    assert meta["source"]["btts"]["bundle"] == "bundle"
+    assert meta["source"]["btts"]["manifest"]["verified"] is True
+    assert meta["source"]["btts"]["license"]["model"] == (
+        "breezeblue-research-non-commercial"
+    )
+    assert meta["default_instruct"] == "温柔女声"
+    assert meta["model"]["id"] is None
+    assert "btts" in meta["tags"]
+    assert meta["consent"]["license"] == "btts-import"
+    assert "btts profile consent is provenance only" in meta["consent"]["note"]
+    assert fake_tts.calls == []
+    assert fake_tts.cls.instances == 0
+    assert _leftovers(tmp_path, "narrator") == []
+
+
+def test_design_clone_without_ref_text_is_an_input_error(
     monkeypatch, capsys, tmp_path, model_dir, fake_tts
 ):
     bundle = _bundle(tmp_path, [_design_voice()])
@@ -574,6 +637,8 @@ def test_design_without_ref_text_is_an_input_error(
         "--voice",
         "narrator",
         "--i-have-rights",
+        "--design-mode",
+        "clone",
         "--json",
     )
     assert rc == 4
@@ -1009,3 +1074,438 @@ def test_auto_ref_text_with_only_clone_is_a_usage_error(
     )
     assert rc == 2
     assert "design voice" in _error(capsys, err)["message"]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        ["--design-mode", "recipe", "--mode", "xvec"],
+        ["--design-mode", "recipe", "--auto-ref-text"],
+        ["--design-mode", "recipe", "--ref-text", USER_TEXT],
+        ["--design-mode", "recipe", "--asr-model", "fake"],
+        ["--design-mode", "recipe", "--model", "fake"],
+        ["--design-mode", "auto", "--mode", "xvec"],
+        ["--design-mode", "auto", "--auto-ref-text"],
+        ["--design-mode", "auto", "--ref-text", USER_TEXT],
+        ["--design-mode", "auto", "--asr-model", "fake"],
+        ["--design-mode", "auto", "--model", "fake"],
+    ],
+)
+def test_recipe_and_auto_reject_clone_only_options(
+    monkeypatch, capsys, tmp_path, model_dir, fake_tts, extra
+):
+    bundle = _bundle(tmp_path, [_design_voice()])
+    rc, _, err = _invoke(
+        capsys,
+        tmp_path,
+        model_dir,
+        "voice",
+        "import-btts",
+        str(bundle),
+        "--voice",
+        "narrator",
+        "--i-have-rights",
+        "--json",
+        *extra,
+    )
+    assert rc == 2
+    error = _error(capsys, err)
+    assert error["error"] == "usage"
+    assert "clone-only" in error["message"]
+    assert fake_tts.calls == []
+
+
+def test_explicit_recipe_imports_offline(monkeypatch, capsys, tmp_path, model_dir, fake_tts):
+    bundle = _bundle(tmp_path, [_design_voice()])
+    monkeypatch.setattr(voice_cmd, "scan", lambda _dir: pytest.fail("model scan must not run"))
+    rc, payload, err = _invoke(
+        capsys,
+        tmp_path,
+        model_dir,
+        "voice",
+        "import-btts",
+        str(bundle),
+        "--voice",
+        "narrator",
+        "--i-have-rights",
+        "--design-mode",
+        "recipe",
+        "--json",
+    )
+    assert rc == 0, err
+    assert payload["design_mode"] == "recipe"
+    assert payload["voices"][0]["design_mode"] == "recipe"
+    assert fake_tts.calls == []
+
+
+def _mutated_design_voice(**updates):
+    name, profile, files = _design_voice()
+    for path, value in updates.items():
+        node = profile
+        keys = path.split(".")
+        for key in keys[:-1]:
+            node = node[key]
+        node[keys[-1]] = value
+    return name, profile, files
+
+
+def test_recipe_instruction_falls_back_to_identity_rendered(
+    monkeypatch, capsys, tmp_path, model_dir, fake_tts
+):
+    bundle = _bundle(
+        tmp_path,
+        [_mutated_design_voice(
+            **{
+                "design.instruction": "   ",
+                "identity.rendered_instruction": "备选描述",
+            }
+        )],
+    )
+    rc, _, err = _invoke(
+        capsys,
+        tmp_path,
+        model_dir,
+        "voice",
+        "import-btts",
+        str(bundle),
+        "--voice",
+        "narrator",
+        "--i-have-rights",
+        "--json",
+    )
+    assert rc == 0, err
+    meta = _voice_meta(tmp_path, "narrator")
+    assert meta["source"]["description"] == "备选描述"
+    assert meta["source"]["design"]["rendered_instruction"] == "备选描述"
+    assert meta["default_instruct"] == "备选描述"
+
+
+def test_recipe_without_any_instruction_is_an_input_error(
+    monkeypatch, capsys, tmp_path, model_dir, fake_tts
+):
+    bundle = _bundle(
+        tmp_path,
+        [_mutated_design_voice(
+            **{
+                "design.instruction": "",
+                "identity.rendered_instruction": "",
+            }
+        )],
+    )
+    monkeypatch.setattr(voice_cmd, "scan", lambda _dir: pytest.fail("model scan must not run"))
+    rc, _, err = _invoke(
+        capsys,
+        tmp_path,
+        model_dir,
+        "voice",
+        "import-btts",
+        str(bundle),
+        "--voice",
+        "narrator",
+        "--i-have-rights",
+        "--json",
+    )
+    assert rc == 4
+    assert "no instruction" in _error(capsys, err)["message"]
+    assert not (tmp_path / "data" / "voices" / "narrator").exists()
+    assert _leftovers(tmp_path, "narrator") == []
+
+
+def test_recipe_instruction_mismatch_is_preserved_with_warning(
+    monkeypatch, capsys, tmp_path, model_dir, fake_tts
+):
+    bundle = _bundle(
+        tmp_path,
+        [_mutated_design_voice(
+            **{
+                "design.instruction": "主描述",
+                "identity.rendered_instruction": "旧描述",
+            }
+        )],
+    )
+    rc, payload, err = _invoke(
+        capsys,
+        tmp_path,
+        model_dir,
+        "voice",
+        "import-btts",
+        str(bundle),
+        "--voice",
+        "narrator",
+        "--i-have-rights",
+        "--json",
+    )
+    assert rc == 0, err
+    meta = _voice_meta(tmp_path, "narrator")
+    assert meta["source"]["description"] == "主描述"
+    assert meta["source"]["design"]["identity_rendered_instruction"] == "旧描述"
+    assert "instruction-mismatch" in payload["voices"][0]["warnings"]
+
+
+def test_unknown_btts_template_keeps_raw_id_and_warns(
+    monkeypatch, capsys, tmp_path, model_dir, fake_tts
+):
+    bundle = _bundle(
+        tmp_path,
+        [_mutated_design_voice(**{"identity.template": "btts/unknown/v1"})],
+    )
+    rc, payload, err = _invoke(
+        capsys,
+        tmp_path,
+        model_dir,
+        "voice",
+        "import-btts",
+        str(bundle),
+        "--voice",
+        "narrator",
+        "--i-have-rights",
+        "--json",
+    )
+    assert rc == 0, err
+    entry = payload["voices"][0]
+    assert entry["template"] is None
+    assert entry["btts_template"] == "btts/unknown/v1"
+    assert entry["template_mapped"] is False
+    assert any("unsupported-btts-template" in item for item in payload["warnings"])
+    meta = _voice_meta(tmp_path, "narrator")
+    assert meta["source"]["design"]["template"] is None
+    assert meta["source"]["design"]["template_id"] == "btts/unknown/v1"
+    assert meta["source"]["btts"]["identity"]["template"] == "btts/unknown/v1"
+
+
+def test_recipe_archive_round_trip_keeps_embedded_design_yaml(
+    monkeypatch, capsys, tmp_path, model_dir, fake_tts
+):
+    bundle = _bundle(tmp_path, [_design_voice()])
+    rc, _, err = _invoke(
+        capsys,
+        tmp_path,
+        model_dir,
+        "voice",
+        "import-btts",
+        str(bundle),
+        "--voice",
+        "narrator",
+        "--i-have-rights",
+        "--json",
+    )
+    assert rc == 0, err
+    store = VoiceStore(tmp_path / "data")
+    original = store.get("narrator")
+    archive = tmp_path / "narrator.qttsvoice"
+    export_voice(store, "narrator", archive)
+    other = VoiceStore(tmp_path / "other-data")
+    import_voice(other, archive)
+    restored = other.get("narrator")
+    assert restored["source"]["design"] == original["source"]["design"]
+    assert restored["source"]["btts"] == original["source"]["btts"]
+    assert (other.dir_for("narrator") / "preview.wav").read_bytes() == (
+        store.dir_for("narrator") / "preview.wav"
+    ).read_bytes()
+    assert restored["source"]["design"]["yaml"].startswith("schema_version: 1")
+
+
+def test_btts_provenance_truncates_large_fields_with_sha(
+    monkeypatch, capsys, tmp_path, model_dir, fake_tts
+):
+    long_value = "x" * 5000
+    bundle = _bundle(
+        tmp_path,
+        [_mutated_design_voice(
+            **{
+                "identity.rendered_instruction": long_value,
+                "defaults.direction": "y" * 600,
+            }
+        )],
+    )
+    rc, _, err = _invoke(
+        capsys,
+        tmp_path,
+        model_dir,
+        "voice",
+        "import-btts",
+        str(bundle),
+        "--voice",
+        "narrator",
+        "--i-have-rights",
+        "--json",
+    )
+    assert rc == 0, err
+    meta = _voice_meta(tmp_path, "narrator")
+    truncations = meta["source"]["btts"]["truncations"]
+    assert truncations["identity.rendered_instruction"]["truncated"] is True
+    assert truncations["identity.rendered_instruction"]["length"] == len(long_value)
+    assert truncations["identity.rendered_instruction"]["sha256"]
+    assert truncations["defaults.direction"]["sha256"]
+    assert len(meta["source"]["btts"]["identity"]["rendered_instruction"]) == 4096
+    assert len(meta["source"]["btts"]["defaults"]["direction"]) == 512
+
+
+def test_dry_run_writes_nothing_and_skips_model_and_asr(
+    monkeypatch, capsys, tmp_path, model_dir, fake_tts
+):
+    bundle = _bundle(tmp_path, [_clone_voice(), _design_voice()])
+    monkeypatch.setattr(voice_cmd, "scan", lambda _dir: pytest.fail("model scan must not run"))
+    monkeypatch.setattr(
+        voice_cmd, "AsrEngine", lambda *args, **kwargs: pytest.fail("ASR must not run")
+    )
+    rc, payload, err = _invoke(
+        capsys,
+        tmp_path,
+        model_dir,
+        "voice",
+        "import-btts",
+        str(bundle),
+        "--all",
+        "--i-have-rights",
+        "--auto-ref-text",
+        "--dry-run",
+        "--json",
+    )
+    assert rc == 0, err
+    assert payload["dry_run"] is True
+    assert {entry["design_mode"] for entry in payload["voices"]} == {"clone"}
+    assert not (tmp_path / "data" / "voices").exists()
+    assert fake_tts.calls == []
+    assert any("asr-skipped-in-dry-run" in item for item in payload["warnings"])
+
+
+def test_auto_mode_dry_run_plans_recipe_and_clone(
+    monkeypatch, capsys, tmp_path, model_dir, fake_tts
+):
+    bundle = _bundle(tmp_path, [_clone_voice("alice"), _design_voice("narrator")])
+    monkeypatch.setattr(voice_cmd, "scan", lambda _dir: pytest.fail("model scan must not run"))
+    rc, payload, err = _invoke(
+        capsys,
+        tmp_path,
+        model_dir,
+        "voice",
+        "import-btts",
+        str(bundle),
+        "--all",
+        "--i-have-rights",
+        "--dry-run",
+        "--json",
+    )
+    assert rc == 0, err
+    modes = {entry["name"]: entry["design_mode"] for entry in payload["voices"]}
+    assert modes == {"alice": "clone", "narrator": "recipe"}
+    recipe = next(entry for entry in payload["voices"] if entry["name"] == "narrator")
+    assert recipe["template"] == "qtts/zh-late-night-radio/v1"
+    assert not (tmp_path / "data" / "voices").exists()
+
+
+def test_mixed_recipe_and_clone_import_rolls_back_together(
+    monkeypatch, capsys, tmp_path, model_dir, fake_tts
+):
+    bundle = _bundle(tmp_path, [_clone_voice("bob"), _design_voice("narrator")])
+    store = VoiceStore(tmp_path / "data")
+    import os
+
+    real_replace = os.replace
+
+    def flaky(src, dst, *args, **kwargs):
+        if str(dst) == str(store.dir_for("bob")):
+            raise OSError("simulated publish failure")
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(voice_cmd.os, "replace", flaky)
+    rc, _, err = _invoke(
+        capsys,
+        tmp_path,
+        model_dir,
+        "voice",
+        "import-btts",
+        str(bundle),
+        "--all",
+        "--i-have-rights",
+        "--json",
+    )
+    assert rc == 4
+    assert "simulated publish failure" in _error(capsys, err)["message"]
+    assert not store.dir_for("bob").exists()
+    assert not store.dir_for("narrator").exists()
+    assert _leftovers(tmp_path, "bob") == []
+    assert _leftovers(tmp_path, "narrator") == []
+
+
+def test_text_formatter_uses_recipe_and_clone_labels(
+    monkeypatch, capsys, tmp_path, model_dir, fake_tts
+):
+    bundle = _bundle(tmp_path, [_clone_voice("alice"), _design_voice("narrator")])
+    rc = main(
+        [
+            "voice",
+            "import-btts",
+            str(bundle),
+            "--all",
+            "--i-have-rights",
+            "--model-dir",
+            str(model_dir),
+            "--data-dir",
+            str(tmp_path / "data"),
+            "--cache-dir",
+            str(tmp_path / "cache"),
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "narrator: design <- btts design" in out
+    assert "alice: clone <- btts clone" in out
+    assert "recipe" in out
+    assert "qtts/zh-late-night-radio/v1" in out
+
+
+def test_voice_preview_replaces_btts_preview_provenance(
+    monkeypatch, capsys, tmp_path, model_dir, fake_tts
+):
+    bundle = _bundle(tmp_path, [_design_voice()])
+    rc, _, err = _invoke(
+        capsys,
+        tmp_path,
+        model_dir,
+        "voice",
+        "import-btts",
+        str(bundle),
+        "--voice",
+        "narrator",
+        "--i-have-rights",
+        "--json",
+    )
+    assert rc == 0, err
+    before = _voice_meta(tmp_path, "narrator")
+
+    class FakePreviewEngine:
+        dtype_name = "fp32"
+        device = "cpu"
+
+        def __init__(self, cfg, model):
+            pass
+
+        def load(self):
+            return self
+
+        def generate(self, **kwargs):
+            return np.zeros(2400, dtype=np.float32), 24000, {"generate_ms": 1.0}
+
+    monkeypatch.setattr(voice_cmd, "TtsEngine", FakePreviewEngine)
+    rc, _, err = _invoke(
+        capsys,
+        tmp_path,
+        model_dir,
+        "voice",
+        "preview",
+        "narrator",
+        "--json",
+    )
+    assert rc == 0, err
+    after = _voice_meta(tmp_path, "narrator")
+    preview_path = tmp_path / "data" / "voices" / "narrator" / "preview.wav"
+    digest = hashlib.sha256(preview_path.read_bytes()).hexdigest()
+    assert after["source"]["preview"]["origin"] == "qtts"
+    assert after["source"]["preview"]["file"] == "preview.wav"
+    assert after["source"]["preview"]["sha256"] == digest
+    assert after["source"]["preview"]["updated_at"]
+    assert after["source"]["btts"]["preview_sha256"] == (
+        before["source"]["btts"]["preview_sha256"]
+    )

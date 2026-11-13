@@ -7,9 +7,12 @@ import json
 import math
 import os
 import shutil
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Optional
+
+import yaml
 
 from .. import __version__
 from ..admit import check_ref_audio
@@ -17,19 +20,52 @@ from ..asr_engine import AsrEngine, clear_asr_cache
 from ..audio_io import duration_s, resolve_output_format, write_audio
 from ..capabilities import VoiceRef, validate_capabilities
 from ..catalog import ModelInfo, find_model, scan, select, select_asr
+from ..design_compile import template_sha256
+from ..design_yaml import (
+    DESIGN_SCHEMA_VERSION,
+    MAX_DESIGN_BYTES,
+    normalize_document,
+    resolve_template_id,
+)
 from ..errors import InputError, ModelError, UsageError
 from ..plan import SAMPLING_DEFAULTS, resolve_dtype_name, resolve_voice
 from ..sidecar import build_recipe, recipe_path, write_recipe
 from ..textnorm import NORMALIZATION_VERSION
 from ..tts_engine import TtsEngine, clear_model_cache
-from ..utils import atomic_write_bytes, confirm, eprint, is_tty, sha256_file
+from ..utils import (
+    atomic_write_bytes,
+    confirm,
+    eprint,
+    is_tty,
+    sha256_bytes,
+    sha256_file,
+    sha256_json,
+    sha256_text,
+)
 from ..voice_archive import (
     export_bundle,
     export_voice,
     import_bundle as import_voice_bundle,
     import_voice,
 )
-from ..voice_btts import BttsBundle, BundleVoice, load_bundle, read_bundle_file
+from ..voice_btts import (
+    BttsBundle,
+    BundleVoice,
+    design_block,
+    design_compiler_version,
+    design_defaults,
+    design_identity,
+    design_instruction,
+    design_structured,
+    design_template,
+    load_bundle,
+    read_bundle_file,
+)
+from ..voice_import_journal import (
+    commit_import as commit_btts_import,
+    has_pending_journal,
+    recover_import as recover_btts_import,
+)
 from ..voice_store import VoiceStore, utc_now, validate_name
 
 DEFAULT_PREVIEW_TEXT = "你好，这是音色试听。Hello, this is a voice preview."
@@ -705,6 +741,10 @@ def inspect(cfg, args) -> dict[str, Any]:
         design_text = None
 
     preview = directory / "preview.wav"
+    preview_block = source.get("preview") if isinstance(source.get("preview"), dict) else {}
+    if design_text is None and isinstance(design, dict):
+        embedded = design.get("yaml")
+        design_text = embedded[:65536] if isinstance(embedded, str) else None
     payload = {
         "ok": True,
         "kind": meta.get("kind"),
@@ -713,6 +753,7 @@ def inspect(cfg, args) -> dict[str, Any]:
         "files": files,
         "prompt_sha256": store.prompt_sha256(directory.name),
         "preview": str(preview) if preview.is_file() else None,
+        "preview_origin": preview_block.get("origin"),
         "design": design,
         "design_yaml": design_text,
         "warnings": warnings,
@@ -911,6 +952,17 @@ def preview(cfg, args) -> dict[str, Any]:
         and out.parent == store.dir_for(name)
     ):
         store.set_preview(name, out)
+        meta_for_preview = store.get(name)
+        if meta_for_preview is not None:
+            source_for_preview = dict(meta_for_preview.get("source") or {})
+            source_for_preview["preview"] = {
+                "origin": "qtts",
+                "file": "preview.wav",
+                "sha256": sha256_file(out),
+                "updated_at": utc_now(),
+            }
+            meta_for_preview["source"] = source_for_preview
+            store.save_meta(meta_for_preview)
 
     recipe = build_recipe(
         qtts_version=__version__,
@@ -994,6 +1046,27 @@ def import_bundle(cfg, args) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # import-btts
 # --------------------------------------------------------------------------- #
+def _btts_design_mode(args) -> str:
+    explicit = str(getattr(args, "design_mode", "") or "").strip().lower()
+    clone_flags = bool(
+        getattr(args, "auto_ref_text", False)
+        or getattr(args, "ref_text", None) is not None
+        or getattr(args, "asr_model", None)
+        or getattr(args, "mode", None) is not None
+        or getattr(args, "model", None)
+    )
+    if explicit:
+        if explicit not in ("auto", "recipe", "clone"):
+            raise UsageError("--design-mode must be auto, recipe or clone")
+        if explicit in ("auto", "recipe") and clone_flags:
+            raise UsageError(
+                f"--design-mode {explicit} cannot be combined with clone-only "
+                "options; use --design-mode clone"
+            )
+        return explicit
+    return "clone" if clone_flags else "auto"
+
+
 def import_btts(cfg, args) -> dict[str, Any]:
     requested = list(getattr(args, "voice", None) or [])
     if args.all and requested:
@@ -1010,19 +1083,21 @@ def import_btts(cfg, args) -> dict[str, Any]:
         if len(requested) != 1:
             raise UsageError("--name requires exactly one selected voice")
 
-    mode = (args.mode or "icl").lower()
-    auto = bool(getattr(args, "auto_ref_text", False))
-    explicit_text = args.ref_text
-    if auto and explicit_text is not None:
-        raise UsageError("--auto-ref-text cannot be combined with --ref-text")
-    if auto and mode != "icl":
-        raise UsageError("--auto-ref-text requires --mode icl")
-    if getattr(args, "asr_model", None) and not auto:
-        raise UsageError("--asr-model requires --auto-ref-text")
-    if explicit_text is not None and mode != "icl":
-        raise UsageError("--ref-text requires --mode icl")
-    if explicit_text is not None and not explicit_text.strip():
-        raise UsageError("--ref-text must not be empty")
+    design_mode = _btts_design_mode(args)
+    clone_mode = (args.mode or "icl").lower()
+    auto = bool(getattr(args, "auto_ref_text", False)) if design_mode == "clone" else False
+    explicit_text = args.ref_text if design_mode == "clone" else None
+    if design_mode == "clone":
+        if auto and explicit_text is not None:
+            raise UsageError("--auto-ref-text cannot be combined with --ref-text")
+        if auto and clone_mode != "icl":
+            raise UsageError("--auto-ref-text requires --mode icl")
+        if getattr(args, "asr_model", None) and not auto:
+            raise UsageError("--asr-model requires --auto-ref-text")
+        if explicit_text is not None and clone_mode != "icl":
+            raise UsageError("--ref-text requires --mode icl")
+        if explicit_text is not None and not explicit_text.strip():
+            raise UsageError("--ref-text must not be empty")
     if not getattr(args, "i_have_rights", False):
         raise InputError(
             "importing btts voices requires explicit consent; pass --i-have-rights "
@@ -1045,10 +1120,16 @@ def import_btts(cfg, args) -> dict[str, Any]:
         )
 
     store = VoiceStore(cfg.data_dir)
+    if has_pending_journal(store):
+        if getattr(args, "dry_run", False):
+            recover_btts_import(store, dry_run=True)
+        else:
+            recover_btts_import(store)
+
     existing = store.existing_names()
     targets: list[tuple[BundleVoice, str]] = []
     seen_targets: dict[str, str] = {}
-    replace_paths: dict[str, Path] = {}
+    replace_names: dict[str, str] = {}
     conflicts: list[str] = []
     for voice in selected:
         target = validate_name(args.name or voice.name)
@@ -1062,10 +1143,7 @@ def import_btts(cfg, args) -> dict[str, Any]:
         seen_targets[folded] = target
         on_disk = existing.get(folded)
         if on_disk is not None:
-            if on_disk != target:
-                # A case-only rename must replace the existing directory, not
-                # create a second profile beside it on case-sensitive systems.
-                replace_paths[target] = store.root / on_disk
+            replace_names[target] = on_disk
             if not args.force:
                 conflicts.append(target)
         targets.append((voice, target))
@@ -1077,34 +1155,126 @@ def import_btts(cfg, args) -> dict[str, Any]:
             details={"bundle": str(bundle.path), "voices": sorted(conflicts)},
         )
 
-    models = scan(cfg.model_dir)
-    model = (
-        find_model(models, args.model)
-        if getattr(args, "model", None)
-        else select(models, "clone")
-    )
-
     plans = [
-        _btts_plan(voice, target, bundle=bundle, mode=mode,
-                   auto=auto, explicit_text=explicit_text)
+        (
+            _btts_recipe_plan(voice, target, bundle=bundle)
+            if voice.kind == "design" and design_mode in ("auto", "recipe")
+            else _btts_plan(
+                voice,
+                target,
+                bundle=bundle,
+                mode=clone_mode or "icl",
+                auto=auto,
+                explicit_text=explicit_text,
+            )
+        )
         for voice, target in targets
     ]
-    for plan in plans:
-        validate_capabilities(
-            model,
-            mode="clone",
-            language=plan["voice"].language,
-            icl=(mode == "icl" and plan["ref_text"] is not None),
-            ref_text=plan["ref_text"],
-        )
+    clone_plans = [plan for plan in plans if plan["design_mode"] == "clone"]
+    recipe_plans = [plan for plan in plans if plan["design_mode"] == "recipe"]
 
-    asr_model = select_asr(models, getattr(args, "asr_model", None)) if auto else None
+    models = scan(cfg.model_dir) if clone_plans and not getattr(args, "dry_run", False) else []
+    model = None
+    if clone_plans and not getattr(args, "dry_run", False):
+        model = (
+            find_model(models, args.model)
+            if getattr(args, "model", None)
+            else select(models, "clone")
+        )
+        for plan in clone_plans:
+            validate_capabilities(
+                model,
+                mode="clone",
+                language=plan["voice"].language,
+                icl=(clone_mode == "icl" and plan["ref_text"] is not None),
+                ref_text=plan["ref_text"],
+            )
+
+    if getattr(args, "dry_run", False):
+        warnings = list(bundle.warnings)
+        for plan in plans:
+            plan["warnings"] = list(plan.get("warnings") or [])
+            warnings.extend(plan["warnings"])
+            if plan["design_mode"] == "recipe":
+                warnings.append(
+                    "acoustic-equivalence-not-possible: btts uses Breeze TTS 2; "
+                    "qtts uses Qwen3-TTS VoiceDesign"
+                )
+        with tempfile.TemporaryDirectory(prefix="qtts-btts-dry-") as tmp:
+            for plan in clone_plans:
+                if clone_mode == "icl" and plan["ref_text"] is None:
+                    plan["warnings"].append("asr-skipped-in-dry-run")
+                    if "asr-skipped-in-dry-run" not in warnings:
+                        warnings.append("asr-skipped-in-dry-run")
+                    continue
+                voice = plan["voice"]
+                ref_rel = (
+                    f"{voice.name}/{voice.ref_audio}"
+                    if voice.kind == "clone"
+                    else voice.preview
+                )
+                staged_ref = Path(tmp) / f"{plan['target']}.wav"
+                atomic_write_bytes(staged_ref, read_bundle_file(bundle, ref_rel))
+                report = check_ref_audio(
+                    staged_ref,
+                    ref_text=plan["ref_text"] if clone_mode == "icl" else None,
+                    language=voice.language,
+                )
+                if not report.ok:
+                    details = report.to_dict()
+                    details.update(
+                        {"bundle": str(bundle.path), "voice": voice.name, "file": ref_rel}
+                    )
+                    raise InputError(
+                        "reference audio rejected by admission checks", details=details
+                    )
+                plan["admission"] = report
+        return {
+            "ok": True,
+            "kind": "btts-import",
+            "dry_run": True,
+            "bundle": str(bundle.path),
+            "bundle_format": bundle.format,
+            "design_mode": design_mode,
+            "manifest": {
+                "present": bundle.manifest_present,
+                "verified": bundle.manifest_verified,
+                "sha256": bundle.manifest_sha256,
+            },
+            "voices": [
+                _btts_result(plan, replaced=False, store=store)
+                for plan in plans
+            ],
+            "replaced": False,
+            "warnings": warnings,
+        }
+
+    asr_model = (
+        select_asr(models, getattr(args, "asr_model", None))
+        if auto and any(plan["voice"].kind == "design" for plan in clone_plans)
+        else None
+    )
     asr = None
     staged: list[tuple[str, Path]] = []
     staging_by_target: dict[str, Path] = {}
     replaced: set[str] = set()
     try:
-        for plan in plans:
+        for plan in recipe_plans:
+            voice = plan["voice"]
+            target = plan["target"]
+            staging = store.staging_dir(target)
+            staged.append((target, staging))
+            staging_by_target[target] = staging
+            plan["meta"] = _stage_btts_recipe(
+                cfg,
+                store,
+                plan,
+                bundle=bundle,
+                force=bool(args.force),
+                staging=staging,
+            )
+
+        for plan in clone_plans:
             voice = plan["voice"]
             target = plan["target"]
             staging = store.staging_dir(target)
@@ -1146,7 +1316,7 @@ def import_btts(cfg, args) -> dict[str, Any]:
 
             report = check_ref_audio(
                 staged_ref,
-                ref_text=plan["ref_text"] if mode == "icl" else None,
+                ref_text=plan["ref_text"] if clone_mode == "icl" else None,
                 language=voice.language,
             )
             if not report.ok:
@@ -1158,104 +1328,101 @@ def import_btts(cfg, args) -> dict[str, Any]:
                     "reference audio rejected by admission checks", details=details
                 )
             plan["admission"] = report
+            assert model is not None
             validate_capabilities(
                 model,
                 mode="clone",
                 language=voice.language,
-                icl=(mode == "icl"),
-                ref_text=plan["ref_text"] if mode == "icl" else None,
+                icl=(clone_mode == "icl"),
+                ref_text=plan["ref_text"] if clone_mode == "icl" else None,
             )
 
-        # Release ASR memory before the Base model is loaded (MPS co-residency).
         asr = None
         if auto:
             clear_asr_cache()
 
-        engine = TtsEngine(cfg, model)
-        engine.load()
-        for plan in plans:
-            voice = plan["voice"]
-            target = plan["target"]
-            staging = staging_by_target[target]
-            source = {
-                "type": "clone",
-                "origin": "btts",
-                "mode": mode,
-                "ref_text": plan["ref_text"] if mode == "icl" else None,
-                "ref_text_source": (
-                    plan["ref_text_source"] if mode == "icl" else None
-                ),
-                "btts": _btts_provenance(voice, bundle),
-            }
-            meta = _freeze_clone_prompt(
-                cfg,
-                store,
-                name=target,
-                staged_ref=staging / "ref.wav",
-                ref_text=plan["ref_text"],
-                mode=mode,
-                language=voice.language,
-                model=model,
-                engine=engine,
-                source=source,
-                consent=_btts_consent(voice, bundle),
-                staging=staging,
-                tags=voice.tags,
-                preview_src=staging / "preview.wav",
-                asr_model=(
-                    asr_model if plan["ref_text_source"] == "asr" else None
-                ),
-                allow_existing=bool(args.force),
-            )
-            plan["meta"] = meta
+        if clone_plans:
+            assert model is not None
+            engine = TtsEngine(cfg, model)
+            engine.load()
+            for plan in clone_plans:
+                voice = plan["voice"]
+                target = plan["target"]
+                staging = staging_by_target[target]
+                source = {
+                    "type": "clone",
+                    "origin": "btts",
+                    "mode": clone_mode,
+                    "ref_text": plan["ref_text"] if clone_mode == "icl" else None,
+                    "ref_text_source": (
+                        plan["ref_text_source"] if clone_mode == "icl" else None
+                    ),
+                    "btts": _btts_provenance(voice, bundle),
+                }
+                plan["meta"] = _freeze_clone_prompt(
+                    cfg,
+                    store,
+                    name=target,
+                    staged_ref=staging / "ref.wav",
+                    ref_text=plan["ref_text"],
+                    mode=clone_mode or "icl",
+                    language=voice.language,
+                    model=model,
+                    engine=engine,
+                    source=source,
+                    consent=_btts_consent(voice, bundle),
+                    staging=staging,
+                    tags=_btts_tags(voice),
+                    preview_src=staging / "preview.wav",
+                    asr_model=(
+                        asr_model if plan["ref_text_source"] == "asr" else None
+                    ),
+                    allow_existing=bool(args.force),
+                )
 
-        replaced = _commit_imported(
+        replaced = commit_btts_import(
             store,
-            staged,
-            force=bool(args.force),
-            replace=replace_paths,
+            [
+                (target, staging, replace_names.get(target))
+                for target, staging in staged
+            ],
         )
         staged = []
     finally:
-        for _, staging in staged:
-            shutil.rmtree(staging, ignore_errors=True)
+        # If commit_import left a journal, recovery may still need the staging
+        # directory to distinguish "replace not attempted" from "installed".
+        if not has_pending_journal(store):
+            for _, staging in staged:
+                shutil.rmtree(staging, ignore_errors=True)
         if auto:
             clear_asr_cache()
 
-    results = []
+    warnings = list(bundle.warnings)
     for plan in plans:
-        voice = plan["voice"]
-        target = plan["target"]
-        results.append(
-            {
-                "name": target,
-                "btts_name": voice.name,
-                "kind": "clone",
-                "btts_kind": voice.kind,
-                "language": voice.language,
-                "btts_language": voice.btts_language,
-                "profile_sha256": voice.profile_sha256,
-                "ref_text_source": (
-                    plan["ref_text_source"] if mode == "icl" else None
-                ),
-                "replaced": target in replaced,
-                "output": str(store.dir_for(target)),
-                "files": sorted(voice.files),
-            }
-        )
+        warnings.extend(plan.get("warnings") or [])
+        if plan["design_mode"] == "recipe":
+            warnings.append(
+                "acoustic-equivalence-not-possible: btts uses Breeze TTS 2; "
+                "qtts uses Qwen3-TTS VoiceDesign"
+            )
     return {
         "ok": True,
         "kind": "btts-import",
+        "dry_run": False,
         "bundle": str(bundle.path),
         "bundle_format": bundle.format,
+        "design_mode": design_mode,
         "manifest": {
             "present": bundle.manifest_present,
             "verified": bundle.manifest_verified,
             "sha256": bundle.manifest_sha256,
         },
-        "voices": results,
+        "voices": [
+            _btts_result(plan, replaced=plan["target"] in replaced, store=store)
+            for plan in plans
+        ],
         "replaced": bool(replaced),
-        "warnings": list(bundle.warnings),
+        "warnings": warnings,
     }
 
 
@@ -1312,8 +1479,236 @@ def _btts_plan(
     return {
         "voice": voice,
         "target": target,
+        "design_mode": "clone",
         "ref_text": ref_text,
         "ref_text_source": ref_text_source,
+        "warnings": [],
+    }
+
+
+def _btts_recipe_plan(
+    voice: BundleVoice, target: str, *, bundle: BttsBundle
+) -> dict[str, Any]:
+    instruction = design_instruction(voice)
+    if not instruction:
+        raise InputError(
+            f"design voice {voice.name} has no instruction; cannot import a recipe",
+            details={"bundle": str(bundle.path), "voice": voice.name},
+        )
+    return {
+        "voice": voice,
+        "target": target,
+        "design_mode": "recipe",
+        "instruction": instruction,
+        "ref_text": None,
+        "ref_text_source": None,
+        "warnings": [],
+    }
+
+
+def _read_btts_design_yaml(
+    voice: BundleVoice, bundle: BttsBundle
+) -> tuple[Optional[str], Optional[dict[str, Any]], list[str]]:
+    if not voice.design_yaml:
+        return None, None, []
+    warnings: list[str] = []
+    try:
+        raw = read_bundle_file(bundle, voice.design_yaml)
+    except InputError as exc:
+        return None, None, [f"invalid-design-yaml: {exc}"]
+    if len(raw) > MAX_DESIGN_BYTES:
+        return None, None, [
+            f"invalid-design-yaml: design.yaml is larger than {MAX_DESIGN_BYTES} bytes"
+        ]
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        return None, None, [f"invalid-design-yaml: {exc}"]
+    try:
+        document = yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        return None, None, [f"invalid-design-yaml: {exc}"]
+    if not isinstance(document, dict):
+        return text, None, ["invalid-design-yaml: design.yaml must be a mapping"]
+    try:
+        normalized = normalize_document(document)
+    except Exception as exc:  # normalize is defensive; keep the recipe usable
+        return text, None, [f"invalid-design-yaml: {exc}"]
+    if normalized.get("errors"):
+        warnings.append(
+            "invalid-design-yaml: " + "; ".join(str(item) for item in normalized["errors"])
+        )
+    return text, normalized, warnings
+
+
+def _btts_tags(voice: BundleVoice) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for tag in [*voice.tags, "btts"]:
+        key = tag.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tag)
+    return out
+
+
+def _stage_btts_recipe(
+    cfg,
+    store: VoiceStore,
+    plan: dict[str, Any],
+    *,
+    bundle: BttsBundle,
+    force: bool,
+    staging: Path,
+) -> dict[str, Any]:
+    voice = plan["voice"]
+    instruction = plan["instruction"]
+    yaml_text, normalized, warnings = _read_btts_design_yaml(voice, bundle)
+    plan["warnings"].extend(warnings)
+
+    structured = design_structured(voice)
+    covers: list[str] = []
+    if normalized:
+        covers = [str(item) for item in (normalized.get("covers") or []) if str(item).strip()]
+        if not structured:
+            structured = {
+                key: value
+                for key, value in normalized.items()
+                if key not in ("extras", "errors", "present_fields")
+            }
+        if normalized.get("name") and normalized.get("name") != voice.name:
+            plan["warnings"].append(
+                f"design-yaml-mismatch: name {normalized.get('name')!r} != {voice.name!r}"
+            )
+        normalized_language = str(normalized.get("language") or "").strip().lower()
+        if normalized_language and normalized_language != voice.btts_language.strip().lower():
+            plan["warnings"].append(
+                "design-yaml-mismatch: language "
+                f"{normalized_language!r} != {voice.btts_language!r}"
+            )
+    if not covers and isinstance(structured.get("covers"), list):
+        covers = [str(item) for item in structured["covers"] if str(item).strip()]
+    sample_text = covers[0] if covers else DEFAULT_DESIGN_SAMPLE
+
+    raw_template = design_template(voice)
+    if not raw_template and normalized:
+        raw_template = normalized.get("template")
+    template = resolve_template_id(raw_template)
+    if raw_template and template is None:
+        plan["warnings"].append(f"unsupported-btts-template: {raw_template}")
+    template_hash = template_sha256(template) if template else None
+
+    identity = design_identity(voice)
+    rendered_by_identity = identity.get("rendered_instruction")
+    design = design_block(voice)
+    defaults = design_defaults(voice)
+    compiler_version = design_compiler_version(voice)
+    preview = read_bundle_file(bundle, voice.preview)
+    preview_sha = sha256_bytes(preview)
+    btts = _btts_provenance(voice, bundle)
+
+    design_source: dict[str, Any] = {
+        "schema_version": DESIGN_SCHEMA_VERSION,
+        "template": template,
+        "template_id": raw_template,
+        "template_sha256": template_hash,
+        "structured": structured,
+        "rendered_instruction": instruction,
+        "rendered_sha256": sha256_text(instruction),
+        "compiler_family": "btts" if compiler_version else None,
+        "compiler_version": compiler_version,
+        "yaml": yaml_text,
+        "yaml_sha256": sha256_text(yaml_text) if yaml_text is not None else None,
+        "seed": _bounded_int(design.get("seed")),
+        "cfg_scale": _bounded_number(design.get("cfg_scale")),
+        "max_new_tokens": _bounded_int(design.get("max_new_tokens")),
+    }
+    if (
+        isinstance(rendered_by_identity, str)
+        and rendered_by_identity.strip()
+        and rendered_by_identity.strip() != instruction
+    ):
+        design_source["identity_rendered_instruction"] = rendered_by_identity.strip()
+        plan["warnings"].append("instruction-mismatch")
+
+    source = {
+        "type": "design",
+        "origin": "btts",
+        "description": instruction,
+        "sample_text": sample_text,
+        "language": voice.language,
+        "materialized": False,
+        "preview": {"origin": "btts", "file": "preview.wav", "sha256": preview_sha},
+        "design": design_source,
+        "btts": btts,
+    }
+    model_id = ((btts.get("model") or {}) if isinstance(btts.get("model"), dict) else {}).get("id")
+    meta = store.create(
+        name=plan["target"],
+        kind="design",
+        source=source,
+        model={
+            "id": None,
+            "source": "btts",
+            "btts_model": model_id,
+            "note": "qtts VoiceDesign model is selected at say/preview time",
+        },
+        dtype=None,
+        language=voice.language,
+        default_instruct=instruction,
+        tags=_btts_tags(voice),
+        consent=_btts_consent(voice, bundle),
+        qtts_version=__version__,
+        staging=staging,
+        allow_existing=force,
+    )
+    atomic_write_bytes(staging / "preview.wav", preview)
+    return meta
+
+
+def _btts_result(
+    plan: dict[str, Any], *, replaced: bool, store: VoiceStore
+) -> dict[str, Any]:
+    voice = plan["voice"]
+    meta = plan.get("meta") or {}
+    source = meta.get("source") if isinstance(meta.get("source"), dict) else {}
+    design = source.get("design") if isinstance(source.get("design"), dict) else {}
+    instruction = (
+        plan.get("instruction")
+        or source.get("description")
+        or design_instruction(voice)
+        or ""
+    )
+    raw_template = design.get("template_id") or design_template(voice)
+    canonical_template = design.get("template") or resolve_template_id(raw_template)
+    return {
+        "name": plan["target"],
+        "btts_name": voice.name,
+        "kind": "design" if plan["design_mode"] == "recipe" else "clone",
+        "btts_kind": voice.kind,
+        "design_mode": plan["design_mode"],
+        "template": canonical_template,
+        "btts_template": raw_template,
+        "template_mapped": bool(canonical_template),
+        "instruction_sha256": sha256_text(instruction) if instruction else None,
+        "language": voice.language,
+        "btts_language": voice.btts_language,
+        "profile_sha256": voice.profile_sha256,
+        "ref_text_source": (
+            plan["ref_text_source"]
+            if plan["design_mode"] == "clone" and plan.get("ref_text_source")
+            else None
+        ),
+        "preview_origin": "btts",
+        "metadata_compatible": True,
+        "acoustic_equivalence": False,
+        "seed_replayed": False,
+        "cfg_replayed": False,
+        "replaced": replaced,
+        "output": str(store.dir_for(plan["target"])),
+        "files": sorted(voice.files),
+        "warnings": list(plan.get("warnings") or []),
     }
 
 
@@ -1372,18 +1767,16 @@ def _btts_consent(voice: BundleVoice, bundle: BttsBundle) -> dict[str, Any]:
     license_model = (
         license_block.get("model") if isinstance(license_block, dict) else None
     )
-    license_value = (
-        f"btts:{license_model}"
-        if isinstance(license_model, str) and license_model
-        else "btts-import"
+    note = (
+        f"imported from btts bundle {bundle.path.name}; the btts profile "
+        "consent is provenance only and was not used as qtts consent"
     )
+    if isinstance(license_model, str) and license_model:
+        note += f"; btts model license: {license_model}"
     return {
         "rights_confirmed": True,
-        "license": license_value,
-        "note": (
-            f"imported from btts bundle {bundle.path.name}; the btts profile "
-            "consent is provenance only and was not used as qtts consent"
-        ),
+        "license": "btts-import",
+        "note": note,
     }
 
 
@@ -1394,18 +1787,48 @@ def _btts_provenance(voice: BundleVoice, bundle: BttsBundle) -> dict[str, Any]:
         if isinstance(profile.get("reference"), dict)
         else None
     )
-    design = profile.get("design") if isinstance(profile.get("design"), dict) else None
+    design = design_block(voice)
     provenance = (
         profile.get("provenance")
         if isinstance(profile.get("provenance"), dict)
         else {}
     )
-    identity = profile.get("identity") if isinstance(profile.get("identity"), dict) else {}
+    identity = design_identity(voice)
     license_block = profile.get("license") if isinstance(profile.get("license"), dict) else {}
+    defaults = design_defaults(voice)
+    consent = profile.get("consent")
+    truncations: dict[str, dict[str, Any]] = {}
+
+    def text(value: Any, limit: int, field: str) -> Optional[str]:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if len(stripped) > limit:
+                truncations[field] = {
+                    "truncated": True,
+                    "limit": limit,
+                    "length": len(stripped),
+                    "sha256": sha256_text(stripped),
+                }
+        return _bounded_str(value, limit)
+
+    def data(value: Any, limit: int, field: str) -> Any:
+        try:
+            encoded = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError):
+            encoded = None
+        if encoded is not None and len(encoded) > limit:
+            truncations[field] = {
+                "truncated": True,
+                "limit": limit,
+                "length": len(encoded),
+                "sha256": sha256_text(encoded),
+            }
+        return _bounded_json(value, limit)
 
     out: dict[str, Any] = {
-        "bundle": str(bundle.path),
+        "bundle": bundle.path.name,
         "bundle_format": bundle.format,
+        "bundle_root_prefix": bundle.root_prefix,
         "manifest": {
             "present": bundle.manifest_present,
             "verified": bundle.manifest_verified,
@@ -1418,46 +1841,53 @@ def _btts_provenance(voice: BundleVoice, bundle: BttsBundle) -> dict[str, Any]:
         "profile_sha256": voice.profile_sha256,
         "profile_path": voice.profile_rel,
         "tags": list(voice.tags),
-        "license": {"model": _bounded_str(license_block.get("model"), 256)},
+        "license": data(license_block, 4096, "license"),
         "model": {
-            "id": _bounded_str(provenance.get("model_id"), 256),
-            "digest": _bounded_str(provenance.get("model_digest"), 256),
+            "id": text(provenance.get("model_id"), 256, "model.id"),
+            "digest": text(provenance.get("model_digest"), 256, "model.digest"),
         },
         "provenance": {
-            "source": _bounded_str(provenance.get("source"), 64),
-            "source_take_id": _bounded_str(provenance.get("source_take_id"), 256),
-            "source_session_id": _bounded_str(
-                provenance.get("source_session_id"), 256
+            "source": text(provenance.get("source"), 64, "provenance.source"),
+            "source_take_id": text(
+                provenance.get("source_take_id"), 256, "provenance.source_take_id"
             ),
-            "api_protocol": _bounded_str(provenance.get("api_protocol"), 128),
-            "cli_version": _bounded_str(provenance.get("cli_version"), 64),
+            "source_session_id": text(
+                provenance.get("source_session_id"), 256, "provenance.source_session_id"
+            ),
+            "api_protocol": text(
+                provenance.get("api_protocol"), 128, "provenance.api_protocol"
+            ),
+            "cli_version": text(
+                provenance.get("cli_version"), 64, "provenance.cli_version"
+            ),
+            "model_id": text(
+                provenance.get("model_id"), 256, "provenance.model_id"
+            ),
+            "model_digest": text(
+                provenance.get("model_digest"), 256, "provenance.model_digest"
+            ),
         },
         "identity": {
-            "rendered_instruction": _bounded_str(
-                identity.get("rendered_instruction"), 4096
+            "structured": data(
+                identity.get("structured"), 16384, "identity.structured"
             ),
-            "template": _bounded_str(identity.get("template"), 256),
-            "compiler_version": _bounded_str(identity.get("compiler_version"), 64),
-        },
-        "files": {
-            filename: ref.sha256 for filename, ref in sorted(voice.files.items())
-        },
-    }
-    if reference is not None:
-        out["reference"] = {
-            "audio": _bounded_str(reference.get("audio"), 128),
-            "audio_sha256": _bounded_str(reference.get("audio_sha256"), 128),
-            "transcript": _bounded_str(reference.get("transcript"), 128),
-            "transcript_sha256": _bounded_str(
-                reference.get("transcript_sha256"), 128
+            "rendered_instruction": text(
+                identity.get("rendered_instruction"),
+                4096,
+                "identity.rendered_instruction",
             ),
-            "transcript_confirmed": bool(reference.get("transcript_confirmed")),
-            "duration_s": _bounded_number(reference.get("duration_s")),
-            "sample_rate": _bounded_int(reference.get("sample_rate")),
-        }
-    if design is not None:
-        out["design"] = {
-            "instruction": _bounded_str(design.get("instruction"), 4096),
+            "template": text(identity.get("template"), 256, "identity.template"),
+            "compiler_family": (
+                "btts" if design_compiler_version(voice) else None
+            ),
+            "compiler_version": text(
+                identity.get("compiler_version"), 64, "identity.compiler_version"
+            ),
+        },
+        "design": {
+            "instruction": text(
+                design.get("instruction"), 4096, "design.instruction"
+            ),
             "seed": _bounded_int(design.get("seed")),
             "cfg_scale": _bounded_number(design.get("cfg_scale")),
             "max_new_tokens": _bounded_int(design.get("max_new_tokens")),
@@ -1465,12 +1895,51 @@ def _btts_provenance(voice: BundleVoice, bundle: BttsBundle) -> dict[str, Any]:
             "design_yaml_sha256": (
                 voice.files["design.yaml"].sha256 if voice.design_yaml else None
             ),
+        },
+        "defaults": {
+            "seed": _bounded_int(defaults.get("seed")),
+            "cfg_scale": _bounded_number(defaults.get("cfg_scale")),
+            "direction": text(defaults.get("direction"), 512, "defaults.direction"),
+        },
+        "files": {
+            filename: ref.sha256 for filename, ref in sorted(voice.files.items())
+        },
+        "preview_sha256": (
+            voice.files["preview.wav"].sha256
+            if "preview.wav" in voice.files
+            else None
+        ),
+    }
+    if reference is not None:
+        out["reference"] = {
+            "audio": text(reference.get("audio"), 128, "reference.audio"),
+            "audio_sha256": text(
+                reference.get("audio_sha256"), 128, "reference.audio_sha256"
+            ),
+            "transcript": text(
+                reference.get("transcript"), 128, "reference.transcript"
+            ),
+            "transcript_sha256": text(
+                reference.get("transcript_sha256"),
+                128,
+                "reference.transcript_sha256",
+            ),
+            "transcript_confirmed": bool(reference.get("transcript_confirmed")),
+            "duration_s": _bounded_number(reference.get("duration_s")),
+            "sample_rate": _bounded_int(reference.get("sample_rate")),
         }
-    consent = profile.get("consent")
     if isinstance(consent, dict):
-        out["consent"] = _bounded_json(consent)
+        out["consent"] = data(consent, 4096, "consent")
     elif consent is not None:
-        out["consent"] = {"present": True}
+        out["consent"] = {"present": True, "truncated": True}
+        truncations["consent"] = {
+            "truncated": True,
+            "limit": 4096,
+            "length": None,
+            "sha256": None,
+        }
+    if truncations:
+        out["truncations"] = truncations
     return out
 
 
@@ -1548,7 +2017,7 @@ def format_result(payload: dict[str, Any]) -> str:
         for warning in payload.get("warnings") or []:
             lines.append(f"  warning: {warning}")
         return "\n".join(lines)
-    if payload.get("bundle") and "voices" in payload:
+    if payload.get("bundle") and "voices" in payload and "out_dir" in payload:
         verb = "would export" if payload.get("dry_run") else "exported"
         lines = [
             f"{verb} {len(payload['voices'])} voice(s) -> {payload['out_dir']} "
@@ -1601,17 +2070,21 @@ def format_result(payload: dict[str, Any]) -> str:
             manifest_text = "manifest not verified"
         else:
             manifest_text = "manifest missing"
+        verb = "would import" if payload.get("dry_run") else "imported"
         lines = [
-            f"imported {len(payload.get('voices') or [])} voice(s) from "
+            f"{verb} {len(payload.get('voices') or [])} voice(s) from "
             f"{payload.get('bundle')} ({manifest_text})"
         ]
         for entry in payload.get("voices") or []:
             source = entry.get("ref_text_source")
             source_text = f" ref_text_source={source}" if source else ""
             replaced = " replaced" if entry.get("replaced") else ""
+            mode = entry.get("design_mode") or entry.get("kind") or "clone"
+            detail = f", template {entry['template']}" if entry.get("template") else ""
             lines.append(
-                f"  {entry['name']}: clone <- btts {entry['btts_kind']} "
-                f"({entry['btts_language']} -> {entry['language']})"
+                f"  {entry['name']}: {entry.get('kind')} <- btts "
+                f"{entry['btts_kind']} ({entry['btts_language']} -> "
+                f"{entry['language']}, {mode}{detail})"
                 f"{source_text}{replaced}"
             )
         for warning in payload.get("warnings") or []:

@@ -12,23 +12,25 @@ import pytest
 import soundfile as sf
 
 from qtts_cli.cli import main
-from qtts_cli.design_compile import compile_design
+from qtts_cli.design_compile import compile_design, template_sha256
 from qtts_cli.design_lint import lint_design
 from qtts_cli.design_report import CSV_COLUMNS, build_report
 from qtts_cli.design_run import (
     MAX_CANDIDATES,
-    RunLock,
     SAMPLING_PROFILES,
+    RunLock,
     build_matrix,
     matrix_signature,
     prepare_run,
 )
 from qtts_cli.design_yaml import (
     MAX_DESIGN_BYTES,
+    TEMPLATE_STARTERS,
     dump_design,
     example_document,
     load_design,
     normalize_document,
+    resolve_template_id,
 )
 from qtts_cli.errors import InputError, UsageError
 from qtts_cli.utils import sha256_file, sha256_text
@@ -124,7 +126,7 @@ def test_compile_zh_uses_structured_vocabulary():
 def test_compile_en_uses_structured_vocabulary():
     compiled = _compiled("en")
     text = compiled.rendered_instruction
-    assert text.startswith("A 30s female voice")
+    assert text.startswith("A in their thirties female voice")
     assert "warm, clear timbre" in text
     assert "podcast host" in text
     assert "Avoid childlike, shouting." in text
@@ -325,6 +327,147 @@ def test_design_init_infers_language_from_template(tmp_path):
     ) == 2
 
 
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "zh-late-night-radio/v1",
+        "btts/zh-late-night-radio/v1",
+        "qtts/zh-late-night-radio/v1",
+    ],
+)
+def test_template_aliases_share_one_identity(raw):
+    canonical = "qtts/zh-late-night-radio/v1"
+    assert resolve_template_id(raw) == canonical
+    assert template_sha256(raw) == template_sha256(canonical)
+
+
+def test_normalize_canonicalizes_btts_template_alias():
+    document = normalize_document(
+        {
+            "name": "demo-voice",
+            "language": "zh",
+            "template": "btts/zh-documentary-narrator/v1",
+            "covers": ["这片土地已经沉睡了千年。"],
+        }
+    )
+    assert document["template"] == "qtts/zh-documentary-narrator/v1"
+
+
+def test_unknown_template_is_not_guessed():
+    assert resolve_template_id("btts/does-not-exist/v1") is None
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "qtts/zh-documentary-narrator/v1",
+        "qtts/zh-anime-character/v1",
+        "qtts/en-audiobook-narrator/v1",
+        "qtts/en-game-character/v1",
+    ],
+)
+def test_design_init_new_templates_use_their_own_starters(tmp_path, template):
+    path = tmp_path / "new-template.yaml"
+    assert main(["design", "init", str(path), "--template", template, "--name", "demo"]) == 0
+    document, _, _ = load_design(path)
+    assert document["template"] == template
+    starter = TEMPLATE_STARTERS[template]
+    assert document["identity"]["persona"] == starter["identity"]["persona"]
+    assert document["covers"] == starter["covers"]
+
+
+def test_design_init_accepts_btts_alias_and_writes_canonical(tmp_path, capsys):
+    path = tmp_path / "alias.yaml"
+    assert main(
+        [
+            "design",
+            "init",
+            str(path),
+            "--template",
+            "btts/zh-documentary-narrator/v1",
+            "--name",
+            "demo",
+        ]
+    ) == 0
+    document, _, _ = load_design(path)
+    assert document["template"] == "qtts/zh-documentary-narrator/v1"
+    assert document["identity"]["persona"] == "documentary_narrator"
+
+
+_BTTS_VOCAB = {
+    "zh": {
+        "age": ["teen", "child", "20s", "30s", "40s", "50s", "60s", "senior"],
+        "gender_presentation": ["female", "male", "neutral"],
+        "timbre": [
+            "warm", "clean", "slightly_husky", "bright", "dark", "breathy",
+            "nasal", "smooth", "crisp", "soft", "metallic", "deep",
+        ],
+        "pitch": ["low", "low_mid", "mid", "high_mid", "high"],
+        "articulation": ["clear", "relaxed", "precise", "lazy", "crisp", "soft"],
+        "persona": [
+            "late_night_host", "documentary_narrator", "anime_character",
+            "podcast_host", "audiobook_narrator", "game_character",
+        ],
+        "pace": ["slow", "medium_slow", "medium", "medium_fast", "fast"],
+        "energy": ["low", "medium_low", "medium", "medium_high", "high"],
+        "tone": [
+            "calm", "intimate", "warm", "cool", "playful", "serious",
+            "gentle", "wry",
+        ],
+        "proximity": ["close_mic", "mid_distance", "far_field", "far_mic"],
+        "room": ["dry_studio", "treated_room", "natural_room"],
+        "avoid": ["childlike", "shouting", "robotic", "overly_bright", "monotone"],
+    },
+    "en": {
+        "age": ["teen", "child", "20s", "30s", "40s", "50s", "60s", "senior"],
+        "gender_presentation": ["female", "male", "neutral"],
+        "timbre": [
+            "warm", "clean", "slightly_husky", "bright", "dark", "breathy",
+            "nasal", "smooth", "crisp", "soft", "metallic", "deep",
+        ],
+        "pitch": ["low", "low_mid", "mid", "high_mid", "high"],
+        "articulation": ["clear", "relaxed", "precise", "lazy", "crisp", "soft"],
+        "persona": [
+            "late_night_host", "documentary_narrator", "anime_character",
+            "podcast_host", "audiobook_narrator", "game_character",
+        ],
+        "pace": ["slow", "medium_slow", "medium", "medium_fast", "fast"],
+        "energy": ["low", "medium_low", "medium", "medium_high", "high"],
+        "tone": [
+            "calm", "intimate", "warm", "cool", "playful", "serious",
+            "gentle", "wry",
+        ],
+        "proximity": ["close_mic", "mid_distance", "far_field", "far_mic"],
+        "room": ["dry_studio", "treated_room", "natural_room"],
+        "avoid": ["childlike", "shouting", "robotic", "overly_bright", "monotone"],
+    },
+}
+_LIST_FIELDS = {"timbre", "articulation", "tone", "avoid"}
+
+
+@pytest.mark.parametrize("language", ["zh", "en"])
+def test_btts_vocab_tokens_have_no_unknown_vocab(language):
+    vocab = _BTTS_VOCAB[language]
+    for field, tokens in vocab.items():
+        for token in tokens:
+            document = example_document("demo-voice", language=language)
+            value = [token] if field in _LIST_FIELDS else token
+            if field in {"pace", "energy", "tone"}:
+                document["delivery_baseline"][field] = value
+            elif field in {"proximity", "room"}:
+                document["scene"][field] = value
+            elif field == "avoid":
+                document["avoid"] = [token]
+            else:
+                document["identity"][field] = value
+            compiled = compile_design(normalize_document(document))
+            unknown = [
+                warning for warning in compiled.warnings
+                if warning["code"] == "unknown-vocab"
+            ]
+            assert not unknown, (language, field, token, unknown)
+
+
 def test_design_lint_block_and_parse_error_exit_codes(tmp_path):
     blocked = tmp_path / "blocked.yaml"
     _write(
@@ -448,6 +591,31 @@ def test_prepare_run_writes_manifest_and_resumes(tmp_path):
         resume=True,
     )
     assert resumed["run_id"] == manifest["run_id"]
+
+
+def test_prepare_run_resume_with_template_alias_uses_canonical(tmp_path):
+    document = example_document("demo-voice", language="zh")
+    document["template"] = "btts/zh-late-night-radio/v1"
+    raw_text = dump_design(document)
+    manifest = prepare_run(
+        tmp_path / "run",
+        document=document,
+        raw_text=raw_text,
+        compiled=compile_design(document),
+        matrix=build_matrix(document),
+    )
+    assert manifest["design"]["template"] == ZH_TEMPLATE
+
+    resumed = prepare_run(
+        tmp_path / "run",
+        document=document,
+        raw_text=raw_text,
+        compiled=compile_design(document),
+        matrix=build_matrix(document),
+        resume=True,
+    )
+    assert resumed["run_id"] == manifest["run_id"]
+    assert resumed["design"]["template"] == ZH_TEMPLATE
 
 
 def test_prepare_run_resume_mismatch(tmp_path):

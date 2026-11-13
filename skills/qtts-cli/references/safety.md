@@ -20,7 +20,7 @@
 | `voice rm` | 音色目录 | **删除** | 非 TTY 必须 `--yes`；只删 store 根目录内的单个音色 |
 | `voice export` | `-o` | **拒绝** | 已有归档需 `--force`；full 包含参考音频/转写/consent |
 | `voice import` | 音色目录 | **拒绝/回滚** | 已有音色需 `--force`；替换失败回滚；`.qttsvoice` 无同意旗标 |
-| `voice import-btts` | 音色目录 | **拒绝/回滚** | 必须 `--i-have-rights`；已有音色需 `--force`；staging 失败不留半成品 |
+| `voice import-btts` | 音色目录 | **拒绝/回滚** | 必须 `--i-have-rights`；已有音色需 `--force`；多音色走 `.btts-import.json` journal，失败/崩溃后回滚 |
 | `align` | `--out-prefix`, `--recipe-out` | **覆盖但回滚** | 先备份旧目标，提交失败时恢复；**无输入碰撞检查**，`--out-prefix` 可覆盖 `--srt` 输入 |
 | `check` / `qc` / `bench` | `--report` | **静默覆盖** | 原子写 canonical JSON；**`--report` 可等于被分析的音频**，无碰撞检查 |
 | `post` | `--out`, `--out-dir`, `--report` | **覆盖** | 写前做路径/大小写/NFC/symlink 碰撞检查；不拒绝已有输出 |

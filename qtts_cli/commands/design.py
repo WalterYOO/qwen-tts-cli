@@ -14,25 +14,32 @@ from ..design_compile import CompiledDesign, compile_design
 from ..design_lint import lint_design
 from ..design_yaml import (
     SUPPORTED_LANGUAGES,
-    TEMPLATES,
     dump_design,
     example_document,
     load_design,
+    resolve_template_id,
     template_for_language,
     template_language,
 )
 from ..errors import UsageError
-from ..utils import atomic_write_json, atomic_write_text, read_json, sha256_file, sha256_text
+from ..utils import (
+    atomic_write_json,
+    atomic_write_text,
+    read_json,
+    sha256_file,
+    sha256_text,
+)
 from ..voice_store import validate_name
 
 
 def init(cfg, args) -> dict[str, Any]:
     path = Path(args.file).expanduser()
     language = str(args.language).strip().lower() if args.language else None
-    template = args.template
-    if template is not None:
-        if template not in TEMPLATES:
-            raise UsageError(f"unknown design template: {template!r}")
+    raw_template = args.template
+    if raw_template is not None:
+        template = resolve_template_id(raw_template)
+        if template is None:
+            raise UsageError(f"unknown design template: {raw_template!r}")
         template_language_value = template_language(template)
         if language and template_language_value != language:
             raise UsageError(
@@ -67,7 +74,7 @@ def init(cfg, args) -> dict[str, Any]:
 
 
 def _compile_or_placeholder(document: dict[str, Any]) -> CompiledDesign:
-    if document.get("template") in TEMPLATES:
+    if resolve_template_id(document.get("template")) is not None:
         return compile_design(document)
     rendered = str(
         document.get("instruction_override")
@@ -529,8 +536,8 @@ def freeze(cfg, args) -> dict[str, Any]:
             }
 
         # --as clone
-        from ..catalog import find_model, scan, select
         from ..capabilities import validate_capabilities
+        from ..catalog import find_model, scan, select
         from ..commands.voice import _freeze_clone_prompt, _require_consent
         from ..tts_engine import TtsEngine
 

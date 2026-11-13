@@ -16,7 +16,7 @@ description: >-
 长音频对齐与 `--auto-ref-text` 也会用到 ASR。
 
 命令在项目根目录执行。若 `qtts` 不在 PATH，改用 `uv run qtts` 或 `.venv/bin/qtts`，
-选定一个并全程复用。本文按 0.4.1 编写，先 `qtts --version` 核对。
+选定一个并全程复用。本文按 0.4.2 编写，先 `qtts --version` 核对。
 
 ## 最小可用路径
 

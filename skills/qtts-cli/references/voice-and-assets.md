@@ -97,17 +97,31 @@ qtts voice import-bundle ./voices-bundle
 ## 从 btts 导入
 
 ```bash
+# 默认 auto：clone 走 ICL，design 离线导入 recipe
 qtts voice import-btts ./btts-export --voice dusk --i-have-rights --json
 qtts voice import-btts ./btts-export.zip --all --i-have-rights --json
+
+# 只规划；不写 profile、不 scan 模型
+qtts voice import-btts ./btts-export --all --i-have-rights --dry-run --json
+
+# 只有确实需要旧 clone 行为时才显式选择
+qtts voice import-btts ./btts-export --voice narrator --i-have-rights \
+  --design-mode clone --auto-ref-text --json
 ```
 
 - bundle 是 `btts voice export --mode full` 的目录或 `.zip`。
 - 有 `manifest.json` 时校验每文件 SHA-256、大小与完整文件集；拒绝路径穿越、
   绝对路径、盘符、反斜杠、symlink、特殊文件、大小写冲突、未知文件与超大 bundle。
-- 每个 voice 解析 `profile.json`，走 `voice add` 的 clone 流程；design preview
-  作为参考音频。
-- ICL 需要转写：用 `--auto-ref-text`（Qwen3-ASR）或逐个 `--ref-text`。
-- 必须 `--i-have-rights`；已有音色需 `--force`；失败走 staging/回滚。
+- `--design-mode auto`（默认）：clone voice 走 clone；design voice 保存为 qtts
+  `kind=design` recipe，保留 instruction/structured/template/seed/cfg 与内嵌
+  `design.yaml`，不加载模型、不跑 ASR、不重放 btts seed。跨模型声学不等价。
+- 传 `--auto-ref-text`（Qwen3-ASR）、`--ref-text`、`--asr-model`、`--mode` 或
+  `--model` 时自动按 clone 处理；也可显式 `--design-mode clone`。recipe/auto 与
+  这些 clone-only 选项互斥。
+- 6 个 btts 模板 ID 和 `btts/...` 会 canonicalize 为 `qtts/...`；原始 ID 保留在
+  `source.design.template_id`。未知模板不猜测，保留 raw ID 并 warning。
+- 必须 `--i-have-rights`；已有音色需 `--force`；多音色安装走
+  `.btts-import.json` journal + lock，失败/崩溃后自动回滚。
 - `--voice NAME` 可重复；`--all` 与 `--voice` 二选一；`--name` 只用于单个 voice。
 
 ## 数据目录与 takes

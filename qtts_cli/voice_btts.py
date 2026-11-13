@@ -183,6 +183,46 @@ def read_bundle_file(bundle: BttsBundle, rel: str) -> bytes:
     return data
 
 
+def design_block(voice: BundleVoice) -> dict[str, Any]:
+    value = voice.profile.get("design")
+    return value if isinstance(value, dict) else {}
+
+
+def design_identity(voice: BundleVoice) -> dict[str, Any]:
+    value = voice.profile.get("identity")
+    return value if isinstance(value, dict) else {}
+
+
+def design_structured(voice: BundleVoice) -> dict[str, Any]:
+    value = design_identity(voice).get("structured")
+    return value if isinstance(value, dict) else {}
+
+
+def design_instruction(voice: BundleVoice) -> str:
+    """Return the instruction btts actually replays for a design profile."""
+    block = design_block(voice)
+    identity = design_identity(voice)
+    for value in (block.get("instruction"), identity.get("rendered_instruction")):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def design_template(voice: BundleVoice) -> Optional[str]:
+    value = design_identity(voice).get("template")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def design_compiler_version(voice: BundleVoice) -> Optional[str]:
+    value = design_identity(voice).get("compiler_version")
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def design_defaults(voice: BundleVoice) -> dict[str, Any]:
+    value = voice.profile.get("defaults")
+    return value if isinstance(value, dict) else {}
+
+
 def map_language(value: Any, *, bundle: Path | str, voice: str) -> tuple[str, str]:
     """Return ``(qtts_language, original_btts_language)`` or raise InputError."""
     if not isinstance(value, str) or not value.strip():
